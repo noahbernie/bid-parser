@@ -1,4 +1,7 @@
 fastapi
 uvicorn
 pdfplumber
+pymupdf
 python-multipart
+anthropic
+python-dotenv

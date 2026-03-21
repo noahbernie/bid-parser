@@ -266,6 +266,32 @@
       font-style: italic;
     }
 
+    .log-console {
+      background: #0f1117;
+      border-radius: 8px;
+      overflow: hidden;
+      font-family: monospace;
+    }
+    .log-header {
+      background: #1e2130;
+      color: #888;
+      font-size: 0.7rem;
+      padding: 5px 12px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+    }
+    .log-body {
+      max-height: 200px;
+      overflow-y: auto;
+      padding: 10px 12px;
+    }
+    .log-line {
+      color: #a8ff78;
+      font-size: 0.75rem;
+      line-height: 1.7;
+      white-space: pre-wrap;
+    }
+
     .loading { color: #888; font-style: italic; font-size: 0.85rem; }
 
     .toast {
@@ -329,6 +355,7 @@
     <div class="schema-header">
       <h3>Extracted Schema</h3>
       <button id="extract-btn" onclick="extractSchema()" disabled>Extract with AI</button>
+      <button id="reextract-btn" onclick="reExtractSchema()" disabled style="background:#6b7280;margin-left:6px;">Re-extract</button>
     </div>
     <div class="schema-body" id="schema-body">
       <div class="schema-empty">Select a document and click<br>"Extract with AI" to parse fields.</div>
@@ -403,6 +430,7 @@
     document.getElementById('page-input').max = pages;
     document.getElementById('toolbar').style.display = 'flex';
     document.getElementById('extract-btn').disabled = false;
+    document.getElementById('reextract-btn').disabled = false;
     document.querySelectorAll('.doc-item').forEach(el => {
       el.classList.toggle('active', el.dataset.docId === docId);
     });
@@ -436,13 +464,17 @@
     `;
   }
 
+  let pollInterval = null;
+
   async function extractSchema() {
     if (!currentDocId) return;
     const btn = document.getElementById('extract-btn');
+    const reBtn = document.getElementById('reextract-btn');
     btn.disabled = true;
+    reBtn.disabled = true;
     btn.textContent = 'Extracting...';
-    document.getElementById('schema-body').innerHTML =
-      '<p class="loading" style="padding:20px">Reading document and calling AI...<br>This takes ~10 seconds.</p>';
+
+    renderLiveProgress([], []);
 
     try {
       const res = await fetch(`/doc/${currentDocId}/extract`, { method: 'POST' });
@@ -450,25 +482,88 @@
         const e = await res.json();
         document.getElementById('schema-body').innerHTML =
           `<p style="color:red;padding:20px">Error: ${e.detail}</p>`;
+        btn.disabled = false; reBtn.disabled = false; btn.textContent = 'Extract with AI';
         return;
       }
-      const schema = await res.json();
-      renderSchema(schema);
+      // Start polling for progress
+      startPolling();
     } catch (err) {
       document.getElementById('schema-body').innerHTML =
         `<p style="color:red;padding:20px">Request failed: ${err.message}</p>`;
-    } finally {
-      btn.disabled = false;
-      btn.textContent = 'Re-extract';
+      btn.disabled = false; reBtn.disabled = false; btn.textContent = 'Extract with AI';
     }
+  }
+
+  function startPolling() {
+    if (pollInterval) clearInterval(pollInterval);
+    pollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`/doc/${currentDocId}/status`);
+        const data = await res.json();
+        const logs = data.progress?.logs || [];
+        const streets = data.progress?.streets_so_far || [];
+        if (data.done && data.schema) {
+          clearInterval(pollInterval);
+          pollInterval = null;
+          renderSchema(data.schema);
+          const btn = document.getElementById('extract-btn');
+          const reBtn = document.getElementById('reextract-btn');
+          btn.disabled = false; reBtn.disabled = false;
+          btn.textContent = 'Extract with AI';
+        } else {
+          renderLiveProgress(logs, streets);
+        }
+      } catch(e) { /* ignore poll errors */ }
+    }, 1500);
+  }
+
+  function renderLiveProgress(logs, streets) {
+    const logsHtml = logs.map(l => `<div class="log-line">${escapeHtml(l)}</div>`).join('');
+    const streetsHtml = streets.length > 0
+      ? streets.slice(-20).map(st => `
+          <div class="street-card">
+            <div class="street-main">${escapeHtml(st.main_street || '—')}</div>
+            <div class="street-bounds">
+              From: <strong>${escapeHtml(st.from_street || '?')}</strong>
+              &nbsp;→&nbsp; To: <strong>${escapeHtml(st.to_street || '?')}</strong>
+            </div>
+          </div>`).join('')
+      : '<p style="color:#aaa;font-size:0.82rem;padding:8px 0">Streets will appear here as they are found...</p>';
+
+    document.getElementById('schema-body').innerHTML = `
+      <div class="log-console">
+        <div class="log-header">Live Log</div>
+        <div class="log-body" id="log-body">${logsHtml}</div>
+      </div>
+      <div class="section-label streets-section" style="margin-top:14px">
+        Streets Found So Far (${streets.length})
+      </div>
+      ${streetsHtml}
+    `;
+    // Auto-scroll log to bottom
+    const lb = document.getElementById('log-body');
+    if (lb) lb.scrollTop = lb.scrollHeight;
+  }
+
+  async function reExtractSchema() {
+    if (!currentDocId) return;
+    if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+    const btn = document.getElementById('reextract-btn');
+    btn.disabled = true;
+    btn.textContent = 'Clearing...';
+    await fetch(`/doc/${currentDocId}/extract`, { method: 'DELETE' });
+    btn.textContent = 'Re-extract';
+    btn.disabled = false;
+    extractSchema();
   }
 
   function renderSchema(s) {
     const meta = s._meta || {};
     const metaHtml = meta.total_pages ? `
       <div style="font-size:0.72rem;color:#888;background:#f5f5f5;border-radius:5px;padding:6px 10px;margin-bottom:14px">
-        Sent ${meta.pages_sent_to_ai} pages to AI (vision)
-        &nbsp;·&nbsp; ${meta.street_pages_found} street-relevant pages detected
+        ${meta.chunks_processed} chunks processed
+        &nbsp;·&nbsp; ${meta.street_pages_found} street-relevant pages
+        &nbsp;·&nbsp; ${meta.total_streets} streets extracted
         &nbsp;·&nbsp; ${meta.total_pages} total pages
       </div>` : '';
 
@@ -486,11 +581,11 @@
             &nbsp;→&nbsp;
             To: <strong>${escapeHtml(st.to_street || '?')}</strong>
           </div>
-          ${st.notes ? `<div class="street-notes">${escapeHtml(st.notes)}</div>` : ''}
+          ${st.work_type ? `<div class="street-notes">${escapeHtml(st.work_type)}${st.location ? ' · ' + escapeHtml(st.location) : ''}</div>` : ''}
         </div>
       `).join('');
     } else {
-      streetsHtml = '<p style="color:#aaa;font-size:0.82rem">No street segments found in first 20 pages.<br>Try "View All Text" to find them manually.</p>';
+      streetsHtml = '<p style="color:#aaa;font-size:0.82rem">No street segments found.</p>';
     }
 
     document.getElementById('schema-body').innerHTML = `
@@ -501,7 +596,6 @@
       <div class="field-row"><div class="field-label">Work Type</div>${val(s.work_type)}</div>
       <div class="field-row"><div class="field-label">Estimated Cost</div>${val(s.estimated_cost)}</div>
       <div class="field-row"><div class="field-label">Bid Due Date</div>${val(s.bid_due_date)}</div>
-
       <div class="section-label streets-section">Street Segments (${s.streets ? s.streets.length : 0} found)</div>
       ${streetsHtml}
     `;

@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Bid Parser</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #f5f5f5; color: #222; }
+
+    header {
+      background: #1a1a2e;
+      color: white;
+      padding: 16px 24px;
+      font-size: 1.2rem;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+    }
+
+    .layout {
+      display: flex;
+      height: calc(100vh - 53px);
+    }
+
+    /* LEFT SIDEBAR */
+    .sidebar {
+      width: 260px;
+      min-width: 260px;
+      background: white;
+      border-right: 1px solid #ddd;
+      display: flex;
+      flex-direction: column;
+      padding: 16px;
+      gap: 12px;
+      overflow-y: auto;
+    }
+
+    .upload-zone {
+      border: 2px dashed #aaa;
+      border-radius: 8px;
+      padding: 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+    .upload-zone:hover, .upload-zone.drag-over {
+      border-color: #4f46e5;
+      background: #eef2ff;
+    }
+    .upload-zone p { font-size: 0.8rem; color: #666; margin-top: 4px; }
+    #file-input { display: none; }
+
+    .doc-list-title {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      color: #888;
+      letter-spacing: 0.5px;
+    }
+
+    .doc-item {
+      background: #f9f9f9;
+      border: 1px solid #e5e5e5;
+      border-radius: 6px;
+      padding: 10px 12px;
+      cursor: pointer;
+      font-size: 0.85rem;
+    }
+    .doc-item:hover { border-color: #4f46e5; background: #f0f0ff; }
+    .doc-item.active { border-color: #4f46e5; background: #eef2ff; }
+    .doc-item .name { font-weight: 600; word-break: break-all; font-size: 0.8rem; }
+    .doc-item .meta { color: #888; font-size: 0.72rem; margin-top: 2px; }
+
+    /* CENTER — raw text viewer */
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      border-right: 1px solid #ddd;
+    }
+
+    .toolbar {
+      background: white;
+      border-bottom: 1px solid #ddd;
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .toolbar button {
+      background: #4f46e5;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      padding: 6px 13px;
+      font-size: 0.82rem;
+      cursor: pointer;
+    }
+    .toolbar button:hover { background: #3730a3; }
+    .toolbar button.secondary {
+      background: white;
+      color: #4f46e5;
+      border: 1px solid #4f46e5;
+    }
+    .toolbar button.secondary:hover { background: #eef2ff; }
+
+    .page-nav {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.82rem;
+      margin-left: auto;
+    }
+    .page-nav button {
+      background: white;
+      color: #222;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 4px 9px;
+      cursor: pointer;
+      font-size: 0.82rem;
+    }
+    .page-nav button:hover { background: #f5f5f5; }
+    .page-nav input {
+      width: 44px;
+      text-align: center;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 4px;
+      font-size: 0.82rem;
+    }
+
+    .content-area {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+    }
+
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: #aaa;
+      font-size: 1rem;
+      gap: 8px;
+    }
+
+    .text-block {
+      background: white;
+      border: 1px solid #e5e5e5;
+      border-radius: 8px;
+      padding: 18px 20px;
+      white-space: pre-wrap;
+      font-family: monospace;
+      font-size: 0.8rem;
+      line-height: 1.7;
+    }
+
+    .section-label {
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+
+    /* RIGHT PANEL — schema output */
+    .schema-panel {
+      width: 380px;
+      min-width: 380px;
+      background: white;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .schema-header {
+      padding: 14px 18px;
+      border-bottom: 1px solid #ddd;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .schema-header h3 {
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+
+    .schema-header button {
+      background: #4f46e5;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      padding: 7px 14px;
+      font-size: 0.82rem;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .schema-header button:hover { background: #3730a3; }
+    .schema-header button:disabled { background: #a5b4fc; cursor: not-allowed; }
+
+    .schema-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 18px;
+    }
+
+    .schema-empty {
+      color: #aaa;
+      font-size: 0.85rem;
+      text-align: center;
+      margin-top: 40px;
+    }
+
+    .field-row {
+      margin-bottom: 14px;
+    }
+    .field-label {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #6366f1;
+      margin-bottom: 3px;
+    }
+    .field-value {
+      font-size: 0.88rem;
+      color: #222;
+      background: #f9f9fb;
+      border: 1px solid #e5e5e5;
+      border-radius: 5px;
+      padding: 6px 10px;
+      word-break: break-word;
+    }
+    .field-value.null { color: #bbb; font-style: italic; }
+
+    .streets-section { margin-top: 8px; }
+    .street-card {
+      background: #f4f4ff;
+      border: 1px solid #ddd8ff;
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      font-size: 0.83rem;
+    }
+    .street-card .street-main {
+      font-weight: 700;
+      font-size: 0.9rem;
+      color: #1a1a2e;
+      margin-bottom: 4px;
+    }
+    .street-card .street-bounds {
+      color: #555;
+    }
+    .street-card .street-notes {
+      color: #888;
+      font-size: 0.78rem;
+      margin-top: 4px;
+      font-style: italic;
+    }
+
+    .loading { color: #888; font-style: italic; font-size: 0.85rem; }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #1a1a2e;
+      color: white;
+      padding: 12px 18px;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+      z-index: 999;
+    }
+    .toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+
+<header>Bid Parser — Document Viewer</header>
+
+<div class="layout">
+  <!-- LEFT SIDEBAR -->
+  <div class="sidebar">
+    <div class="upload-zone" id="upload-zone">
+      <div style="font-size:1.4rem">📄</div>
+      <strong>Upload PDF</strong>
+      <p>Click or drag & drop</p>
+      <input type="file" id="file-input" accept=".pdf" multiple />
+    </div>
+
+    <div class="doc-list-title">Documents</div>
+    <div id="doc-list"><p style="font-size:0.8rem;color:#aaa">No documents yet</p></div>
+  </div>
+
+  <!-- CENTER — raw text -->
+  <div class="main">
+    <div class="toolbar" id="toolbar" style="display:none">
+      <button class="secondary" onclick="viewCurrentPage()">Page View</button>
+      <button class="secondary" onclick="viewAllText()">All Text</button>
+      <div class="page-nav">
+        <button onclick="prevPage()">&#8592;</button>
+        Page <input type="number" id="page-input" min="1" value="1" onchange="goToPage()" />
+        of <span id="total-pages">?</span>
+        <button onclick="nextPage()">&#8594;</button>
+      </div>
+    </div>
+
+    <div class="content-area" id="content-area">
+      <div class="empty-state">
+        <div style="font-size:3rem">📂</div>
+        <div>Upload a PDF to get started</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT — schema panel -->
+  <div class="schema-panel">
+    <div class="schema-header">
+      <h3>Extracted Schema</h3>
+      <button id="extract-btn" onclick="extractSchema()" disabled>Extract with AI</button>
+    </div>
+    <div class="schema-body" id="schema-body">
+      <div class="schema-empty">Select a document and click<br>"Extract with AI" to parse fields.</div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  let currentDocId = null;
+  let currentPage = 1;
+  let totalPages = 1;
+
+  // Load existing docs on page open
+  async function refreshDocList() {
+    const res = await fetch('/documents');
+    const docs = await res.json();
+    if (docs.length === 0) return;
+    document.getElementById('doc-list').innerHTML = '';
+    docs.forEach(d => addDocToList(d.doc_id, d.filename, d.total_pages));
+  }
+  refreshDocList();
+
+  // Upload zone
+  const zone = document.getElementById('upload-zone');
+  const fileInput = document.getElementById('file-input');
+
+  zone.addEventListener('click', () => fileInput.click());
+  zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag-over'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+  zone.addEventListener('drop', e => {
+    e.preventDefault();
+    zone.classList.remove('drag-over');
+    [...e.dataTransfer.files].forEach(uploadFile);
+  });
+  fileInput.addEventListener('change', () => [...fileInput.files].forEach(uploadFile));
+
+  async function uploadFile(file) {
+    showToast(`Uploading ${file.name}...`);
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      const res = await fetch('/upload', { method: 'POST', body: fd });
+      if (!res.ok) { const e = await res.json(); showToast('Error: ' + e.detail); return; }
+      const data = await res.json();
+      showToast(`Loaded: ${data.filename} (${data.total_pages} pages)`);
+      addDocToList(data.doc_id, data.filename, data.total_pages);
+      openDoc(data.doc_id, data.total_pages);
+    } catch (err) {
+      showToast('Upload failed');
+    }
+  }
+
+  function addDocToList(docId, filename, pages) {
+    const list = document.getElementById('doc-list');
+    if (list.querySelector('p')) list.innerHTML = '';
+    const item = document.createElement('div');
+    item.className = 'doc-item';
+    item.dataset.docId = docId;
+    item.innerHTML = `<div class="name">${filename}</div><div class="meta">${pages} pages</div>`;
+    item.addEventListener('click', () => openDoc(docId, pages));
+    list.appendChild(item);
+  }
+
+  function openDoc(docId, pages) {
+    currentDocId = docId;
+    currentPage = 1;
+    totalPages = pages;
+    document.getElementById('total-pages').textContent = pages;
+    document.getElementById('page-input').value = 1;
+    document.getElementById('page-input').max = pages;
+    document.getElementById('toolbar').style.display = 'flex';
+    document.getElementById('extract-btn').disabled = false;
+    document.querySelectorAll('.doc-item').forEach(el => {
+      el.classList.toggle('active', el.dataset.docId === docId);
+    });
+    // Reset schema panel
+    document.getElementById('schema-body').innerHTML =
+      '<div class="schema-empty">Click "Extract with AI" to parse this document.</div>';
+    viewCurrentPage();
+  }
+
+  async function viewCurrentPage() {
+    if (!currentDocId) return;
+    const area = document.getElementById('content-area');
+    area.innerHTML = '<p class="loading" style="padding:20px">Loading page...</p>';
+    const res = await fetch(`/doc/${currentDocId}/page/${currentPage}`);
+    const data = await res.json();
+    area.innerHTML = `
+      <div class="section-label">Page ${data.page} of ${data.total}</div>
+      <div class="text-block">${escapeHtml(data.text) || '<em style="color:#aaa">No text on this page (may be a scan/image)</em>'}</div>
+    `;
+  }
+
+  async function viewAllText() {
+    if (!currentDocId) return;
+    const area = document.getElementById('content-area');
+    area.innerHTML = '<p class="loading" style="padding:20px">Extracting all text — may take a moment for large docs...</p>';
+    const res = await fetch(`/doc/${currentDocId}/all`);
+    const data = await res.json();
+    area.innerHTML = `
+      <div class="section-label">${data.filename} — All ${data.total_pages} pages</div>
+      <div class="text-block">${escapeHtml(data.text) || '<em style="color:#aaa">No text extracted</em>'}</div>
+    `;
+  }
+
+  async function extractSchema() {
+    if (!currentDocId) return;
+    const btn = document.getElementById('extract-btn');
+    btn.disabled = true;
+    btn.textContent = 'Extracting...';
+    document.getElementById('schema-body').innerHTML =
+      '<p class="loading" style="padding:20px">Reading document and calling AI...<br>This takes ~10 seconds.</p>';
+
+    try {
+      const res = await fetch(`/doc/${currentDocId}/extract`, { method: 'POST' });
+      if (!res.ok) {
+        const e = await res.json();
+        document.getElementById('schema-body').innerHTML =
+          `<p style="color:red;padding:20px">Error: ${e.detail}</p>`;
+        return;
+      }
+      const schema = await res.json();
+      renderSchema(schema);
+    } catch (err) {
+      document.getElementById('schema-body').innerHTML =
+        `<p style="color:red;padding:20px">Request failed: ${err.message}</p>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Re-extract';
+    }
+  }
+
+  function renderSchema(s) {
+    const meta = s._meta || {};
+    const metaHtml = meta.total_pages ? `
+      <div style="font-size:0.72rem;color:#888;background:#f5f5f5;border-radius:5px;padding:6px 10px;margin-bottom:14px">
+        Sent ${meta.pages_sent_to_ai} pages to AI (vision)
+        &nbsp;·&nbsp; ${meta.street_pages_found} street-relevant pages detected
+        &nbsp;·&nbsp; ${meta.total_pages} total pages
+      </div>` : '';
+
+    const val = (v) => v
+      ? `<div class="field-value">${escapeHtml(String(v))}</div>`
+      : `<div class="field-value null">not found</div>`;
+
+    let streetsHtml = '';
+    if (s.streets && s.streets.length > 0) {
+      streetsHtml = s.streets.map(st => `
+        <div class="street-card">
+          <div class="street-main">${escapeHtml(st.main_street || '—')}</div>
+          <div class="street-bounds">
+            From: <strong>${escapeHtml(st.from_street || '?')}</strong>
+            &nbsp;→&nbsp;
+            To: <strong>${escapeHtml(st.to_street || '?')}</strong>
+          </div>
+          ${st.notes ? `<div class="street-notes">${escapeHtml(st.notes)}</div>` : ''}
+        </div>
+      `).join('');
+    } else {
+      streetsHtml = '<p style="color:#aaa;font-size:0.82rem">No street segments found in first 20 pages.<br>Try "View All Text" to find them manually.</p>';
+    }
+
+    document.getElementById('schema-body').innerHTML = `
+      ${metaHtml}
+      <div class="field-row"><div class="field-label">Bid Number</div>${val(s.bid_number)}</div>
+      <div class="field-row"><div class="field-label">Project Name</div>${val(s.project_name)}</div>
+      <div class="field-row"><div class="field-label">City / Municipality</div>${val(s.city)}</div>
+      <div class="field-row"><div class="field-label">Work Type</div>${val(s.work_type)}</div>
+      <div class="field-row"><div class="field-label">Estimated Cost</div>${val(s.estimated_cost)}</div>
+      <div class="field-row"><div class="field-label">Bid Due Date</div>${val(s.bid_due_date)}</div>
+
+      <div class="section-label streets-section">Street Segments (${s.streets ? s.streets.length : 0} found)</div>
+      ${streetsHtml}
+    `;
+  }
+
+  function prevPage() {
+    if (currentPage > 1) { currentPage--; syncPageInput(); viewCurrentPage(); }
+  }
+  function nextPage() {
+    if (currentPage < totalPages) { currentPage++; syncPageInput(); viewCurrentPage(); }
+  }
+  function goToPage() {
+    const val = parseInt(document.getElementById('page-input').value);
+    if (val >= 1 && val <= totalPages) { currentPage = val; viewCurrentPage(); }
+  }
+  function syncPageInput() {
+    document.getElementById('page-input').value = currentPage;
+  }
+
+  function escapeHtml(str) {
+    return (str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), 3000);
+  }
+</script>
+</body>
+</html>

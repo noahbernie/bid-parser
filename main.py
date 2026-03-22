@@ -22,7 +22,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 documents = {}
 
-CHUNK_CHAR_LIMIT = 80000  # ~20k tokens — safely under the 30k/min rate limit
+CHUNK_CHAR_LIMIT = 40000  # ~10k tokens input → response fits in 16k output tokens
 
 HEADER_PROMPT = """You are parsing a road construction bid document. Extract project-level fields only (no street list yet).
 Return ONLY valid JSON with these fields:
@@ -258,7 +258,7 @@ def run_extraction(doc_id: str, api_key: str):
         sleep_for_chunk(sleep_chars)
         log(f"Processing chunk {i+1}/{len(chunks)} (~{chunk_size // 1000}k chars)...")
         try:
-            result = call_claude_with_retry(client, STREETS_PROMPT, chunk_blocks, max_tokens=8192)
+            result = call_claude_with_retry(client, STREETS_PROMPT, chunk_blocks, max_tokens=16000)
             new_streets = result.get("streets", [])
             all_streets.extend(new_streets)
             schema["streets"] = all_streets
@@ -270,7 +270,7 @@ def run_extraction(doc_id: str, api_key: str):
             log(f"  ⚠ Rate limit — waiting {e.wait_seconds}s then retrying...")
             time.sleep(e.wait_seconds)
             try:
-                result = call_claude_with_retry(client, STREETS_PROMPT, chunk_blocks, max_tokens=8192)
+                result = call_claude_with_retry(client, STREETS_PROMPT, chunk_blocks, max_tokens=16000)
                 new_streets = result.get("streets", [])
                 all_streets.extend(new_streets)
                 schema["streets"] = all_streets
@@ -297,6 +297,8 @@ async def extract_schema(doc_id: str):
     doc = documents[doc_id]
     if doc["extracted_schema"]:
         return doc["extracted_schema"]
+    if doc.get("progress") is not None:
+        return {"status": "already_running"}
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")

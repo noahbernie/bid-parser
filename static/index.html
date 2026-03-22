@@ -520,7 +520,7 @@
   function renderLiveProgress(logs, streets) {
     const logsHtml = logs.map(l => `<div class="log-line">${escapeHtml(l)}</div>`).join('');
     const streetsHtml = streets.length > 0
-      ? streets.slice(-20).map(st => `
+      ? streets.slice(-200).map(st => `
           <div class="street-card">
             <div class="street-main">${escapeHtml(st.main_street || '—')}</div>
             <div class="street-bounds">
@@ -536,7 +536,7 @@
         <div class="log-body" id="log-body">${logsHtml}</div>
       </div>
       <div class="section-label streets-section" style="margin-top:14px">
-        Streets Found So Far (${streets.length})
+        Streets Found So Far (${streets.length}${streets.length > 200 ? ', showing last 200' : ''})
       </div>
       ${streetsHtml}
     `;

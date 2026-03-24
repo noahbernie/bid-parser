@@ -20,9 +20,12 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 app = FastAPI()
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+from highway.routes import router as highway_router
+app.include_router(highway_router)
+
 documents = {}
 
-CHUNK_CHAR_LIMIT = 40000  # ~10k tokens input → response fits in 16k output tokens
+CHUNK_CHAR_LIMIT = 20000  # ~5k tokens input → response fits in 32k output tokens
 
 HEADER_PROMPT = """You are parsing a road construction bid document. Extract project-level fields only (no street list yet).
 Return ONLY valid JSON with these fields:
@@ -78,12 +81,19 @@ def extract_text_smart(page, page_index: int = None, pdf_bytes: bytes = None) ->
 
 def call_claude(client, prompt: str, content_blocks: list, max_tokens: int = 4096) -> dict:
     content = [{"type": "text", "text": prompt}] + content_blocks
-    msg = client.messages.create(
+    with client.messages.stream(
         model="claude-sonnet-4-6",
         max_tokens=max_tokens,
         messages=[{"role": "user", "content": content}],
-    )
+    ) as stream:
+        msg = stream.get_final_message()
     raw = msg.content[0].text.strip()
+    # Log raw response to file for debugging
+    with open("/tmp/claude_last_response.txt", "w") as f:
+        f.write(f"stop_reason: {msg.stop_reason}\n")
+        f.write(f"raw_len: {len(raw)}\n")
+        f.write("---RAW---\n")
+        f.write(raw)
     if "```" in raw:
         parts = raw.split("```")
         for part in parts:
@@ -258,7 +268,7 @@ def run_extraction(doc_id: str, api_key: str):
         sleep_for_chunk(sleep_chars)
         log(f"Processing chunk {i+1}/{len(chunks)} (~{chunk_size // 1000}k chars)...")
         try:
-            result = call_claude_with_retry(client, STREETS_PROMPT, chunk_blocks, max_tokens=16000)
+            result = call_claude_with_retry(client, STREETS_PROMPT, chunk_blocks, max_tokens=32000)
             new_streets = result.get("streets", [])
             all_streets.extend(new_streets)
             schema["streets"] = all_streets
@@ -270,7 +280,7 @@ def run_extraction(doc_id: str, api_key: str):
             log(f"  ⚠ Rate limit — waiting {e.wait_seconds}s then retrying...")
             time.sleep(e.wait_seconds)
             try:
-                result = call_claude_with_retry(client, STREETS_PROMPT, chunk_blocks, max_tokens=16000)
+                result = call_claude_with_retry(client, STREETS_PROMPT, chunk_blocks, max_tokens=32000)
                 new_streets = result.get("streets", [])
                 all_streets.extend(new_streets)
                 schema["streets"] = all_streets

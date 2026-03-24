@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Highway Parser</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f1117; color: #e2e8f0; height: 100vh; display: flex; flex-direction: column; }
+
+  .topbar {
+    background: #1a1d2e; border-bottom: 1px solid #2d3748; padding: 12px 20px;
+    display: flex; align-items: center; gap: 16px; flex-shrink: 0;
+  }
+  .topbar h1 { font-size: 16px; font-weight: 600; color: #63b3ed; }
+  .topbar a { font-size: 13px; color: #718096; text-decoration: none; }
+  .topbar a:hover { color: #e2e8f0; }
+
+  .upload-bar {
+    background: #1a1d2e; border-bottom: 1px solid #2d3748; padding: 10px 20px;
+    display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+  }
+  .upload-bar label { font-size: 13px; color: #a0aec0; }
+  .upload-bar input[type=file] { font-size: 13px; color: #e2e8f0; }
+  .btn {
+    padding: 6px 16px; border-radius: 6px; border: none; cursor: pointer;
+    font-size: 13px; font-weight: 500;
+  }
+  .btn-blue { background: #3182ce; color: white; }
+  .btn-blue:hover { background: #2b6cb0; }
+  .btn-blue:disabled { background: #2d3748; color: #718096; cursor: not-allowed; }
+  .btn-gray { background: #2d3748; color: #a0aec0; }
+  .btn-gray:hover { background: #4a5568; }
+  .filename { font-size: 13px; color: #68d391; }
+
+  .panels {
+    display: grid;
+    grid-template-columns: 1fr 340px 1fr;
+    gap: 0;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  .panel {
+    display: flex; flex-direction: column;
+    border-right: 1px solid #2d3748;
+    overflow: hidden;
+  }
+  .panel:last-child { border-right: none; }
+
+  .panel-header {
+    background: #1a1d2e; border-bottom: 1px solid #2d3748;
+    padding: 8px 14px; font-size: 12px; font-weight: 600;
+    color: #a0aec0; letter-spacing: 0.05em; text-transform: uppercase;
+    flex-shrink: 0;
+  }
+
+  /* PDF panel */
+  #pdf-embed {
+    flex: 1; width: 100%; border: none; background: #fff;
+  }
+  .pdf-placeholder {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    color: #4a5568; font-size: 14px;
+  }
+
+  /* Middle panel: log + json */
+  .middle-panel { display: flex; flex-direction: column; overflow: hidden; }
+  .log-section { flex: 0 0 auto; max-height: 220px; overflow-y: auto; padding: 10px 14px; background: #0f1117; }
+  .log-line { font-size: 12px; font-family: monospace; color: #a0aec0; line-height: 1.6; }
+  .log-line.ok { color: #68d391; }
+  .log-line.err { color: #fc8181; }
+  .log-line.warn { color: #f6e05e; }
+  .json-section {
+    flex: 1; overflow-y: auto; padding: 10px 14px;
+    border-top: 1px solid #2d3748;
+  }
+  pre#json-out {
+    font-size: 12px; font-family: monospace; color: #e2e8f0;
+    white-space: pre-wrap; word-break: break-word;
+  }
+
+  /* Map panel */
+  #map { flex: 1; }
+  .map-placeholder {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    color: #4a5568; font-size: 14px;
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <h1>Highway Parser</h1>
+  <a href="/">← City/County Parser</a>
+</div>
+
+<div class="upload-bar">
+  <label>Caltrans Plan Set (PDF):</label>
+  <input type="file" id="file-input" accept=".pdf">
+  <button class="btn btn-blue" id="extract-btn" disabled>Extract</button>
+  <button class="btn btn-gray" id="reset-btn" style="display:none">Reset</button>
+  <span class="filename" id="filename-label"></span>
+</div>
+
+<div class="panels">
+
+  <!-- PDF Viewer -->
+  <div class="panel">
+    <div class="panel-header">Source Document</div>
+    <div class="pdf-placeholder" id="pdf-placeholder">Upload a PDF to preview it here</div>
+    <iframe id="pdf-embed" style="display:none"></iframe>
+  </div>
+
+  <!-- Log + JSON -->
+  <div class="panel middle-panel">
+    <div class="panel-header">Extraction Log</div>
+    <div class="log-section" id="log-section">
+      <div class="log-line" style="color:#4a5568">Logs will appear here after extraction starts...</div>
+    </div>
+    <div class="panel-header" style="border-top:1px solid #2d3748">Extracted Schema</div>
+    <div class="json-section">
+      <pre id="json-out" style="color:#4a5568">JSON output will appear here...</pre>
+    </div>
+  </div>
+
+  <!-- Map -->
+  <div class="panel">
+    <div class="panel-header">Map — Start / End Coordinates</div>
+    <div class="map-placeholder" id="map-placeholder">Map will appear after coordinates are resolved</div>
+    <div id="map" style="display:none"></div>
+  </div>
+
+</div>
+
+<script>
+let docId = null;
+let pollTimer = null;
+let map = null;
+
+const fileInput = document.getElementById('file-input');
+const extractBtn = document.getElementById('extract-btn');
+const resetBtn = document.getElementById('reset-btn');
+const filenameLabel = document.getElementById('filename-label');
+const pdfEmbed = document.getElementById('pdf-embed');
+const pdfPlaceholder = document.getElementById('pdf-placeholder');
+const logSection = document.getElementById('log-section');
+const jsonOut = document.getElementById('json-out');
+const mapDiv = document.getElementById('map');
+const mapPlaceholder = document.getElementById('map-placeholder');
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length > 0) {
+    extractBtn.disabled = false;
+    filenameLabel.textContent = fileInput.files[0].name;
+  }
+});
+
+extractBtn.addEventListener('click', async () => {
+  if (!fileInput.files.length) return;
+  extractBtn.disabled = true;
+  resetBtn.style.display = 'inline-block';
+
+  // Upload
+  const formData = new FormData();
+  formData.append('file', fileInput.files[0]);
+  addLog('Uploading PDF...');
+
+  const uploadRes = await fetch('/highway/upload', { method: 'POST', body: formData });
+  const uploadData = await uploadRes.json();
+  docId = uploadData.doc_id;
+
+  // Show PDF
+  pdfPlaceholder.style.display = 'none';
+  pdfEmbed.style.display = 'block';
+  pdfEmbed.src = `/highway/doc/${docId}/pdf`;
+
+  // Start extraction
+  await fetch(`/highway/doc/${docId}/extract`, { method: 'POST' });
+  addLog('Extraction started...');
+
+  // Poll
+  pollTimer = setInterval(pollStatus, 1500);
+});
+
+resetBtn.addEventListener('click', () => {
+  clearInterval(pollTimer);
+  docId = null;
+  fileInput.value = '';
+  extractBtn.disabled = true;
+  resetBtn.style.display = 'none';
+  filenameLabel.textContent = '';
+  pdfEmbed.style.display = 'none';
+  pdfEmbed.src = '';
+  pdfPlaceholder.style.display = 'flex';
+  logSection.innerHTML = '<div class="log-line" style="color:#4a5568">Logs will appear here after extraction starts...</div>';
+  jsonOut.textContent = 'JSON output will appear here...';
+  jsonOut.style.color = '#4a5568';
+  mapDiv.style.display = 'none';
+  mapPlaceholder.style.display = 'flex';
+  if (map) { map.remove(); map = null; }
+});
+
+async function pollStatus() {
+  if (!docId) return;
+  const res = await fetch(`/highway/doc/${docId}/status`);
+  const data = await res.json();
+
+  // Update logs
+  logSection.innerHTML = '';
+  (data.logs || []).forEach(line => {
+    const div = document.createElement('div');
+    div.className = 'log-line' + (line.startsWith('✓') ? ' ok' : line.startsWith('✗') ? ' err' : line.startsWith('⚠') ? ' warn' : '');
+    div.textContent = line;
+    logSection.appendChild(div);
+  });
+  logSection.scrollTop = logSection.scrollHeight;
+
+  if (data.done && data.schema) {
+    clearInterval(pollTimer);
+
+    // Show JSON
+    jsonOut.style.color = '#e2e8f0';
+    jsonOut.textContent = JSON.stringify(data.schema, null, 2);
+
+    // Show map if coordinates available
+    const coords = data.schema.coordinates;
+    if (coords && coords.start && coords.end) {
+      showMap(coords.start, coords.end, data.schema);
+    }
+  }
+}
+
+function showMap(start, end, schema) {
+  mapPlaceholder.style.display = 'none';
+  mapDiv.style.display = 'block';
+
+  if (map) map.remove();
+  map = L.map('map');
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap contributors'
+  }).addTo(map);
+
+  const startLatLng = [start.lat, start.lng];
+  const endLatLng = [end.lat, end.lng];
+
+  // Draw line between endpoints
+  L.polyline([startLatLng, endLatLng], { color: '#3182ce', weight: 4, opacity: 0.8 }).addTo(map);
+
+  // Start marker (green)
+  const startIcon = L.divIcon({
+    html: `<div style="background:#68d391;width:14px;height:14px;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.5)"></div>`,
+    className: '', iconAnchor: [7, 7]
+  });
+  const endIcon = L.divIcon({
+    html: `<div style="background:#fc8181;width:14px;height:14px;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.5)"></div>`,
+    className: '', iconAnchor: [7, 7]
+  });
+
+  const prefix = schema.pm_prefix || '';
+  L.marker(startLatLng, { icon: startIcon })
+    .addTo(map)
+    .bindPopup(`<b>Start</b><br>PM ${prefix}${schema.pm_start}<br>${start.lat.toFixed(5)}, ${start.lng.toFixed(5)}`);
+  L.marker(endLatLng, { icon: endIcon })
+    .addTo(map)
+    .bindPopup(`<b>End</b><br>PM ${prefix}${schema.pm_end}<br>${end.lat.toFixed(5)}, ${end.lng.toFixed(5)}`);
+
+  map.fitBounds([startLatLng, endLatLng], { padding: [40, 40] });
+}
+
+function addLog(msg) {
+  const div = document.createElement('div');
+  div.className = 'log-line';
+  div.textContent = msg;
+  logSection.appendChild(div);
+  logSection.scrollTop = logSection.scrollHeight;
+}
+</script>
+</body>
+</html>

@@ -3,6 +3,7 @@ import urllib.parse
 import json
 import io
 import math
+import base64
 import pdfplumber
 import fitz
 import anthropic
@@ -17,7 +18,7 @@ COUNTY_CODES = {
     "imperial": "IMP", "inyo": "INY", "kern": "KER", "kings": "KIN",
     "lake": "LAK", "lassen": "LAS", "los angeles": "LA", "madera": "MAD",
     "marin": "MRN", "mariposa": "MPA", "mendocino": "MEN", "merced": "MER",
-    "modoc": "MOD", "mono": "MON", "monterey": "MOT", "napa": "NAP",
+    "modoc": "MOD", "mono": "MNO", "monterey": "MOT", "napa": "NAP",
     "nevada": "NEV", "orange": "ORA", "placer": "PLA", "plumas": "PLU",
     "riverside": "RIV", "sacramento": "SAC", "san benito": "SBT",
     "san bernardino": "SBD", "san diego": "SD", "san francisco": "SF",
@@ -46,9 +47,12 @@ Return ONLY valid JSON with this exact structure:
     {"prefix": "L", "start": 0.0, "end": 4.79},
     {"prefix": null, "start": 0.0, "end": 5.0}
   ],
+  "work_segments": [
+    {"start_prefix": "L", "start": 0.0, "end_prefix": null, "end": 5.0}
+  ],
   "features": [
     {
-      "type": "driveway",
+      "type": "road_connection",
       "pm": 0.54,
       "pm_prefix": null,
       "side": "Rt",
@@ -67,17 +71,30 @@ Rules for pm_segments — list EVERY distinct PM prefix range used in this proje
 - prefix: the letter prefix ("L", "R", "M", "T", etc.) or null for no prefix
 - start: numeric start PM for that prefix segment
 - end: numeric end PM for that prefix segment
-- Look for station equations (e.g. "PM L4.790 EQUATES TO PM 0.000") to find segment boundaries
+- Look for station equations (e.g. "PM L4.790 EQUATES TO PM 0.000", "PM R52.41 Bk = PM 51.63 Ahd") to find segment boundaries
 
-Rules for features — extract ALL rows from ALL driveway, road connection, and pullout tables:
-- road_name: copy the exact text from the last column. Use null ONLY if the cell says literally "DRIVEWAY" and nothing else.
-- type: set based on road_name:
-  - "pullout" if the row is from the pullouts table
-  - "driveway" if road_name is null (cell said only "DRIVEWAY")
-  - "road_connection" if road_name is non-null (cell had any actual name like "DOBBINS CREEK Rd", "BRIDGE GULCH Rd", "MILL GULCH", "13 DIPS Rd", etc.)
-- pm: numeric postmile value as a number (e.g. 0.54, 3.98)
-- pm_prefix: the prefix letter on THIS feature's PM (e.g. "L" for L3.98) — null if no prefix
-- side: "Lt" or "Rt"
+Rules for work_segments — list each CONTINUOUS geographic paving run:
+- One entry per continuous run. Only split at explicit "BEGIN BREAK IN CONSTRUCTION" / "END BREAK IN CONSTRUCTION" labels.
+- A run that spans a PM prefix change is still ONE entry (e.g. L-prefix connects to null-prefix via station equation → single entry).
+- start_prefix: PM prefix letter at the beginning of this run (null if none)
+- start: numeric PM at the beginning of this run
+- end_prefix: PM prefix letter at the end of this run (null if none)
+- end: numeric PM at the end of this run
+- Example with no breaks (Trinity-style): [{"start_prefix":"L","start":0.0,"end_prefix":null,"end":5.0}]
+- Example with one break (SB Route 25-style): [{"start_prefix":"R","start":49.8,"end_prefix":"R","end":51.355}, {"start_prefix":"R","start":51.924,"end_prefix":null,"end":51.7}]
+
+Rules for features — extract ALL road connections, driveways, intersections, and pullouts:
+- From driveway/road connection/pullout tables if present
+- From construction detail sheet labels (e.g. "HILLCREST ROAD REPAIRS AND CONFORMS PM R50.52", "SANTA ANA ROAD REPAIRS AND CONFORMS PM R51.10")
+- From intersection labels on plan and detail sheets
+- road_name: the exact road/street name. Use null ONLY if it is a plain unnamed driveway.
+- type:
+  - "pullout" if the row is from a pullouts table
+  - "driveway" if road_name is null (unnamed driveway)
+  - "road_connection" if road_name is non-null (any named road, street, or intersection)
+- pm: numeric postmile value as a number (e.g. 0.54, 50.52)
+- pm_prefix: the prefix letter on THIS feature's PM (e.g. "R" for R50.52, "L" for L3.98) — null if no prefix
+- side: "Lt" or "Rt" if shown, otherwise null
 
 Use null for any field not found."""
 
@@ -141,7 +158,6 @@ def pm_to_coords(route: str, county_code: str, pm_value: float, pm_prefix: str =
         right = [f for f in features if f.get("attributes", {}).get("AlignCode") == "Right"]
         candidates = right if right else features
 
-        # Find floor and ceil tenth points
         def get_pt(f):
             g = f.get("geometry", {})
             return f["attributes"].get("PM"), g.get("x"), g.get("y")
@@ -191,17 +207,37 @@ def extract_text_all_pages(pdf_bytes: bytes) -> str:
     return "\n\n".join(pages)
 
 
-def call_claude(client, prompt: str, text: str, max_tokens: int = 4096) -> dict:
+def render_pages_as_images(pdf_bytes: bytes, page_indices: list, dpi: int = 150) -> list:
+    """Render specified page indices as base64 PNG images."""
+    images = []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    for i in page_indices:
+        if i >= len(doc):
+            continue
+        pix = doc[i].get_pixmap(matrix=mat)
+        img_bytes = pix.tobytes("png")
+        images.append(base64.standard_b64encode(img_bytes).decode())
+    doc.close()
+    return images
+
+
+def call_claude(client, prompt: str, text: str, images: list = None, max_tokens: int = 4096) -> dict:
+    content = [{"type": "text", "text": prompt}]
+    if images:
+        for b64 in images:
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}})
+    content.append({"type": "text", "text": text})
     with client.messages.stream(
         model="claude-sonnet-4-6",
         max_tokens=max_tokens,
-        messages=[{"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "text", "text": text},
-        ]}],
+        messages=[{"role": "user", "content": content}],
     ) as stream:
         msg = stream.get_final_message()
     raw = msg.content[0].text.strip()
+    if not raw:
+        stop_reason = getattr(msg, "stop_reason", "unknown")
+        raise ValueError(f"Claude returned empty response (stop_reason={stop_reason})")
     if "```" in raw:
         for part in raw.split("```"):
             if part.startswith("json"):
@@ -227,13 +263,19 @@ def run_highway_extraction(doc_id: str, api_key: str, highway_docs: dict):
         doc["progress"]["done"] = True
         return
 
+    log("Rendering overview pages as images...")
+    try:
+        page_images = render_pages_as_images(doc["bytes"], [0], dpi=100)
+        log(f"  Rendered {len(page_images)} page images")
+    except Exception as e:
+        log(f"  ⚠ Image render failed, continuing text-only: {e}")
+        page_images = []
+
     log("Calling Claude to extract project info and features...")
     client = anthropic.Anthropic(api_key=api_key)
     try:
-        schema = call_claude(client, HIGHWAY_PROMPT, text[:40000], max_tokens=4096)
-        prefix = schema.get("pm_prefix") or ""
+        schema = call_claude(client, HIGHWAY_PROMPT, text[:40000], images=page_images, max_tokens=8192)
         log(f"✓ Route {schema.get('route')} | {schema.get('county')} | {schema.get('contract_number')}")
-        log(f"  PM {prefix}{schema.get('pm_start')} → {prefix}{schema.get('pm_end')}")
         features = schema.get("features", [])
         # Enforce type based on road_name: named road = road_connection, "DRIVEWAY"/null = driveway
         for feat in features:
@@ -252,28 +294,70 @@ def run_highway_extraction(doc_id: str, api_key: str, highway_docs: dict):
     route = schema.get("route", "")
     pm_segments = schema.get("pm_segments") or []
 
-    # Main segment endpoints — use the first pm_segment's polyline for the map line
-    log("Fetching main segment polyline from Caltrans LRS...")
-    first_prefix = (pm_segments[0].get("prefix") or None) if pm_segments else None
-    main_pts = get_polyline_points(route, county_code, first_prefix, alignment="R")
-    if main_pts:
+    # Main segment endpoints — use work_segments for the actual paving run extents
+    log("Resolving main segment endpoints from Caltrans Postmiles...")
+    work_segs = schema.get("work_segments") or []
+    first_wseg = work_segs[0] if work_segs else None
+    last_wseg = work_segs[-1] if work_segs else None
+    start_prefix = (first_wseg.get("start_prefix") or "") if first_wseg else ""
+    start_pm = float(first_wseg.get("start") or 0) if first_wseg else 0.0
+    end_prefix = (last_wseg.get("end_prefix") or "") if last_wseg else ""
+    end_pm = float(last_wseg.get("end") or 0) if last_wseg else 0.0
+
+    start_pt = pm_to_coords(route, county_code, start_pm, start_prefix)
+    if not start_pt:
+        for delta in [0.1, 0.2, 0.5, 1.0]:
+            start_pt = pm_to_coords(route, county_code, start_pm + delta, start_prefix)
+            if start_pt:
+                break
+
+    end_pt = pm_to_coords(route, county_code, end_pm, end_prefix)
+    if not end_pt:
+        for delta in [0.1, 0.2, 0.5, 1.0]:
+            end_pt = pm_to_coords(route, county_code, end_pm - delta, end_prefix)
+            if end_pt:
+                break
+    if start_pt and end_pt:
         schema["coordinates"] = {
-            "start": {"lat": main_pts[0][1], "lng": main_pts[0][0]},
-            "end": {"lat": main_pts[-1][1], "lng": main_pts[-1][0]},
+            "start": {"lat": round(start_pt["lat"], 6), "lng": round(start_pt["lng"], 6)},
+            "end": {"lat": round(end_pt["lat"], 6), "lng": round(end_pt["lng"], 6)},
         }
-        log(f"✓ Start: {main_pts[0][1]:.5f}, {main_pts[0][0]:.5f}")
-        log(f"✓ End:   {main_pts[-1][1]:.5f}, {main_pts[-1][0]:.5f}")
+        log(f"✓ Start (PM {start_prefix}{start_pm}): {start_pt['lat']:.5f}, {start_pt['lng']:.5f}")
+        log(f"✓ End   (PM {end_prefix}{end_pm}): {end_pt['lat']:.5f}, {end_pt['lng']:.5f}")
     else:
         schema["coordinates"] = None
-        log("⚠ Could not fetch main segment polyline")
+        log("⚠ Could not resolve main segment endpoints")
+
+    # Work segment coordinates — one start/end pair per continuous paving run
+    if work_segs:
+        seg_coords = []
+        for seg in work_segs:
+            s_start_prefix = seg.get("start_prefix") or ""
+            s_end_prefix = seg.get("end_prefix") or ""
+            s_start = float(seg.get("start") or 0)
+            s_end = float(seg.get("end") or 0)
+            sp = pm_to_coords(route, county_code, s_start, s_start_prefix)
+            ep = pm_to_coords(route, county_code, s_end, s_end_prefix)
+            if sp and ep:
+                seg_coords.append({
+                    "start": {"lat": round(sp["lat"], 6), "lng": round(sp["lng"], 6)},
+                    "end": {"lat": round(ep["lat"], 6), "lng": round(ep["lng"], 6)},
+                })
+        if seg_coords:
+            schema["segment_coords"] = seg_coords
+            log(f"✓ Resolved {len(seg_coords)}/{len(work_segs)} work segment polylines")
 
     # Point features — look up each PM directly from Postmiles_Tenth
     log(f"Resolving coordinates for {len(features)} features...")
     resolved = 0
     for feat in features:
         feat_prefix = feat.get("pm_prefix") or ""
-        feat_pm = float(feat.get("pm") or 0)
-        pt = pm_to_coords(route, county_code, feat_pm, feat_prefix)
+        feat_pm = feat.get("pm")
+        if feat_pm is None:
+            feat["lat"] = None
+            feat["lng"] = None
+            continue
+        pt = pm_to_coords(route, county_code, float(feat_pm), feat_prefix)
         if pt:
             feat["lat"] = round(pt["lat"], 6)
             feat["lng"] = round(pt["lng"], 6)

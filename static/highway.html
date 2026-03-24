@@ -232,21 +232,33 @@ function showMap(schema) {
   }).addTo(map);
 
   const allLatLngs = [];
-  const prefix = schema.pm_prefix || '';
 
-  // Main segment endpoints
+  // Draw work segments — one polyline per continuous paving run
+  const segCoords = schema.segment_coords;
   const coords = schema.coordinates;
-  if (coords && coords.start && coords.end) {
+  if (segCoords && segCoords.length > 0) {
+    segCoords.forEach((seg, i) => {
+      const startLL = [seg.start.lat, seg.start.lng];
+      const endLL = [seg.end.lat, seg.end.lng];
+      L.polyline([startLL, endLL], { color: '#3182ce', weight: 4, opacity: 0.7 }).addTo(map);
+      allLatLngs.push(startLL, endLL);
+      if (i === 0) {
+        L.marker(startLL, { icon: makePin('#68d391') }).addTo(map)
+          .bindPopup(`<b>Begin Construction</b><br>${seg.start.lat.toFixed(5)}, ${seg.start.lng.toFixed(5)}`);
+      }
+      if (i === segCoords.length - 1) {
+        L.marker(endLL, { icon: makePin('#fc8181') }).addTo(map)
+          .bindPopup(`<b>End Construction</b><br>${seg.end.lat.toFixed(5)}, ${seg.end.lng.toFixed(5)}`);
+      }
+    });
+  } else if (coords && coords.start && coords.end) {
     const startLL = [coords.start.lat, coords.start.lng];
     const endLL = [coords.end.lat, coords.end.lng];
-
     L.polyline([startLL, endLL], { color: '#3182ce', weight: 4, opacity: 0.7 }).addTo(map);
-
     L.marker(startLL, { icon: makePin('#68d391') }).addTo(map)
-      .bindPopup(`<b>Start</b><br>PM ${prefix}${schema.pm_start}<br>${coords.start.lat.toFixed(5)}, ${coords.start.lng.toFixed(5)}`);
+      .bindPopup(`<b>Begin Construction</b><br>${coords.start.lat.toFixed(5)}, ${coords.start.lng.toFixed(5)}`);
     L.marker(endLL, { icon: makePin('#fc8181') }).addTo(map)
-      .bindPopup(`<b>End</b><br>PM ${prefix}${schema.pm_end}<br>${coords.end.lat.toFixed(5)}, ${coords.end.lng.toFixed(5)}`);
-
+      .bindPopup(`<b>End Construction</b><br>${coords.end.lat.toFixed(5)}, ${coords.end.lng.toFixed(5)}`);
     allLatLngs.push(startLL, endLL);
   }
 

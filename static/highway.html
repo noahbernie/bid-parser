@@ -23,10 +23,7 @@
   }
   .upload-bar label { font-size: 13px; color: #a0aec0; }
   .upload-bar input[type=file] { font-size: 13px; color: #e2e8f0; }
-  .btn {
-    padding: 6px 16px; border-radius: 6px; border: none; cursor: pointer;
-    font-size: 13px; font-weight: 500;
-  }
+  .btn { padding: 6px 16px; border-radius: 6px; border: none; cursor: pointer; font-size: 13px; font-weight: 500; }
   .btn-blue { background: #3182ce; color: white; }
   .btn-blue:hover { background: #2b6cb0; }
   .btn-blue:disabled { background: #2d3748; color: #718096; cursor: not-allowed; }
@@ -34,59 +31,40 @@
   .btn-gray:hover { background: #4a5568; }
   .filename { font-size: 13px; color: #68d391; }
 
-  .panels {
-    display: grid;
-    grid-template-columns: 1fr 340px 1fr;
-    gap: 0;
-    flex: 1;
-    overflow: hidden;
-  }
-
-  .panel {
-    display: flex; flex-direction: column;
-    border-right: 1px solid #2d3748;
-    overflow: hidden;
-  }
+  .panels { display: grid; grid-template-columns: 1fr 340px 1fr; gap: 0; flex: 1; overflow: hidden; }
+  .panel { display: flex; flex-direction: column; border-right: 1px solid #2d3748; overflow: hidden; }
   .panel:last-child { border-right: none; }
-
   .panel-header {
     background: #1a1d2e; border-bottom: 1px solid #2d3748;
     padding: 8px 14px; font-size: 12px; font-weight: 600;
-    color: #a0aec0; letter-spacing: 0.05em; text-transform: uppercase;
-    flex-shrink: 0;
+    color: #a0aec0; letter-spacing: 0.05em; text-transform: uppercase; flex-shrink: 0;
   }
 
-  /* PDF panel */
-  #pdf-embed {
-    flex: 1; width: 100%; border: none; background: #fff;
-  }
-  .pdf-placeholder {
-    flex: 1; display: flex; align-items: center; justify-content: center;
-    color: #4a5568; font-size: 14px;
-  }
+  #pdf-embed { flex: 1; width: 100%; border: none; background: #fff; }
+  .placeholder { flex: 1; display: flex; align-items: center; justify-content: center; color: #4a5568; font-size: 14px; }
 
-  /* Middle panel: log + json */
   .middle-panel { display: flex; flex-direction: column; overflow: hidden; }
-  .log-section { flex: 0 0 auto; max-height: 220px; overflow-y: auto; padding: 10px 14px; background: #0f1117; }
+  .log-section { flex: 0 0 auto; max-height: 200px; overflow-y: auto; padding: 10px 14px; background: #0f1117; }
   .log-line { font-size: 12px; font-family: monospace; color: #a0aec0; line-height: 1.6; }
   .log-line.ok { color: #68d391; }
   .log-line.err { color: #fc8181; }
   .log-line.warn { color: #f6e05e; }
-  .json-section {
-    flex: 1; overflow-y: auto; padding: 10px 14px;
-    border-top: 1px solid #2d3748;
-  }
-  pre#json-out {
-    font-size: 12px; font-family: monospace; color: #e2e8f0;
-    white-space: pre-wrap; word-break: break-word;
-  }
+  .json-section { flex: 1; overflow-y: auto; padding: 10px 14px; border-top: 1px solid #2d3748; }
+  pre#json-out { font-size: 12px; font-family: monospace; color: #e2e8f0; white-space: pre-wrap; word-break: break-word; }
 
-  /* Map panel */
   #map { flex: 1; }
-  .map-placeholder {
-    flex: 1; display: flex; align-items: center; justify-content: center;
-    color: #4a5568; font-size: 14px;
+
+  .legend {
+    position: absolute; bottom: 24px; right: 10px; z-index: 1000;
+    background: rgba(26,29,46,0.92); border: 1px solid #2d3748; border-radius: 8px;
+    padding: 10px 14px; font-size: 12px; color: #e2e8f0;
   }
+  .legend-row { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+  .legend-row:last-child { margin-bottom: 0; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.6); flex-shrink: 0; }
+  .line-swatch { width: 20px; height: 3px; border-radius: 2px; flex-shrink: 0; }
+  .legend-toggle { opacity: 0.35; transition: opacity 0.15s; }
+  .legend-toggle.active { opacity: 1; }
 </style>
 </head>
 <body>
@@ -106,14 +84,12 @@
 
 <div class="panels">
 
-  <!-- PDF Viewer -->
   <div class="panel">
     <div class="panel-header">Source Document</div>
-    <div class="pdf-placeholder" id="pdf-placeholder">Upload a PDF to preview it here</div>
+    <div class="placeholder" id="pdf-placeholder">Upload a PDF to preview it here</div>
     <iframe id="pdf-embed" style="display:none"></iframe>
   </div>
 
-  <!-- Log + JSON -->
   <div class="panel middle-panel">
     <div class="panel-header">Extraction Log</div>
     <div class="log-section" id="log-section">
@@ -125,11 +101,18 @@
     </div>
   </div>
 
-  <!-- Map -->
-  <div class="panel">
-    <div class="panel-header">Map — Start / End Coordinates</div>
-    <div class="map-placeholder" id="map-placeholder">Map will appear after coordinates are resolved</div>
-    <div id="map" style="display:none"></div>
+  <div class="panel" style="position:relative">
+    <div class="panel-header">Map — Route Segment &amp; Features</div>
+    <div class="placeholder" id="map-placeholder">Map will appear after extraction completes</div>
+    <div id="map" style="display:none; flex:1;"></div>
+    <div class="legend" id="legend" style="display:none">
+      <div class="legend-row"><div class="line-swatch" style="background:#3182ce"></div> Route segment</div>
+      <div class="legend-row"><div class="dot" style="background:#68d391"></div> Start (PM begin)</div>
+      <div class="legend-row"><div class="dot" style="background:#fc8181"></div> End (PM end)</div>
+      <div class="legend-row legend-toggle active" data-type="driveway" style="cursor:pointer" title="Click to toggle"><div class="dot" style="background:#f6ad55"></div> Driveway</div>
+      <div class="legend-row legend-toggle active" data-type="road_connection" style="cursor:pointer" title="Click to toggle"><div class="dot" style="background:#b794f4"></div> Road connection</div>
+      <div class="legend-row legend-toggle active" data-type="pullout" style="cursor:pointer" title="Click to toggle"><div class="dot" style="background:#f6e05e"></div> Pullout</div>
+    </div>
   </div>
 
 </div>
@@ -138,6 +121,8 @@
 let docId = null;
 let pollTimer = null;
 let map = null;
+let markersByType = {}; // type → [L.Marker, ...]
+let activeTypes = new Set(['driveway', 'road_connection', 'pullout']);
 
 const fileInput = document.getElementById('file-input');
 const extractBtn = document.getElementById('extract-btn');
@@ -149,6 +134,13 @@ const logSection = document.getElementById('log-section');
 const jsonOut = document.getElementById('json-out');
 const mapDiv = document.getElementById('map');
 const mapPlaceholder = document.getElementById('map-placeholder');
+const legend = document.getElementById('legend');
+
+const FEATURE_COLORS = {
+  driveway: '#f6ad55',
+  road_connection: '#b794f4',
+  pullout: '#f6e05e',
+};
 
 fileInput.addEventListener('change', () => {
   if (fileInput.files.length > 0) {
@@ -162,7 +154,6 @@ extractBtn.addEventListener('click', async () => {
   extractBtn.disabled = true;
   resetBtn.style.display = 'inline-block';
 
-  // Upload
   const formData = new FormData();
   formData.append('file', fileInput.files[0]);
   addLog('Uploading PDF...');
@@ -171,16 +162,12 @@ extractBtn.addEventListener('click', async () => {
   const uploadData = await uploadRes.json();
   docId = uploadData.doc_id;
 
-  // Show PDF
   pdfPlaceholder.style.display = 'none';
   pdfEmbed.style.display = 'block';
   pdfEmbed.src = `/highway/doc/${docId}/pdf`;
 
-  // Start extraction
   await fetch(`/highway/doc/${docId}/extract`, { method: 'POST' });
   addLog('Extraction started...');
-
-  // Poll
   pollTimer = setInterval(pollStatus, 1500);
 });
 
@@ -199,6 +186,7 @@ resetBtn.addEventListener('click', () => {
   jsonOut.style.color = '#4a5568';
   mapDiv.style.display = 'none';
   mapPlaceholder.style.display = 'flex';
+  legend.style.display = 'none';
   if (map) { map.remove(); map = null; }
 });
 
@@ -207,7 +195,6 @@ async function pollStatus() {
   const res = await fetch(`/highway/doc/${docId}/status`);
   const data = await res.json();
 
-  // Update logs
   logSection.innerHTML = '';
   (data.logs || []).forEach(line => {
     const div = document.createElement('div');
@@ -219,55 +206,88 @@ async function pollStatus() {
 
   if (data.done && data.schema) {
     clearInterval(pollTimer);
-
-    // Show JSON
     jsonOut.style.color = '#e2e8f0';
     jsonOut.textContent = JSON.stringify(data.schema, null, 2);
-
-    // Show map if coordinates available
-    const coords = data.schema.coordinates;
-    if (coords && coords.start && coords.end) {
-      showMap(coords.start, coords.end, data.schema);
-    }
+    showMap(data.schema);
   }
 }
 
-function showMap(start, end, schema) {
+function makePin(color) {
+  return L.divIcon({
+    html: `<div style="background:${color};width:12px;height:12px;border-radius:50%;border:2px solid rgba(255,255,255,0.8);box-shadow:0 1px 4px rgba(0,0,0,.6)"></div>`,
+    className: '',
+    iconAnchor: [6, 6],
+  });
+}
+
+function showMap(schema) {
   mapPlaceholder.style.display = 'none';
   mapDiv.style.display = 'block';
+  legend.style.display = 'block';
 
   if (map) map.remove();
   map = L.map('map');
-
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '© OpenStreetMap contributors'
   }).addTo(map);
 
-  const startLatLng = [start.lat, start.lng];
-  const endLatLng = [end.lat, end.lng];
-
-  // Draw line between endpoints
-  L.polyline([startLatLng, endLatLng], { color: '#3182ce', weight: 4, opacity: 0.8 }).addTo(map);
-
-  // Start marker (green)
-  const startIcon = L.divIcon({
-    html: `<div style="background:#68d391;width:14px;height:14px;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.5)"></div>`,
-    className: '', iconAnchor: [7, 7]
-  });
-  const endIcon = L.divIcon({
-    html: `<div style="background:#fc8181;width:14px;height:14px;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.5)"></div>`,
-    className: '', iconAnchor: [7, 7]
-  });
-
+  const allLatLngs = [];
   const prefix = schema.pm_prefix || '';
-  L.marker(startLatLng, { icon: startIcon })
-    .addTo(map)
-    .bindPopup(`<b>Start</b><br>PM ${prefix}${schema.pm_start}<br>${start.lat.toFixed(5)}, ${start.lng.toFixed(5)}`);
-  L.marker(endLatLng, { icon: endIcon })
-    .addTo(map)
-    .bindPopup(`<b>End</b><br>PM ${prefix}${schema.pm_end}<br>${end.lat.toFixed(5)}, ${end.lng.toFixed(5)}`);
 
-  map.fitBounds([startLatLng, endLatLng], { padding: [40, 40] });
+  // Main segment endpoints
+  const coords = schema.coordinates;
+  if (coords && coords.start && coords.end) {
+    const startLL = [coords.start.lat, coords.start.lng];
+    const endLL = [coords.end.lat, coords.end.lng];
+
+    L.polyline([startLL, endLL], { color: '#3182ce', weight: 4, opacity: 0.7 }).addTo(map);
+
+    L.marker(startLL, { icon: makePin('#68d391') }).addTo(map)
+      .bindPopup(`<b>Start</b><br>PM ${prefix}${schema.pm_start}<br>${coords.start.lat.toFixed(5)}, ${coords.start.lng.toFixed(5)}`);
+    L.marker(endLL, { icon: makePin('#fc8181') }).addTo(map)
+      .bindPopup(`<b>End</b><br>PM ${prefix}${schema.pm_end}<br>${coords.end.lat.toFixed(5)}, ${coords.end.lng.toFixed(5)}`);
+
+    allLatLngs.push(startLL, endLL);
+  }
+
+  // Point features
+  markersByType = {};
+  activeTypes = new Set(['driveway', 'road_connection', 'pullout']);
+  document.querySelectorAll('.legend-toggle').forEach(el => el.classList.add('active'));
+
+  const features = schema.features || [];
+  features.forEach(feat => {
+    if (feat.lat == null || feat.lng == null) return;
+    const ll = [feat.lat, feat.lng];
+    const color = FEATURE_COLORS[feat.type] || '#a0aec0';
+    const featPrefix = feat.pm_prefix || '';
+    const label = feat.road_name || feat.type;
+    const popup = `<b>${feat.type}</b><br>${label}<br>PM ${featPrefix}${feat.pm} ${feat.side}<br>${feat.lat.toFixed(5)}, ${feat.lng.toFixed(5)}`;
+    const marker = L.marker(ll, { icon: makePin(color) }).addTo(map).bindPopup(popup);
+    if (!markersByType[feat.type]) markersByType[feat.type] = [];
+    markersByType[feat.type].push(marker);
+    allLatLngs.push(ll);
+  });
+
+  if (allLatLngs.length > 0) {
+    map.fitBounds(allLatLngs, { padding: [40, 40] });
+  }
+
+  // Legend toggle clicks
+  document.querySelectorAll('.legend-toggle').forEach(el => {
+    el.onclick = () => {
+      const type = el.dataset.type;
+      if (activeTypes.has(type)) {
+        activeTypes.delete(type);
+        el.classList.remove('active');
+        (markersByType[type] || []).forEach(m => map.removeLayer(m));
+      } else {
+        activeTypes.add(type);
+        el.classList.add('active');
+        (markersByType[type] || []).forEach(m => m.addTo(map));
+      }
+    };
+  });
 }
 
 function addLog(msg) {

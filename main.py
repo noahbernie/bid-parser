@@ -10,6 +10,7 @@ import os
 import json
 import time
 import asyncio
+import base64
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -35,9 +36,18 @@ Use null for any field not found."""
 STREETS_PROMPT = """You are parsing pages from a road construction bid document. Extract ALL street segments from any tables or lists on these pages.
 Return ONLY valid JSON: {"streets": [...]}
 Each street object: {"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "...", "location": "..."}
-Use null for missing fields. Return {"streets": []} if no street data on these pages.
-IMPORTANT: Read every row of every table. Do not skip any streets.
-NOTE: Some pages are CAD engineering drawings where text may be partially clipped at cell borders (e.g. "ARLING ST" = "YEARLING ST", "BURY DR" = continuation of previous row). Use context and common street naming patterns to reconstruct partial names. Include every street you can identify even if the name is partially truncated."""
+
+Use your judgment to map whatever columns are present to these fields:
+- main_street: the street being worked on
+- from_street: where the work begins (may be labeled START, FROM, BEGIN, LIMITS FROM, or similar)
+- to_street: where the work ends (may be labeled END, TO, TERMINUS, LIMITS TO, or similar)
+- work_type: the type of work — use the table section header/title if no explicit column (e.g. "SLURRY/CAPE SEAL LIST" → "Slurry/Cape Seal", "CRACK FILL/REPAIR ONLY LIST" → "Crack Fill/Repair")
+- location: any location number or zone identifier if present
+
+Every table is different — read the header row to understand what each column means, then extract every data row.
+If a field has no corresponding column in this table, use null.
+IMPORTANT: Extract every single row. Do not skip any. Each data row = one street object.
+NOTE: Some pages are CAD engineering drawings where text may be partially clipped at cell borders. Use context and common street naming patterns to reconstruct partial names."""
 
 
 STREET_KEYWORDS = [
@@ -55,29 +65,122 @@ def is_relevant_page(text: str) -> bool:
         return False
     return sum(1 for kw in STREET_KEYWORDS if kw in t) >= 3
 
+def tables_to_markdown(tables: list) -> str:
+    """Convert pdfplumber table list to markdown table strings."""
+    parts = []
+    for table in tables:
+        if not table:
+            continue
+        # Normalize cells: replace None with empty string
+        rows = [[str(cell or "").strip() for cell in row] for row in table]
+        if not rows:
+            continue
+        # Determine column widths
+        col_count = max(len(r) for r in rows)
+        rows = [r + [""] * (col_count - len(r)) for r in rows]
+        col_widths = [max(len(r[c]) for r in rows) for c in range(col_count)]
+        def fmt_row(r):
+            return "| " + " | ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(r)) + " |"
+        lines = [fmt_row(rows[0])]
+        lines.append("| " + " | ".join("-" * w for w in col_widths) + " |")
+        for row in rows[1:]:
+            lines.append(fmt_row(row))
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
 def extract_text_smart(page, page_index: int = None, pdf_bytes: bytes = None) -> str:
     """
     Extract text from a pdfplumber page.
-    Standard pages: pdfplumber extract_text() works well.
-    Large-format engineering drawings (>14"): use PyMuPDF which produces cleaner
-    line-by-line output than pdfplumber's word-coordinate approach on these files.
+    - Always tries extract_tables() first and formats as markdown (preserves column structure)
+    - Appends remaining non-table text below
+    - Large-format engineering drawings (>14"): use PyMuPDF for better text flow
     """
     is_large_format = max(page.width, page.height) > 1008  # > 14 inches at 72dpi
-    if not is_large_format:
-        return page.extract_text() or ""
 
-    # Use PyMuPDF for large-format pages — better text flow on engineering drawings
-    if pdf_bytes is not None and page_index is not None:
+    # Always try table extraction first — even large-format pages can have tables
+    parts = []
+    try:
+        tables = page.extract_tables()
+        if tables:
+            parts.append(tables_to_markdown(tables))
+    except Exception:
+        pass
+
+    if parts:
+        # Tables found — also grab plain text for any content outside the table cells
+        plain = page.extract_text() or ""
+        if plain:
+            parts.append(plain)
+        return "\n\n".join(parts)
+
+    # No tables found — use best available plain text extractor
+    if is_large_format and pdf_bytes is not None and page_index is not None:
+        # PyMuPDF handles large-format CAD drawings better than pdfplumber
         try:
             fitz_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
             fitz_page = fitz_doc[page_index]
             text = fitz_page.get_text("text")
             fitz_doc.close()
-            return text or ""
+            if text:
+                return text
         except Exception:
             pass
 
     return page.extract_text() or ""
+
+def render_page_as_image(pdf_bytes: bytes, page_index: int, dpi: int = 120) -> str:
+    """Render a PDF page to a base64 PNG."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = doc[page_index].get_pixmap(matrix=mat)
+    img_bytes = pix.tobytes("png")
+    doc.close()
+    return base64.standard_b64encode(img_bytes).decode()
+
+def page_has_tables(page, pdf_bytes: bytes = None, page_index: int = None) -> bool:
+    """
+    Detect if a page likely has table structure by looking for rows with
+    many words spread across the page width (multi-column = table rows).
+    Uses PyMuPDF word positions — works even when table borders are rasterized.
+    Falls back to pdfplumber rect/edge detection for standard pages.
+    """
+    if pdf_bytes is not None and page_index is not None:
+        try:
+            from collections import defaultdict
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            fitz_page = doc[page_index]
+            words = fitz_page.get_text("words")
+            page_width = fitz_page.rect.width
+            doc.close()
+
+            if len(words) >= 20:
+                rows = defaultdict(list)
+                for w in words:
+                    y_bin = round(w[1] / 3) * 3
+                    rows[y_bin].append(w[0])  # collect x positions
+
+                # Count rows where >=4 words span >40% of page width (multi-column)
+                multi_col_rows = sum(
+                    1 for x_list in rows.values()
+                    if len(x_list) >= 4 and (max(x_list) - min(x_list)) / page_width > 0.4
+                )
+                if multi_col_rows >= 5:
+                    return True
+        except Exception:
+            pass
+
+    # Fallback: pdfplumber geometry (works when borders are vector lines)
+    try:
+        if len(page.rects) >= 6:
+            return True
+        h_edges = [e for e in page.edges if e.get("orientation") == "h"]
+        if len(h_edges) >= 6:
+            return True
+    except Exception:
+        pass
+    return False
+
 
 def call_claude(client, prompt: str, content_blocks: list, max_tokens: int = 4096) -> dict:
     content = [{"type": "text", "text": prompt}] + content_blocks
@@ -88,7 +191,10 @@ def call_claude(client, prompt: str, content_blocks: list, max_tokens: int = 409
     ) as stream:
         msg = stream.get_final_message()
     raw = msg.content[0].text.strip()
-    # Log raw response to file for debugging
+    # Log input and response to file for debugging
+    with open("/tmp/claude_last_input.txt", "w") as f:
+        for block in content_blocks:
+            f.write(block.get("text", "") + "\n")
     with open("/tmp/claude_last_response.txt", "w") as f:
         f.write(f"stop_reason: {msg.stop_reason}\n")
         f.write(f"raw_len: {len(raw)}\n")
@@ -105,24 +211,22 @@ def call_claude(client, prompt: str, content_blocks: list, max_tokens: int = 409
                 break
     return json.loads(raw)
 
-def call_claude_with_retry(client, prompt, content_blocks, max_tokens=4096, max_retries=3):
+def call_claude_with_retry(client, prompt, content_blocks, max_tokens=4096, max_retries=4, log_fn=None):
     """Call Claude with exponential backoff on rate limit errors."""
     for attempt in range(max_retries):
         try:
             return call_claude(client, prompt, content_blocks, max_tokens)
         except anthropic.RateLimitError as e:
-            wait = 60 * (attempt + 1)
-            raise RateLimitRetry(wait, str(e))
+            wait = 30 * (2 ** attempt)  # 30, 60, 120, 240s
+            if log_fn:
+                log_fn(f"  ⚠ Rate limit hit — waiting {wait}s (attempt {attempt+1}/{max_retries})...")
+            time.sleep(wait)
         except Exception as e:
             if attempt < max_retries - 1:
-                time.sleep(5)
+                time.sleep(3)
                 continue
             raise
-
-class RateLimitRetry(Exception):
-    def __init__(self, wait_seconds, msg):
-        self.wait_seconds = wait_seconds
-        self.msg = msg
+    raise Exception("Max retries exceeded due to rate limits")
 
 
 @app.post("/upload")
@@ -200,16 +304,32 @@ def run_extraction(doc_id: str, api_key: str):
     # --- Step 1: scan all pages with smart text extraction ---
     log("Scanning all pages...")
     relevant_indices = []
+    table_page_indices = set()  # pages that have detected table grid structures
 
     pdf_bytes = doc["bytes"]
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for i, page in enumerate(pdf.pages):
             text = extract_text_smart(page, page_index=i, pdf_bytes=pdf_bytes)
             doc["page_cache"][i + 1] = text
-            if is_relevant_page(text):
+            has_table = page_has_tables(page, pdf_bytes=pdf_bytes, page_index=i)
+            relevant = is_relevant_page(text)
+            if has_table:
+                table_page_indices.add(i)
+            if relevant:
                 relevant_indices.append(i)
+            tags = []
+            if relevant:
+                tags.append("street content")
+            if has_table:
+                tags.append("📊 table detected → will send image")
+            if tags:
+                log(f"  Page {i + 1}: {', '.join(tags)}")
 
-    log(f"Found {len(relevant_indices)} street-relevant pages out of {doc['total_pages']} total")
+    log(f"────────────────────────────────────")
+    log(f"Scan complete: {doc['total_pages']} pages total")
+    log(f"  Street-relevant: {len(relevant_indices)} pages ({[i+1 for i in relevant_indices]})")
+    log(f"  Table pages (image): {len(table_page_indices)} pages ({sorted([i+1 for i in table_page_indices])})")
+    log(f"────────────────────────────────────")
 
     client = anthropic.Anthropic(api_key=api_key)
 
@@ -225,7 +345,7 @@ def run_extraction(doc_id: str, api_key: str):
         header_chars += len(entry)
 
     try:
-        schema = call_claude_with_retry(client, HEADER_PROMPT, header_blocks, max_tokens=1024)
+        schema = call_claude_with_retry(client, HEADER_PROMPT, header_blocks, max_tokens=1024, log_fn=log)
         log(f"✓ Project: {schema.get('project_name')} | {schema.get('city')} | {schema.get('bid_number')}")
     except Exception as e:
         log(f"✗ Header extraction failed: {e}")
@@ -235,40 +355,53 @@ def run_extraction(doc_id: str, api_key: str):
     all_streets = []
 
     # --- Step 3: build text chunks from all relevant pages ---
+    # Pages with detected table structures get their image sent alongside the text
     chunks = []
     current_blocks = []
     current_size = 0
     for page_idx in relevant_indices:
         text = doc["page_cache"].get(page_idx + 1, "")
         entry = f"\n--- Page {page_idx + 1} ---\n{text}"
+        blocks_for_page = [{"type": "text", "text": entry}]
+
+        if page_idx in table_page_indices:
+            try:
+                b64 = render_page_as_image(pdf_bytes, page_idx)
+                blocks_for_page.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}})
+                log(f"  Page {page_idx + 1}: sending text + image (table page)")
+            except Exception as e:
+                log(f"  Page {page_idx + 1}: image render failed ({e}), text only")
+
+        # Images are large — flush chunk before and after to avoid token overload
+        has_image = any(b["type"] == "image" for b in blocks_for_page)
+        if has_image and current_blocks:
+            chunks.append(current_blocks)
+            current_blocks = []
+            current_size = 0
+
         if current_size + len(entry) > CHUNK_CHAR_LIMIT and current_blocks:
             chunks.append(current_blocks)
             current_blocks = []
             current_size = 0
-        current_blocks.append({"type": "text", "text": entry})
+
+        current_blocks.extend(blocks_for_page)
         current_size += len(entry)
+
+        if has_image:
+            chunks.append(current_blocks)
+            current_blocks = []
+            current_size = 0
+
     if current_blocks:
         chunks.append(current_blocks)
 
     log(f"Split into {len(chunks)} chunks. Starting street extraction...")
 
-    # Rate limit: 30k tokens/min. Each chunk is ~20k tokens (80k chars / 4).
-    # Sleep proportionally — always sleep before every chunk including the first
-    # since the header call already consumed tokens in this minute window.
-    RATE_LIMIT_CHARS_PER_MIN = 120000  # ~30k tokens × 4 chars/token
-
-    def sleep_for_chunk(chars_used: int):
-        wait = max(5, int((chars_used / RATE_LIMIT_CHARS_PER_MIN) * 65))
-        log(f"  Waiting {wait}s for rate limit...")
-        time.sleep(wait)
-
     for i, chunk_blocks in enumerate(chunks):
-        chunk_size = sum(len(b["text"]) for b in chunk_blocks)
-        sleep_chars = (header_chars + chunk_size) if i == 0 else chunk_size
-        sleep_for_chunk(sleep_chars)
+        chunk_size = sum(len(b.get("text", "")) for b in chunk_blocks if b["type"] == "text")
         log(f"Processing chunk {i+1}/{len(chunks)} (~{chunk_size // 1000}k chars)...")
         try:
-            result = call_claude_with_retry(client, STREETS_PROMPT, chunk_blocks, max_tokens=32000)
+            result = call_claude_with_retry(client, STREETS_PROMPT, chunk_blocks, max_tokens=32000, log_fn=log)
             new_streets = result.get("streets", [])
             all_streets.extend(new_streets)
             schema["streets"] = all_streets
@@ -276,19 +409,55 @@ def run_extraction(doc_id: str, api_key: str):
                 log(f"  ✓ {len(new_streets)} streets found (total: {len(all_streets)})", all_streets)
             else:
                 log(f"  · No streets on these pages")
-        except RateLimitRetry as e:
-            log(f"  ⚠ Rate limit — waiting {e.wait_seconds}s then retrying...")
-            time.sleep(e.wait_seconds)
-            try:
-                result = call_claude_with_retry(client, STREETS_PROMPT, chunk_blocks, max_tokens=32000)
-                new_streets = result.get("streets", [])
-                all_streets.extend(new_streets)
-                schema["streets"] = all_streets
-                log(f"  ✓ Retry ok: {len(new_streets)} streets (total: {len(all_streets)})", all_streets)
-            except Exception as e2:
-                log(f"  ✗ Failed after retry: {str(e2)[:200]}")
         except Exception as e:
             log(f"  ✗ Error: {str(e)[:200]}")
+
+    # --- Deduplication ---
+    # 1. Remove exact duplicates (same main+from+to+work_type)
+    # 2. If a street has null/? from AND null/? to, and a richer version exists, drop the sparse one
+    _SUFFIX_MAP = {
+        "STREET": "ST", "AVENUE": "AV", "DRIVE": "DR", "BOULEVARD": "BL",
+        "ROAD": "RD", "COURT": "CT", "LANE": "LN", "PLACE": "PL",
+        "WAY": "WY", "CIRCLE": "CIR", "TERRACE": "TER", "TRAIL": "TRL",
+    }
+    def norm_name(v):
+        if not v:
+            return ""
+        parts = v.strip().upper().split()
+        if parts and parts[-1] in _SUFFIX_MAP:
+            parts[-1] = _SUFFIX_MAP[parts[-1]]
+        return " ".join(parts)
+
+    def is_empty(v):
+        return not v or v.strip() in ("?", "null", "None", "")
+
+    seen = {}
+    for s in all_streets:
+        key = (
+            norm_name(s.get("main_street")),
+            norm_name(s.get("from_street")),
+            norm_name(s.get("to_street")),
+            (s.get("work_type") or "").strip().upper(),
+        )
+        empty = is_empty(s.get("from_street")) and is_empty(s.get("to_street"))
+        if key not in seen:
+            seen[key] = (s, empty)
+        elif empty and not seen[key][1]:
+            pass  # already have a richer version, skip
+        elif not empty and seen[key][1]:
+            seen[key] = (s, empty)  # replace sparse with richer
+
+    # Also drop sparse entries whose main_street has ANY richer entry
+    mains_with_data = {k[0] for k, (_, emp) in seen.items() if not emp}
+    deduped = [
+        s for (k, (s, emp)) in seen.items()
+        if not emp or k[0] not in mains_with_data
+    ]
+
+    before = len(all_streets)
+    all_streets = deduped
+    schema["streets"] = all_streets
+    log(f"  Deduplication: {before} → {len(all_streets)} streets (removed {before - len(all_streets)} duplicates)")
 
     schema["_meta"] = {
         "total_pages": doc["total_pages"],

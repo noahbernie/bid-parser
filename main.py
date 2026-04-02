@@ -366,9 +366,13 @@ def run_extraction(doc_id: str, api_key: str):
 
         if page_idx in table_page_indices:
             try:
-                b64 = render_page_as_image(pdf_bytes, page_idx)
-                blocks_for_page.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}})
-                log(f"  Page {page_idx + 1}: sending text + image (table page)")
+                b64 = render_page_as_image(pdf_bytes, page_idx, dpi=180)
+                # Image only — drop the garbled text so Claude reads the table visually
+                blocks_for_page = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}]
+                log(f"  Page {page_idx + 1}: sending image only at 180 DPI (table page)")
+                # OLD: sent text + image together — caused row-shift errors on multi-column tables
+                # blocks_for_page.append({"type": "image", ...})
+                # log(f"  Page {page_idx + 1}: sending text + image (table page)")
             except Exception as e:
                 log(f"  Page {page_idx + 1}: image render failed ({e}), text only")
 

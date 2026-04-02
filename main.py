@@ -129,18 +129,12 @@ def extract_text_smart(page, page_index: int = None, pdf_bytes: bytes = None) ->
 
     return page.extract_text() or ""
 
-def render_page_as_image(pdf_bytes: bytes, page_index: int, dpi: int = 150) -> str:
-    """Render a PDF page to a base64 PNG, scaling down if over Claude's 5MB limit."""
-    MAX_BYTES = 4_500_000  # stay under 5MB limit with buffer
+def render_page_as_image(pdf_bytes: bytes, page_index: int, dpi: int = 120) -> str:
+    """Render a PDF page to a base64 PNG."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    current_dpi = dpi
-    while current_dpi >= 60:
-        mat = fitz.Matrix(current_dpi / 72, current_dpi / 72)
-        pix = doc[page_index].get_pixmap(matrix=mat)
-        img_bytes = pix.tobytes("png")
-        if len(img_bytes) <= MAX_BYTES:
-            break
-        current_dpi -= 20
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = doc[page_index].get_pixmap(matrix=mat)
+    img_bytes = pix.tobytes("png")
     doc.close()
     return base64.standard_b64encode(img_bytes).decode()
 
@@ -373,12 +367,8 @@ def run_extraction(doc_id: str, api_key: str):
         if page_idx in table_page_indices:
             try:
                 b64 = render_page_as_image(pdf_bytes, page_idx)
-                # Image only — drop the garbled text so Claude reads the table visually
-                blocks_for_page = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}]
-                log(f"  Page {page_idx + 1}: sending image only (table page)")
-                # OLD: sent text + image together — caused row-shift errors on multi-column tables
-                # blocks_for_page.append({"type": "image", ...})
-                # log(f"  Page {page_idx + 1}: sending text + image (table page)")
+                blocks_for_page.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}})
+                log(f"  Page {page_idx + 1}: sending text + image (table page)")
             except Exception as e:
                 log(f"  Page {page_idx + 1}: image render failed ({e}), text only")
 

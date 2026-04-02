@@ -205,6 +205,10 @@
     }
     .schema-header button:hover { background: #3730a3; }
     .schema-header button:disabled { background: #a5b4fc; cursor: not-allowed; }
+    .schema-header button.download {
+      background: #059669;
+    }
+    .schema-header button.download:hover { background: #047857; }
 
     .schema-body {
       flex: 1;
@@ -356,6 +360,7 @@
       <h3>Extracted Schema</h3>
       <button id="extract-btn" onclick="extractSchema()" disabled>Extract with AI</button>
       <button id="reextract-btn" onclick="reExtractSchema()" disabled style="background:#6b7280;margin-left:6px;">Re-extract</button>
+      <button id="download-btn" class="download" onclick="downloadJSON()" style="display:none;margin-left:6px;">⬇ JSON</button>
     </div>
     <div class="schema-body" id="schema-body">
       <div class="schema-empty">Select a document and click<br>"Extract with AI" to parse fields.</div>
@@ -437,6 +442,7 @@
     // Reset schema panel
     document.getElementById('schema-body').innerHTML =
       '<div class="schema-empty">Click "Extract with AI" to parse this document.</div>';
+    document.getElementById('download-btn').style.display = 'none';
     viewCurrentPage();
   }
 
@@ -510,6 +516,7 @@
           const reBtn = document.getElementById('reextract-btn');
           btn.disabled = false; reBtn.disabled = false;
           btn.textContent = 'Extract with AI';
+          document.getElementById('download-btn').style.display = 'inline-block';
         } else {
           renderLiveProgress(logs, streets);
         }
@@ -617,6 +624,19 @@
 
   function escapeHtml(str) {
     return (str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  async function downloadJSON() {
+    if (!currentDocId) return;
+    const res = await fetch(`/doc/${currentDocId}/status`);
+    const data = await res.json();
+    if (!data.schema) return;
+    const blob = new Blob([JSON.stringify(data.schema, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const filename = (data.schema.bid_number || currentDocId) + '_extracted.json';
+    a.href = url; a.download = filename; a.click();
+    URL.revokeObjectURL(url);
   }
 
   function showToast(msg) {

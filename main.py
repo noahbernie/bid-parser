@@ -61,7 +61,8 @@ Return ONLY valid JSON: {"streets": [...]}
 Each street object: {"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "...", "location": "...", "source": "image"}
 
 """ + _STREETS_PROMPT_BASE.replace("{SOURCE_TAG}", "image") + """
-NOTE: Read each row carefully left-to-right. Each row is independent — do not carry over values from adjacent rows. Column 1 = main_street (the street being worked on), Column 2 = from_street (cross street where work starts), Column 3 = to_street (cross street where work ends)."""
+Read each row carefully left-to-right. Each row is independent — do not carry over values from adjacent rows.
+CRITICAL — MAIN STREET NAME: The main_street is ALWAYS read directly from the first column of that specific row. Never infer, guess, or copy it from another row. If the first column cell is hard to read, do your best to transcribe it exactly as it appears — do not substitute a nearby street name."""
 
 
 STREET_KEYWORDS = [
@@ -230,12 +231,12 @@ def call_claude_with_retry(client, prompt, content_blocks, max_tokens=4096, max_
     for attempt in range(max_retries):
         try:
             return call_claude(client, prompt, content_blocks, max_tokens, model=model)
-        except anthropic.RateLimitError as e:
+        except anthropic.RateLimitError:
             wait = 30 * (2 ** attempt)  # 30, 60, 120, 240s
             if log_fn:
                 log_fn(f"  ⚠ Rate limit hit — waiting {wait}s (attempt {attempt+1}/{max_retries})...")
             time.sleep(wait)
-        except Exception as e:
+        except Exception:
             if attempt < max_retries - 1:
                 time.sleep(3)
                 continue
@@ -494,7 +495,6 @@ def run_extraction(doc_id: str, api_key: str):
         """Process a single image chunk: main Gemini call + optional rescue. Returns (i, streets, logs)."""
         chunk_blocks = chunk["blocks"]
         chunk_text = "\n".join(b.get("text", "") for b in chunk_blocks if b["type"] == "text")
-        local_logs = []
 
         def chunk_log(msg, data=None):
             with log_lock:
@@ -662,8 +662,31 @@ def run_extraction(doc_id: str, api_key: str):
             f"high = clearly visible exact match. medium = plausible but unclear. low = cannot find or looks wrong."
         )
         t0 = time.time()
+        # Resize image for Claude: max 4MB raw and max 4000px on longest side
+        import io
+        from PIL import Image as PILImage
+        raw = base64.standard_b64decode(b64)
+        img = PILImage.open(io.BytesIO(raw))
+        MAX_DIM = 4000
+        MAX_BYTES = 4 * 1024 * 1024
+        if max(img.width, img.height) > MAX_DIM:
+            scale = MAX_DIM / max(img.width, img.height)
+            img = img.resize((int(img.width * scale), int(img.height * scale)), PILImage.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        if buf.tell() > MAX_BYTES:
+            scale = (MAX_BYTES / buf.tell()) ** 0.5
+            img = img.resize((int(img.width * scale), int(img.height * scale)), PILImage.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+        conf_b64 = base64.standard_b64encode(buf.getvalue()).decode()
+        log(f"  ↘ [CONFIDENCE chunk {chunk_idx+1}] image prepared for Claude: {len(conf_b64)*3//4//1024}KB {img.width}x{img.height}px")
+        conf_blocks = [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": conf_b64}},
+            {"type": "text", "text": prompt},
+        ]
         try:
-            result = call_gemini_image(prompt, b64, log_fn=log)
+            result = call_claude_with_retry(client, prompt, conf_blocks, max_tokens=8000, log_fn=log, model="claude-opus-4-6")
             scores = result.get("scores", [])
             elapsed = time.time() - t0
             high = sum(1 for s in scores if s.get("confidence") == "high")

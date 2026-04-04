@@ -12,6 +12,8 @@ import time
 import asyncio
 import base64
 import urllib.request
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -34,17 +36,19 @@ Return ONLY valid JSON with these fields:
 - bid_number, project_name, city, work_type, estimated_cost, bid_due_date
 Use null for any field not found."""
 
-_STREETS_PROMPT_BASE = """Use your judgment to map whatever columns are present to these fields:
-- main_street: the street being worked on
-- from_street: where the work begins (may be labeled START, FROM, BEGIN, LIMITS FROM, or similar)
-- to_street: where the work ends (may be labeled END, TO, TERMINUS, LIMITS TO, or similar)
+_STREETS_PROMPT_BASE = """Map the table columns to these fields:
+- main_street: THE STREET BEING WORKED ON — the PRIMARY street being paved, sealed, or repaired. Always in the FIRST column of the table. Copy it exactly as written — do not substitute or infer a different street name.
+- from_street: where the work segment BEGINS. Labeled START, FROM, BEGIN, LIMITS FROM, or similar. Copy exactly as written. It is okay if this is the same name as main_street or to_street.
+- to_street: where the work segment ENDS. Labeled END, TO, TERMINUS, LIMITS TO, or similar. Copy exactly as written. It is okay if this is the same name as main_street or from_street.
 - work_type: the type of work — use the table section header/title if no explicit column (e.g. "SLURRY/CAPE SEAL LIST" → "Slurry/Cape Seal", "CRACK FILL/REPAIR ONLY LIST" → "Crack Fill/Repair")
 - location: any location number or zone identifier if present
 - source: ALWAYS set to "{SOURCE_TAG}" for every street you extract — do not change this value
 
-Every table is different — read the header row to understand what each column means, then extract every data row.
-If a field has no corresponding column in this table, use null.
-IMPORTANT: Extract every single row. Do not skip any. Each data row = one street object."""
+CRITICAL RULES:
+1. Copy street names EXACTLY as they appear in the table. Do not rename, reorder, or substitute values between columns.
+2. The typical column order left-to-right is: Street Name | From | To | Work Type. Even on continuation pages with no header row, use this order.
+3. Read the header row carefully to confirm column order before extracting data rows.
+4. Extract every single row. Do not skip any. Each data row = one street object."""
 
 STREETS_PROMPT_TEXT = """You are parsing pages from a road construction bid document. Extract ALL street segments from any tables or lists on these pages.
 Return ONLY valid JSON: {"streets": [...]}
@@ -57,7 +61,7 @@ Return ONLY valid JSON: {"streets": [...]}
 Each street object: {"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "...", "location": "...", "source": "image"}
 
 """ + _STREETS_PROMPT_BASE.replace("{SOURCE_TAG}", "image") + """
-NOTE: This is a CAD engineering drawing image. Read each row carefully left-to-right. Each row is independent — do not carry over from/to values from adjacent rows."""
+NOTE: Read each row carefully left-to-right. Each row is independent — do not carry over values from adjacent rows. Column 1 = main_street (the street being worked on), Column 2 = from_street (cross street where work starts), Column 3 = to_street (cross street where work ends)."""
 
 
 STREET_KEYWORDS = [
@@ -251,14 +255,20 @@ def call_gemini_image(prompt: str, b64_image: str, max_retries: int = 4, log_fn=
             {"text": prompt},
             {"inline_data": {"mime_type": "image/png", "data": b64_image}},
         ]}],
-        "generationConfig": {"maxOutputTokens": 32000},
+        "generationConfig": {"maxOutputTokens": 65536, "temperature": 0},
     }).encode()
 
     for attempt in range(max_retries):
         try:
+            if log_fn:
+                log_fn(f"    → [Gemini] Sending request (attempt {attempt+1}, payload {len(payload)//1024}KB)...")
             req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=240) as resp:
+                if log_fn:
+                    log_fn(f"    ← [Gemini] Response received, reading body...")
                 data = json.loads(resp.read())
+                if log_fn:
+                    log_fn(f"    ← [Gemini] Body parsed OK")
             raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
             with open("/tmp/gemini_last_response.txt", "w") as f:
                 f.write(raw)
@@ -478,66 +488,93 @@ def run_extraction(doc_id: str, api_key: str):
     log(f"Split into {len(chunks)} chunks ({n_txt} text, {n_img} image). Starting street extraction...")
 
     doc["chunk_debug"] = []
-    for i, chunk in enumerate(chunks):
+    log_lock = threading.Lock()
+
+    def process_image_chunk(i, chunk):
+        """Process a single image chunk: main Gemini call + optional rescue. Returns (i, streets, logs)."""
         chunk_blocks = chunk["blocks"]
-        chunk_source = chunk["source"]
-        prompt = STREETS_PROMPT_IMAGE if chunk_source == "image" else STREETS_PROMPT_TEXT
         chunk_text = "\n".join(b.get("text", "") for b in chunk_blocks if b["type"] == "text")
-        chunk_size = len(chunk_text)
-        doc["chunk_debug"].append({
-            "index": i, "total": len(chunks), "source": chunk_source,
-            "char_count": chunk_size, "text": chunk_text,
-        })
-        label = "📷 IMAGE" if chunk_source == "image" else "📄 TEXT"
-        log(f"Processing chunk {i+1}/{len(chunks)} [{label}] (~{chunk_size // 1000}k chars)...")
+        local_logs = []
+
+        def chunk_log(msg, data=None):
+            with log_lock:
+                log(msg, data)
+
+        chunk_log(f"🚀 [IMG {i+1}/{len(chunks)}] Starting parallel image extraction...")
+        t_start = time.time()
         try:
-            if chunk_source == "image":
-                b64 = chunk_blocks[0]["source"]["data"]
-                result = call_gemini_image(prompt, b64, log_fn=log)
-            else:
-                result = call_claude_with_retry(client, prompt, chunk_blocks, max_tokens=32000, log_fn=log)
+            b64 = chunk_blocks[0]["source"]["data"]
+            chunk_log(f"  → [IMG {i+1}] Sending to Gemini (image size: {len(b64) * 3 // 4 // 1024}KB)...")
+            result = call_gemini_image(STREETS_PROMPT_IMAGE, b64, log_fn=chunk_log)
+            elapsed = time.time() - t_start
             new_streets = result.get("streets", [])
             for s in new_streets:
-                s.setdefault("source", chunk_source)
+                s.setdefault("source", "image")
+                s["_chunk_idx"] = i  # track source image for confidence pass
+            chunk_log(f"  ✓ [IMG {i+1}] Done in {elapsed:.1f}s — {len(new_streets)} streets")
+            return i, new_streets, chunk_text
 
-            # Targeted rescue pass: only for streets with no from/to AND no richer version in this chunk
-            if chunk_source == "image":
-                names_with_data = {(s.get("main_street") or "").upper() for s in new_streets
-                                   if not is_empty(s.get("from_street")) and not is_empty(s.get("to_street"))}
-                missing = [s for s in new_streets
-                           if (is_empty(s.get("from_street")) or is_empty(s.get("to_street")))
-                           and (s.get("main_street") or "").upper() not in names_with_data]
-                if missing:
-                    missing_names = ", ".join(s.get("main_street", "?") for s in missing)
-                    rescue_prompt = (
-                        f"In this table image, I couldn't read the from/to limits for these streets: {missing_names}.\n"
-                        f"Find each one in the table and return ONLY valid JSON: {{\"streets\": [...]}}\n"
-                        f"Each object: {{\"main_street\": \"...\", \"from_street\": \"...\", \"to_street\": \"...\", "
-                        f"\"work_type\": \"...\", \"location\": null, \"source\": \"image\"}}\n"
-                        f"Only include streets from the list above. Do not guess — if you truly cannot read it, omit that street."
-                    )
-                    try:
-                        rescue_result = call_gemini_image(rescue_prompt, b64, log_fn=log)
-                        rescued = rescue_result.get("streets", [])
-                        for s in rescued:
-                            s.setdefault("source", "image")
-                        # Replace sparse entries with rescued versions
-                        rescued_by_name = {(s.get("main_street") or "").upper(): s for s in rescued
-                                           if not is_empty(s.get("from_street")) and not is_empty(s.get("to_street"))}
-                        new_streets = [rescued_by_name.get((s.get("main_street") or "").upper(), s) for s in new_streets]
-                        if rescued_by_name:
-                            log(f"  ↺ [RESCUE] filled in limits for: {', '.join(rescued_by_name.keys())}")
-                    except Exception as e:
-                        log(f"  ⚠ [RESCUE] failed: {str(e)[:100]}")
-
-            all_streets.extend(new_streets)
-            schema["streets"] = all_streets
-            if new_streets:
-                log(f"  ✓ [{label}] {len(new_streets)} streets found (total: {len(all_streets)})", all_streets)
-            else:
-                log(f"  · [{label}] No streets found")
         except Exception as e:
-            log(f"  ✗ [{label}] Error: {str(e)[:200]}")
+            chunk_log(f"  ✗ [IMG {i+1}] Error: {str(e)[:200]}")
+            return i, [], chunk_text
+
+    # Separate image and text chunks, preserving original order index
+    image_chunks = [(i, c) for i, c in enumerate(chunks) if c["source"] == "image"]
+    text_chunks  = [(i, c) for i, c in enumerate(chunks) if c["source"] == "text"]
+
+    # Build chunk debug info
+    for i, chunk in enumerate(chunks):
+        chunk_text = "\n".join(b.get("text", "") for b in chunk["blocks"] if b["type"] == "text")
+        doc["chunk_debug"].append({
+            "index": i, "total": len(chunks), "source": chunk["source"],
+            "char_count": len(chunk_text), "text": chunk_text,
+        })
+
+    # Collect results keyed by original chunk index so we can merge in order
+    chunk_results = {}  # index -> list of streets
+    chunk_images = {}   # index -> b64 image string (for confidence pass)
+
+    # --- Run all image chunks in parallel ---
+    if image_chunks:
+        log(f"⚡ Launching {len(image_chunks)} image chunk(s) in parallel...")
+        t_parallel_start = time.time()
+        with ThreadPoolExecutor(max_workers=len(image_chunks)) as executor:
+            futures = {executor.submit(process_image_chunk, i, c): i for i, c in image_chunks}
+            for future in as_completed(futures):
+                i, streets, _ = future.result()
+                chunk_results[i] = streets
+                chunk_images[i] = chunks[i]["blocks"][0]["source"]["data"]
+                # Stream partial results immediately as each chunk finishes
+                partial = []
+                for idx in sorted(chunk_results.keys()):
+                    partial.extend(chunk_results[idx])
+                with log_lock:
+                    log(f"⚡ [IMG {i+1}] finished — {len(streets)} streets (partial total: {len(partial)})", partial)
+        log(f"⚡ All image chunks done in {time.time() - t_parallel_start:.1f}s total")
+
+    # --- Run text chunks sequentially (Claude, already fast) ---
+    for i, chunk in text_chunks:
+        chunk_blocks = chunk["blocks"]
+        chunk_text = "\n".join(b.get("text", "") for b in chunk_blocks if b["type"] == "text")
+        chunk_size = len(chunk_text)
+        log(f"Processing chunk {i+1}/{len(chunks)} [📄 TEXT] (~{chunk_size // 1000}k chars)...")
+        try:
+            result = call_claude_with_retry(client, STREETS_PROMPT_TEXT, chunk_blocks, max_tokens=32000, log_fn=log)
+            new_streets = result.get("streets", [])
+            for s in new_streets:
+                s.setdefault("source", "text")
+            chunk_results[i] = new_streets
+            log(f"  ✓ [TEXT {i+1}] {len(new_streets)} streets found")
+        except Exception as e:
+            log(f"  ✗ [TEXT {i+1}] Error: {str(e)[:200]}")
+            chunk_results[i] = []
+
+    # --- Merge results in original chunk order ---
+    for i in sorted(chunk_results.keys()):
+        streets = chunk_results[i]
+        all_streets.extend(streets)
+        schema["streets"] = all_streets
+        log(f"  📥 [Chunk {i+1}] merged {len(streets)} streets (running total: {len(all_streets)})")
 
     # --- Deduplication ---
     # 1. Remove exact duplicates (same main+from+to+work_type)
@@ -596,6 +633,78 @@ def run_extraction(doc_id: str, api_key: str):
     schema["streets"] = all_streets
     log(f"  Deduplication: {before} → {len(all_streets)} streets (removed {before - len(all_streets)} duplicates)")
 
+    # --- Confidence pass: send each image + its extracted streets back to Gemini ---
+    log(f"────────────────────────────────────")
+    log(f"🔎 Starting confidence scoring pass ({len(all_streets)} streets across {len(chunk_images)} image chunk(s))...")
+    from_image = [s for s in all_streets if s.get("_chunk_idx") is not None]
+    by_chunk = {}
+    for s in from_image:
+        by_chunk.setdefault(s["_chunk_idx"], []).append(s)
+
+    def score_chunk(chunk_idx, streets):
+        b64 = chunk_images.get(chunk_idx)
+        if not b64:
+            log(f"  ⚠ [CONFIDENCE chunk {chunk_idx+1}] no image found, skipping")
+            return chunk_idx, {}
+        log(f"  🔎 [CONFIDENCE chunk {chunk_idx+1}] scoring {len(streets)} streets against image...")
+        rows_json = json.dumps([{
+            "main_street": s.get("main_street"),
+            "from_street": s.get("from_street"),
+            "to_street": s.get("to_street"),
+        } for s in streets], indent=2)
+        prompt = (
+            f"I extracted these street rows from this table image:\n{rows_json}\n\n"
+            f"For each row, look at the image and check: does this exact combination of "
+            f"main_street | from_street | to_street appear as a single row reading left-to-right in the table?\n"
+            f"Return ONLY valid JSON: {{\"scores\": ["
+            f"{{\"main_street\": \"...\", \"from_street\": \"...\", \"to_street\": \"...\", "
+            f"\"confidence\": \"high\"|\"medium\"|\"low\"}}, ...]}}\n"
+            f"high = clearly visible exact match. medium = plausible but unclear. low = cannot find or looks wrong."
+        )
+        t0 = time.time()
+        try:
+            result = call_gemini_image(prompt, b64, log_fn=log)
+            scores = result.get("scores", [])
+            elapsed = time.time() - t0
+            high = sum(1 for s in scores if s.get("confidence") == "high")
+            med  = sum(1 for s in scores if s.get("confidence") == "medium")
+            low  = sum(1 for s in scores if s.get("confidence") == "low")
+            log(f"  ✓ [CONFIDENCE chunk {chunk_idx+1}] done in {elapsed:.1f}s — {high} high, {med} medium, {low} low")
+            low_names = [s.get("main_street","?") for s in scores if s.get("confidence") == "low"]
+            if low_names:
+                log(f"    ⚠ LOW confidence: {', '.join(low_names)}")
+            return chunk_idx, {
+                (s.get("main_street") or "").upper(): s.get("confidence", "medium")
+                for s in scores
+            }
+        except Exception as e:
+            log(f"  ✗ [CONFIDENCE chunk {chunk_idx+1}] failed in {time.time()-t0:.1f}s: {str(e)[:150]}")
+            return chunk_idx, {}
+
+    confidence_map = {}
+    if by_chunk:
+        log(f"⚡ Launching {len(by_chunk)} confidence scoring call(s) in parallel...")
+        t_conf_start = time.time()
+        with ThreadPoolExecutor(max_workers=len(by_chunk)) as executor:
+            futures = {executor.submit(score_chunk, cidx, sts): cidx for cidx, sts in by_chunk.items()}
+            for future in as_completed(futures):
+                _, scores = future.result()
+                confidence_map.update(scores)
+        log(f"⚡ Confidence pass done in {time.time()-t_conf_start:.1f}s total")
+    else:
+        log(f"  · No image chunks to score")
+
+    # Apply confidence scores to all streets
+    for s in all_streets:
+        key = (s.get("main_street") or "").upper()
+        s["confidence"] = confidence_map.get(key, "medium" if s.get("source") == "image" else "high")
+
+    high_c = [s for s in all_streets if s.get("confidence") == "high"]
+    med_c  = [s for s in all_streets if s.get("confidence") == "medium"]
+    low_c  = [s for s in all_streets if s.get("confidence") == "low"]
+    log(f"  Final confidence: {len(high_c)} high, {len(med_c)} medium, {len(low_c)} low"
+        + (f" — LOW: {', '.join(s.get('main_street','?') for s in low_c)}" if low_c else ""))
+
     # Write drop log for debugging
     with open("/tmp/dedup_dropped.txt", "w") as f:
         f.write(f"=== DROPPED: sparse (richer version exists) — {len(dropped_sparse)} ===\n")
@@ -608,6 +717,10 @@ def run_extraction(doc_id: str, api_key: str):
         f.write(f"\n=== KEPT: {len(all_streets)} streets ===\n")
         for s in all_streets:
             f.write(f"  {s.get('main_street')} | {s.get('from_street')} → {s.get('to_street')} | src={s.get('source')}\n")
+
+    # Strip internal tracking fields before output
+    for s in all_streets:
+        s.pop("_chunk_idx", None)
 
     schema["_meta"] = {
         "total_pages": doc["total_pages"],

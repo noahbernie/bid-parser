@@ -11,6 +11,7 @@ import json
 import time
 import asyncio
 import base64
+import urllib.request
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -138,7 +139,7 @@ def extract_text_smart(page, page_index: int = None, pdf_bytes: bytes = None) ->
 
     return page.extract_text() or ""
 
-def render_page_as_image(pdf_bytes: bytes, page_index: int, dpi: int = 120) -> str:
+def render_page_as_image(pdf_bytes: bytes, page_index: int, dpi: int = 250) -> str:
     """Render a PDF page to a base64 PNG."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     mat = fitz.Matrix(dpi / 72, dpi / 72)
@@ -236,6 +237,57 @@ def call_claude_with_retry(client, prompt, content_blocks, max_tokens=4096, max_
                 continue
             raise
     raise Exception("Max retries exceeded due to rate limits")
+
+
+def call_gemini_image(prompt: str, b64_image: str, max_retries: int = 4, log_fn=None) -> dict:
+    """Call Gemini 2.5 Pro via REST API for image-based table extraction."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise Exception("GEMINI_API_KEY not set")
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={api_key}"
+    payload = json.dumps({
+        "contents": [{"parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": "image/png", "data": b64_image}},
+        ]}],
+        "generationConfig": {"maxOutputTokens": 32000},
+    }).encode()
+
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read())
+            raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            with open("/tmp/gemini_last_response.txt", "w") as f:
+                f.write(raw)
+            if "```" in raw:
+                for part in raw.split("```"):
+                    if part.startswith("json"):
+                        raw = part[4:].strip()
+                        break
+                    elif part.strip().startswith("{"):
+                        raw = part.strip()
+                        break
+            return json.loads(raw)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            if e.code == 429:
+                wait = 30 * (2 ** attempt)
+                if log_fn:
+                    log_fn(f"  ⚠ Gemini rate limit — waiting {wait}s (attempt {attempt+1}/{max_retries})...")
+                time.sleep(wait)
+            elif attempt < max_retries - 1:
+                time.sleep(3)
+            else:
+                raise Exception(f"Gemini HTTP {e.code}: {body[:200]}")
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(3)
+            else:
+                raise
+    raise Exception("Gemini max retries exceeded")
 
 
 @app.post("/upload")
@@ -358,6 +410,9 @@ def run_extraction(doc_id: str, api_key: str):
     log(f"  Table pages (image): {len(table_page_indices)} pages ({sorted([i+1 for i in table_page_indices])})")
     log(f"────────────────────────────────────")
 
+    def is_empty(v):
+        return not v or str(v).strip() in ("?", "null", "None", "")
+
     client = anthropic.Anthropic(api_key=api_key)
 
     # --- Step 2: extract header info from first 5 pages ---
@@ -436,11 +491,45 @@ def run_extraction(doc_id: str, api_key: str):
         label = "📷 IMAGE" if chunk_source == "image" else "📄 TEXT"
         log(f"Processing chunk {i+1}/{len(chunks)} [{label}] (~{chunk_size // 1000}k chars)...")
         try:
-            chunk_model = "claude-opus-4-6" if chunk_source == "image" else "claude-sonnet-4-6"
-            result = call_claude_with_retry(client, prompt, chunk_blocks, max_tokens=32000, log_fn=log, model=chunk_model)
+            if chunk_source == "image":
+                b64 = chunk_blocks[0]["source"]["data"]
+                result = call_gemini_image(prompt, b64, log_fn=log)
+            else:
+                result = call_claude_with_retry(client, prompt, chunk_blocks, max_tokens=32000, log_fn=log)
             new_streets = result.get("streets", [])
             for s in new_streets:
                 s.setdefault("source", chunk_source)
+
+            # Targeted rescue pass: only for streets with no from/to AND no richer version in this chunk
+            if chunk_source == "image":
+                names_with_data = {(s.get("main_street") or "").upper() for s in new_streets
+                                   if not is_empty(s.get("from_street")) and not is_empty(s.get("to_street"))}
+                missing = [s for s in new_streets
+                           if (is_empty(s.get("from_street")) or is_empty(s.get("to_street")))
+                           and (s.get("main_street") or "").upper() not in names_with_data]
+                if missing:
+                    missing_names = ", ".join(s.get("main_street", "?") for s in missing)
+                    rescue_prompt = (
+                        f"In this table image, I couldn't read the from/to limits for these streets: {missing_names}.\n"
+                        f"Find each one in the table and return ONLY valid JSON: {{\"streets\": [...]}}\n"
+                        f"Each object: {{\"main_street\": \"...\", \"from_street\": \"...\", \"to_street\": \"...\", "
+                        f"\"work_type\": \"...\", \"location\": null, \"source\": \"image\"}}\n"
+                        f"Only include streets from the list above. Do not guess — if you truly cannot read it, omit that street."
+                    )
+                    try:
+                        rescue_result = call_gemini_image(rescue_prompt, b64, log_fn=log)
+                        rescued = rescue_result.get("streets", [])
+                        for s in rescued:
+                            s.setdefault("source", "image")
+                        # Replace sparse entries with rescued versions
+                        rescued_by_name = {(s.get("main_street") or "").upper(): s for s in rescued
+                                           if not is_empty(s.get("from_street")) and not is_empty(s.get("to_street"))}
+                        new_streets = [rescued_by_name.get((s.get("main_street") or "").upper(), s) for s in new_streets]
+                        if rescued_by_name:
+                            log(f"  ↺ [RESCUE] filled in limits for: {', '.join(rescued_by_name.keys())}")
+                    except Exception as e:
+                        log(f"  ⚠ [RESCUE] failed: {str(e)[:100]}")
+
             all_streets.extend(new_streets)
             schema["streets"] = all_streets
             if new_streets:
@@ -466,9 +555,6 @@ def run_extraction(doc_id: str, api_key: str):
             parts[-1] = _SUFFIX_MAP[parts[-1]]
         return " ".join(parts)
 
-    def is_empty(v):
-        return not v or v.strip() in ("?", "null", "None", "")
-
     seen = {}
     for s in all_streets:
         key = (
@@ -492,17 +578,36 @@ def run_extraction(doc_id: str, api_key: str):
 
     # Also drop sparse entries whose main_street has ANY richer entry
     mains_with_data = {k[0] for k, (_, emp) in seen.items() if not emp}
-    deduped = [
-        s for (k, (s, emp)) in seen.items()
-        if not emp or k[0] not in mains_with_data
-    ]
+    dropped_sparse = []
+    deduped = []
+    for (k, (s, emp)) in seen.items():
+        if not emp or k[0] not in mains_with_data:
+            deduped.append(s)
+        else:
+            dropped_sparse.append({"reason": "sparse+richer_exists", "street": s})
 
     before = len(all_streets)
     all_streets = deduped
+
     # Drop streets with no from_street AND no to_street
+    dropped_empty = [s for s in all_streets if is_empty(s.get("from_street")) and is_empty(s.get("to_street"))]
     all_streets = [s for s in all_streets if not (is_empty(s.get("from_street")) and is_empty(s.get("to_street")))]
+
     schema["streets"] = all_streets
     log(f"  Deduplication: {before} → {len(all_streets)} streets (removed {before - len(all_streets)} duplicates)")
+
+    # Write drop log for debugging
+    with open("/tmp/dedup_dropped.txt", "w") as f:
+        f.write(f"=== DROPPED: sparse (richer version exists) — {len(dropped_sparse)} ===\n")
+        for d in dropped_sparse:
+            s = d["street"]
+            f.write(f"  {s.get('main_street')} | {s.get('from_street')} → {s.get('to_street')} | src={s.get('source')}\n")
+        f.write(f"\n=== DROPPED: both from+to empty — {len(dropped_empty)} ===\n")
+        for s in dropped_empty:
+            f.write(f"  {s.get('main_street')} | {s.get('from_street')} → {s.get('to_street')} | src={s.get('source')}\n")
+        f.write(f"\n=== KEPT: {len(all_streets)} streets ===\n")
+        for s in all_streets:
+            f.write(f"  {s.get('main_street')} | {s.get('from_street')} → {s.get('to_street')} | src={s.get('source')}\n")
 
     schema["_meta"] = {
         "total_pages": doc["total_pages"],

@@ -33,21 +33,30 @@ Return ONLY valid JSON with these fields:
 - bid_number, project_name, city, work_type, estimated_cost, bid_due_date
 Use null for any field not found."""
 
-STREETS_PROMPT = """You are parsing pages from a road construction bid document. Extract ALL street segments from any tables or lists on these pages.
-Return ONLY valid JSON: {"streets": [...]}
-Each street object: {"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "...", "location": "..."}
-
-Use your judgment to map whatever columns are present to these fields:
+_STREETS_PROMPT_BASE = """Use your judgment to map whatever columns are present to these fields:
 - main_street: the street being worked on
 - from_street: where the work begins (may be labeled START, FROM, BEGIN, LIMITS FROM, or similar)
 - to_street: where the work ends (may be labeled END, TO, TERMINUS, LIMITS TO, or similar)
 - work_type: the type of work — use the table section header/title if no explicit column (e.g. "SLURRY/CAPE SEAL LIST" → "Slurry/Cape Seal", "CRACK FILL/REPAIR ONLY LIST" → "Crack Fill/Repair")
 - location: any location number or zone identifier if present
+- source: ALWAYS set to "{SOURCE_TAG}" for every street you extract — do not change this value
 
 Every table is different — read the header row to understand what each column means, then extract every data row.
 If a field has no corresponding column in this table, use null.
-IMPORTANT: Extract every single row. Do not skip any. Each data row = one street object.
-NOTE: Some pages are CAD engineering drawings where text may be partially clipped at cell borders. Use context and common street naming patterns to reconstruct partial names."""
+IMPORTANT: Extract every single row. Do not skip any. Each data row = one street object."""
+
+STREETS_PROMPT_TEXT = """You are parsing pages from a road construction bid document. Extract ALL street segments from any tables or lists on these pages.
+Return ONLY valid JSON: {"streets": [...]}
+Each street object: {"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "...", "location": "...", "source": "text"}
+
+""" + _STREETS_PROMPT_BASE.replace("{SOURCE_TAG}", "text")
+
+STREETS_PROMPT_IMAGE = """You are parsing a scanned table image from a road construction bid document. Extract ALL street segments visible in the image.
+Return ONLY valid JSON: {"streets": [...]}
+Each street object: {"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "...", "location": "...", "source": "image"}
+
+""" + _STREETS_PROMPT_BASE.replace("{SOURCE_TAG}", "image") + """
+NOTE: This is a CAD engineering drawing image. Read each row carefully left-to-right. Each row is independent — do not carry over from/to values from adjacent rows."""
 
 
 STREET_KEYWORDS = [
@@ -182,10 +191,10 @@ def page_has_tables(page, pdf_bytes: bytes = None, page_index: int = None) -> bo
     return False
 
 
-def call_claude(client, prompt: str, content_blocks: list, max_tokens: int = 4096) -> dict:
+def call_claude(client, prompt: str, content_blocks: list, max_tokens: int = 4096, model: str = "claude-sonnet-4-6") -> dict:
     content = [{"type": "text", "text": prompt}] + content_blocks
     with client.messages.stream(
-        model="claude-sonnet-4-6",
+        model=model,
         max_tokens=max_tokens,
         messages=[{"role": "user", "content": content}],
     ) as stream:
@@ -211,11 +220,11 @@ def call_claude(client, prompt: str, content_blocks: list, max_tokens: int = 409
                 break
     return json.loads(raw)
 
-def call_claude_with_retry(client, prompt, content_blocks, max_tokens=4096, max_retries=4, log_fn=None):
+def call_claude_with_retry(client, prompt, content_blocks, max_tokens=4096, max_retries=4, log_fn=None, model="claude-sonnet-4-6"):
     """Call Claude with exponential backoff on rate limit errors."""
     for attempt in range(max_retries):
         try:
-            return call_claude(client, prompt, content_blocks, max_tokens)
+            return call_claude(client, prompt, content_blocks, max_tokens, model=model)
         except anthropic.RateLimitError as e:
             wait = 30 * (2 ** attempt)  # 30, 60, 120, 240s
             if log_fn:
@@ -290,6 +299,24 @@ async def get_status(doc_id: str):
     }
 
 
+@app.get("/doc/{doc_id}/chunks")
+async def get_chunks(doc_id: str):
+    if doc_id not in documents:
+        raise HTTPException(status_code=404, detail="Document not found")
+    chunks = documents[doc_id].get("chunk_debug", [])
+    if not chunks:
+        raise HTTPException(status_code=404, detail="No chunk data available yet")
+    lines = []
+    for c in chunks:
+        lines.append(f"{'='*60}")
+        lines.append(f"CHUNK {c['index']+1}/{c['total']}  [{c['source'].upper()}]  {c['char_count']} chars")
+        lines.append(f"{'='*60}")
+        lines.append(c['text'] if c['text'] else "(image — no text content)")
+        lines.append("")
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse("\n".join(lines))
+
+
 def run_extraction(doc_id: str, api_key: str):
     """Run the full extraction pipeline — text only, no images."""
     doc = documents[doc_id]
@@ -354,63 +381,74 @@ def run_extraction(doc_id: str, api_key: str):
     schema["streets"] = []
     all_streets = []
 
-    # --- Step 3: build text chunks from all relevant pages ---
-    # Pages with detected table structures get their image sent alongside the text
+    # --- Step 3: build chunks from all relevant pages ---
+    # Table pages send image-only. Non-table pages are batched as text chunks.
+    # chunks is a list of {"blocks": [...], "source": "text"|"image"}
     chunks = []
     current_blocks = []
     current_size = 0
+
+    def flush_text_chunk():
+        nonlocal current_blocks, current_size
+        if current_blocks:
+            chunks.append({"blocks": current_blocks, "source": "text"})
+            current_blocks = []
+            current_size = 0
+
     for page_idx in relevant_indices:
         text = doc["page_cache"].get(page_idx + 1, "")
         entry = f"\n--- Page {page_idx + 1} ---\n{text}"
-        blocks_for_page = [{"type": "text", "text": entry}]
+        text_block = {"type": "text", "text": entry}
 
         if page_idx in table_page_indices:
+            flush_text_chunk()
             try:
                 b64 = render_page_as_image(pdf_bytes, page_idx)
-                blocks_for_page.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}})
-                log(f"  Page {page_idx + 1}: sending text + image (table page)")
+                image_block = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}
+                chunks.append({"blocks": [image_block], "source": "image"})
+                log(f"  Page {page_idx + 1}: queued image-only chunk (table page)")
             except Exception as e:
-                log(f"  Page {page_idx + 1}: image render failed ({e}), text only")
+                log(f"  Page {page_idx + 1}: image render failed ({e}), falling back to text chunk")
+                chunks.append({"blocks": [text_block], "source": "text"})
+        else:
+            if current_size + len(entry) > CHUNK_CHAR_LIMIT:
+                flush_text_chunk()
+            current_blocks.append(text_block)
+            current_size += len(entry)
 
-        # Images are large — flush chunk before and after to avoid token overload
-        has_image = any(b["type"] == "image" for b in blocks_for_page)
-        if has_image and current_blocks:
-            chunks.append(current_blocks)
-            current_blocks = []
-            current_size = 0
+    flush_text_chunk()
 
-        if current_size + len(entry) > CHUNK_CHAR_LIMIT and current_blocks:
-            chunks.append(current_blocks)
-            current_blocks = []
-            current_size = 0
+    n_img = sum(1 for c in chunks if c["source"] == "image")
+    n_txt = sum(1 for c in chunks if c["source"] == "text")
+    log(f"Split into {len(chunks)} chunks ({n_txt} text, {n_img} image). Starting street extraction...")
 
-        current_blocks.extend(blocks_for_page)
-        current_size += len(entry)
-
-        if has_image:
-            chunks.append(current_blocks)
-            current_blocks = []
-            current_size = 0
-
-    if current_blocks:
-        chunks.append(current_blocks)
-
-    log(f"Split into {len(chunks)} chunks. Starting street extraction...")
-
-    for i, chunk_blocks in enumerate(chunks):
-        chunk_size = sum(len(b.get("text", "")) for b in chunk_blocks if b["type"] == "text")
-        log(f"Processing chunk {i+1}/{len(chunks)} (~{chunk_size // 1000}k chars)...")
+    doc["chunk_debug"] = []
+    for i, chunk in enumerate(chunks):
+        chunk_blocks = chunk["blocks"]
+        chunk_source = chunk["source"]
+        prompt = STREETS_PROMPT_IMAGE if chunk_source == "image" else STREETS_PROMPT_TEXT
+        chunk_text = "\n".join(b.get("text", "") for b in chunk_blocks if b["type"] == "text")
+        chunk_size = len(chunk_text)
+        doc["chunk_debug"].append({
+            "index": i, "total": len(chunks), "source": chunk_source,
+            "char_count": chunk_size, "text": chunk_text,
+        })
+        label = "📷 IMAGE" if chunk_source == "image" else "📄 TEXT"
+        log(f"Processing chunk {i+1}/{len(chunks)} [{label}] (~{chunk_size // 1000}k chars)...")
         try:
-            result = call_claude_with_retry(client, STREETS_PROMPT, chunk_blocks, max_tokens=32000, log_fn=log)
+            chunk_model = "claude-opus-4-6" if chunk_source == "image" else "claude-sonnet-4-6"
+            result = call_claude_with_retry(client, prompt, chunk_blocks, max_tokens=32000, log_fn=log, model=chunk_model)
             new_streets = result.get("streets", [])
+            for s in new_streets:
+                s.setdefault("source", chunk_source)
             all_streets.extend(new_streets)
             schema["streets"] = all_streets
             if new_streets:
-                log(f"  ✓ {len(new_streets)} streets found (total: {len(all_streets)})", all_streets)
+                log(f"  ✓ [{label}] {len(new_streets)} streets found (total: {len(all_streets)})", all_streets)
             else:
-                log(f"  · No streets on these pages")
+                log(f"  · [{label}] No streets found")
         except Exception as e:
-            log(f"  ✗ Error: {str(e)[:200]}")
+            log(f"  ✗ [{label}] Error: {str(e)[:200]}")
 
     # --- Deduplication ---
     # 1. Remove exact duplicates (same main+from+to+work_type)
@@ -440,12 +478,17 @@ def run_extraction(doc_id: str, api_key: str):
             (s.get("work_type") or "").strip().upper(),
         )
         empty = is_empty(s.get("from_street")) and is_empty(s.get("to_street"))
+        src = s.get("source", "text")
         if key not in seen:
             seen[key] = (s, empty)
-        elif empty and not seen[key][1]:
-            pass  # already have a richer version, skip
-        elif not empty and seen[key][1]:
-            seen[key] = (s, empty)  # replace sparse with richer
+        else:
+            existing, existing_empty = seen[key]
+            existing_src = existing.get("source", "text")
+            # Priority: image > text; richer (non-empty) > sparse within same source
+            if src == "image" and existing_src != "image":
+                seen[key] = (s, empty)  # image wins over text
+            elif not empty and existing_empty and src == existing_src:
+                seen[key] = (s, empty)  # richer wins within same source
 
     # Also drop sparse entries whose main_street has ANY richer entry
     mains_with_data = {k[0] for k, (_, emp) in seen.items() if not emp}
@@ -456,6 +499,8 @@ def run_extraction(doc_id: str, api_key: str):
 
     before = len(all_streets)
     all_streets = deduped
+    # Drop streets with no from_street AND no to_street
+    all_streets = [s for s in all_streets if not (is_empty(s.get("from_street")) and is_empty(s.get("to_street")))]
     schema["streets"] = all_streets
     log(f"  Deduplication: {before} → {len(all_streets)} streets (removed {before - len(all_streets)} duplicates)")
 

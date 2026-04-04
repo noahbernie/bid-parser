@@ -183,6 +183,7 @@
       padding: 14px 18px;
       border-bottom: 1px solid #ddd;
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
       gap: 10px;
@@ -359,8 +360,9 @@
     <div class="schema-header">
       <h3>Extracted Schema</h3>
       <button id="extract-btn" onclick="extractSchema()" disabled>Extract with AI</button>
-      <button id="reextract-btn" onclick="reExtractSchema()" disabled style="background:#6b7280;margin-left:6px;">Re-extract</button>
-      <button id="download-btn" class="download" onclick="downloadJSON()" style="display:none;margin-left:6px;">⬇ JSON</button>
+      <button id="reextract-btn" onclick="reExtractSchema()" disabled style="background:#6b7280;">Re-extract</button>
+      <button id="download-btn" class="download" onclick="downloadJSON()" style="display:none;">⬇ JSON</button>
+      <button id="chunks-btn" onclick="downloadChunks()" style="display:none;background:#7c3aed;">⬇ Raw Text</button>
     </div>
     <div class="schema-body" id="schema-body">
       <div class="schema-empty">Select a document and click<br>"Extract with AI" to parse fields.</div>
@@ -443,6 +445,7 @@
     document.getElementById('schema-body').innerHTML =
       '<div class="schema-empty">Click "Extract with AI" to parse this document.</div>';
     document.getElementById('download-btn').style.display = 'none';
+    document.getElementById('chunks-btn').style.display = 'none';
     viewCurrentPage();
   }
 
@@ -517,6 +520,7 @@
           btn.disabled = false; reBtn.disabled = false;
           btn.textContent = 'Extract with AI';
           document.getElementById('download-btn').style.display = 'inline-block';
+          document.getElementById('chunks-btn').style.display = 'inline-block';
         } else {
           renderLiveProgress(logs, streets);
         }
@@ -624,6 +628,18 @@
 
   function escapeHtml(str) {
     return (str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  async function downloadChunks() {
+    if (!currentDocId) return;
+    const res = await fetch(`/doc/${currentDocId}/chunks`);
+    if (!res.ok) return;
+    const text = await res.text();
+    const blob = new Blob([text], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = currentDocId + '_chunks.txt'; a.click();
+    URL.revokeObjectURL(url);
   }
 
   async function downloadJSON() {

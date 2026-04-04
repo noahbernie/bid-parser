@@ -153,6 +153,24 @@ def render_page_as_image(pdf_bytes: bytes, page_index: int, dpi: int = 250) -> s
     doc.close()
     return base64.standard_b64encode(img_bytes).decode()
 
+def render_page_as_strips(pdf_bytes: bytes, page_index: int, dpi: int = 250) -> list:
+    """Render a PDF page and split into top/bottom half strips. Returns list of b64 strings."""
+    import io
+    from PIL import Image as PILImage
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = doc[page_index].get_pixmap(matrix=mat)
+    doc.close()
+    img = PILImage.open(io.BytesIO(pix.tobytes("png")))
+    mid = img.height // 2
+    strips = [img.crop((0, 0, img.width, mid)), img.crop((0, mid, img.width, img.height))]
+    result = []
+    for strip in strips:
+        buf = io.BytesIO()
+        strip.save(buf, format="PNG")
+        result.append(base64.standard_b64encode(buf.getvalue()).decode())
+    return result
+
 def page_has_tables(page, pdf_bytes: bytes = None, page_index: int = None) -> bool:
     """
     Detect if a page likely has table structure by looking for rows with
@@ -462,27 +480,18 @@ def run_extraction(doc_id: str, api_key: str):
             current_size = 0
 
     for page_idx in relevant_indices:
-        text = doc["page_cache"].get(page_idx + 1, "")
-        entry = f"\n--- Page {page_idx + 1} ---\n{text}"
-        text_block = {"type": "text", "text": entry}
-
         if page_idx in table_page_indices:
             flush_text_chunk()
             try:
-                b64 = render_page_as_image(pdf_bytes, page_idx)
-                image_block = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}
-                chunks.append({"blocks": [image_block], "source": "image"})
-                log(f"  Page {page_idx + 1}: queued image-only chunk (table page)")
+                strips = render_page_as_strips(pdf_bytes, page_idx)
+                for strip_num, b64 in enumerate(strips):
+                    image_block = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}
+                    chunks.append({"blocks": [image_block], "source": "image", "page": page_idx + 1, "strip": strip_num + 1})
+                log(f"  Page {page_idx + 1}: queued {len(strips)} image strips (table page)")
             except Exception as e:
-                log(f"  Page {page_idx + 1}: image render failed ({e}), falling back to text chunk")
-                chunks.append({"blocks": [text_block], "source": "text"})
-        else:
-            if current_size + len(entry) > CHUNK_CHAR_LIMIT:
-                flush_text_chunk()
-            current_blocks.append(text_block)
-            current_size += len(entry)
+                log(f"  Page {page_idx + 1}: image render failed ({e}), skipping")
 
-    flush_text_chunk()
+        # non-table pages skipped — image-only mode
 
     n_img = sum(1 for c in chunks if c["source"] == "image")
     n_txt = sum(1 for c in chunks if c["source"] == "text")
@@ -500,17 +509,17 @@ def run_extraction(doc_id: str, api_key: str):
             with log_lock:
                 log(msg, data)
 
-        chunk_log(f"🚀 [IMG {i+1}/{len(chunks)}] Starting parallel image extraction...")
+        page_label = f"p{chunk.get('page','?')} strip {chunk.get('strip','?')}"
+        chunk_log(f"🚀 [IMG {i+1}/{len(chunks)} {page_label}] Starting parallel extraction...")
         t_start = time.time()
         try:
             b64 = chunk_blocks[0]["source"]["data"]
-            chunk_log(f"  → [IMG {i+1}] Sending to Gemini (image size: {len(b64) * 3 // 4 // 1024}KB)...")
+            chunk_log(f"  → [IMG {i+1} {page_label}] Sending to Gemini ({len(b64) * 3 // 4 // 1024}KB)...")
             result = call_gemini_image(STREETS_PROMPT_IMAGE, b64, log_fn=chunk_log)
             elapsed = time.time() - t_start
             new_streets = result.get("streets", [])
             for s in new_streets:
                 s.setdefault("source", "image")
-                s["_chunk_idx"] = i  # track source image for confidence pass
             chunk_log(f"  ✓ [IMG {i+1}] Done in {elapsed:.1f}s — {len(new_streets)} streets")
             return i, new_streets, chunk_text
 
@@ -520,7 +529,6 @@ def run_extraction(doc_id: str, api_key: str):
 
     # Separate image and text chunks, preserving original order index
     image_chunks = [(i, c) for i, c in enumerate(chunks) if c["source"] == "image"]
-    text_chunks  = [(i, c) for i, c in enumerate(chunks) if c["source"] == "text"]
 
     # Build chunk debug info
     for i, chunk in enumerate(chunks):
@@ -532,7 +540,6 @@ def run_extraction(doc_id: str, api_key: str):
 
     # Collect results keyed by original chunk index so we can merge in order
     chunk_results = {}  # index -> list of streets
-    chunk_images = {}   # index -> b64 image string (for confidence pass)
 
     # --- Run all image chunks in parallel ---
     if image_chunks:
@@ -543,7 +550,6 @@ def run_extraction(doc_id: str, api_key: str):
             for future in as_completed(futures):
                 i, streets, _ = future.result()
                 chunk_results[i] = streets
-                chunk_images[i] = chunks[i]["blocks"][0]["source"]["data"]
                 # Stream partial results immediately as each chunk finishes
                 partial = []
                 for idx in sorted(chunk_results.keys()):
@@ -551,23 +557,6 @@ def run_extraction(doc_id: str, api_key: str):
                 with log_lock:
                     log(f"⚡ [IMG {i+1}] finished — {len(streets)} streets (partial total: {len(partial)})", partial)
         log(f"⚡ All image chunks done in {time.time() - t_parallel_start:.1f}s total")
-
-    # --- Run text chunks sequentially (Claude, already fast) ---
-    for i, chunk in text_chunks:
-        chunk_blocks = chunk["blocks"]
-        chunk_text = "\n".join(b.get("text", "") for b in chunk_blocks if b["type"] == "text")
-        chunk_size = len(chunk_text)
-        log(f"Processing chunk {i+1}/{len(chunks)} [📄 TEXT] (~{chunk_size // 1000}k chars)...")
-        try:
-            result = call_claude_with_retry(client, STREETS_PROMPT_TEXT, chunk_blocks, max_tokens=32000, log_fn=log)
-            new_streets = result.get("streets", [])
-            for s in new_streets:
-                s.setdefault("source", "text")
-            chunk_results[i] = new_streets
-            log(f"  ✓ [TEXT {i+1}] {len(new_streets)} streets found")
-        except Exception as e:
-            log(f"  ✗ [TEXT {i+1}] Error: {str(e)[:200]}")
-            chunk_results[i] = []
 
     # --- Merge results in original chunk order ---
     for i in sorted(chunk_results.keys()):
@@ -633,101 +622,6 @@ def run_extraction(doc_id: str, api_key: str):
     schema["streets"] = all_streets
     log(f"  Deduplication: {before} → {len(all_streets)} streets (removed {before - len(all_streets)} duplicates)")
 
-    # --- Confidence pass: send each image + its extracted streets back to Gemini ---
-    log(f"────────────────────────────────────")
-    log(f"🔎 Starting confidence scoring pass ({len(all_streets)} streets across {len(chunk_images)} image chunk(s))...")
-    from_image = [s for s in all_streets if s.get("_chunk_idx") is not None]
-    by_chunk = {}
-    for s in from_image:
-        by_chunk.setdefault(s["_chunk_idx"], []).append(s)
-
-    def score_chunk(chunk_idx, streets):
-        b64 = chunk_images.get(chunk_idx)
-        if not b64:
-            log(f"  ⚠ [CONFIDENCE chunk {chunk_idx+1}] no image found, skipping")
-            return chunk_idx, {}
-        log(f"  🔎 [CONFIDENCE chunk {chunk_idx+1}] scoring {len(streets)} streets against image...")
-        rows_json = json.dumps([{
-            "main_street": s.get("main_street"),
-            "from_street": s.get("from_street"),
-            "to_street": s.get("to_street"),
-        } for s in streets], indent=2)
-        prompt = (
-            f"I extracted these street rows from this table image:\n{rows_json}\n\n"
-            f"For each row, look at the image and check: does this exact combination of "
-            f"main_street | from_street | to_street appear as a single row reading left-to-right in the table?\n"
-            f"Return ONLY valid JSON: {{\"scores\": ["
-            f"{{\"main_street\": \"...\", \"from_street\": \"...\", \"to_street\": \"...\", "
-            f"\"confidence\": \"high\"|\"medium\"|\"low\"}}, ...]}}\n"
-            f"high = clearly visible exact match. medium = plausible but unclear. low = cannot find or looks wrong."
-        )
-        t0 = time.time()
-        # Resize image for Claude: max 4MB raw and max 4000px on longest side
-        import io
-        from PIL import Image as PILImage
-        raw = base64.standard_b64decode(b64)
-        img = PILImage.open(io.BytesIO(raw))
-        MAX_DIM = 4000
-        MAX_BYTES = 4 * 1024 * 1024
-        if max(img.width, img.height) > MAX_DIM:
-            scale = MAX_DIM / max(img.width, img.height)
-            img = img.resize((int(img.width * scale), int(img.height * scale)), PILImage.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        if buf.tell() > MAX_BYTES:
-            scale = (MAX_BYTES / buf.tell()) ** 0.5
-            img = img.resize((int(img.width * scale), int(img.height * scale)), PILImage.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-        conf_b64 = base64.standard_b64encode(buf.getvalue()).decode()
-        log(f"  ↘ [CONFIDENCE chunk {chunk_idx+1}] image prepared for Claude: {len(conf_b64)*3//4//1024}KB {img.width}x{img.height}px")
-        conf_blocks = [
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": conf_b64}},
-            {"type": "text", "text": prompt},
-        ]
-        try:
-            result = call_claude_with_retry(client, prompt, conf_blocks, max_tokens=8000, log_fn=log, model="claude-opus-4-6")
-            scores = result.get("scores", [])
-            elapsed = time.time() - t0
-            high = sum(1 for s in scores if s.get("confidence") == "high")
-            med  = sum(1 for s in scores if s.get("confidence") == "medium")
-            low  = sum(1 for s in scores if s.get("confidence") == "low")
-            log(f"  ✓ [CONFIDENCE chunk {chunk_idx+1}] done in {elapsed:.1f}s — {high} high, {med} medium, {low} low")
-            low_names = [s.get("main_street","?") for s in scores if s.get("confidence") == "low"]
-            if low_names:
-                log(f"    ⚠ LOW confidence: {', '.join(low_names)}")
-            return chunk_idx, {
-                (s.get("main_street") or "").upper(): s.get("confidence", "medium")
-                for s in scores
-            }
-        except Exception as e:
-            log(f"  ✗ [CONFIDENCE chunk {chunk_idx+1}] failed in {time.time()-t0:.1f}s: {str(e)[:150]}")
-            return chunk_idx, {}
-
-    confidence_map = {}
-    if by_chunk:
-        log(f"⚡ Launching {len(by_chunk)} confidence scoring call(s) in parallel...")
-        t_conf_start = time.time()
-        with ThreadPoolExecutor(max_workers=len(by_chunk)) as executor:
-            futures = {executor.submit(score_chunk, cidx, sts): cidx for cidx, sts in by_chunk.items()}
-            for future in as_completed(futures):
-                _, scores = future.result()
-                confidence_map.update(scores)
-        log(f"⚡ Confidence pass done in {time.time()-t_conf_start:.1f}s total")
-    else:
-        log(f"  · No image chunks to score")
-
-    # Apply confidence scores to all streets
-    for s in all_streets:
-        key = (s.get("main_street") or "").upper()
-        s["confidence"] = confidence_map.get(key, "medium" if s.get("source") == "image" else "high")
-
-    high_c = [s for s in all_streets if s.get("confidence") == "high"]
-    med_c  = [s for s in all_streets if s.get("confidence") == "medium"]
-    low_c  = [s for s in all_streets if s.get("confidence") == "low"]
-    log(f"  Final confidence: {len(high_c)} high, {len(med_c)} medium, {len(low_c)} low"
-        + (f" — LOW: {', '.join(s.get('main_street','?') for s in low_c)}" if low_c else ""))
-
     # Write drop log for debugging
     with open("/tmp/dedup_dropped.txt", "w") as f:
         f.write(f"=== DROPPED: sparse (richer version exists) — {len(dropped_sparse)} ===\n")
@@ -740,10 +634,6 @@ def run_extraction(doc_id: str, api_key: str):
         f.write(f"\n=== KEPT: {len(all_streets)} streets ===\n")
         for s in all_streets:
             f.write(f"  {s.get('main_street')} | {s.get('from_street')} → {s.get('to_street')} | src={s.get('source')}\n")
-
-    # Strip internal tracking fields before output
-    for s in all_streets:
-        s.pop("_chunk_idx", None)
 
     schema["_meta"] = {
         "total_pages": doc["total_pages"],

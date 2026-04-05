@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 import pdfplumber
 import fitz  # PyMuPDF
 import anthropic
@@ -22,6 +23,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 app = FastAPI()
+
+# CORS — restrict to specific origins in prod via ALLOWED_ORIGINS env var
+# e.g. ALLOWED_ORIGINS=https://partner.com,https://app.partner.com
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "*")
+_origins = [o.strip() for o in _raw_origins.split(",")] if _raw_origins != "*" else ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_methods=["POST", "GET", "DELETE"],
+    allow_headers=["*"],
+)
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 from highway.routes import router as highway_router

@@ -71,9 +71,10 @@ Each street object: {"main_street": "...", "from_street": "...", "to_street": ".
 
 STREETS_PROMPT_IMAGE = """You are parsing a scanned table image from a road construction bid document.
 
-FIRST — decide if this image contains a structured data table listing street segments with columns like Street Name, From, To, and Work Type.
-- If the image is a MAP, DIAGRAM, COVER PAGE, INDEX, or any page WITHOUT a row-based street table: return exactly {"streets": []} and stop.
-- If the image contains a valid street table: extract every row as described below.
+FIRST — decide if this image could contain street segment data.
+- Return exactly {"streets": []} ONLY if the image is clearly a GEOGRAPHIC MAP, ENGINEERING DRAWING, PHOTOGRAPH, or COVER/TITLE PAGE with no tabular data at all.
+- If the image shows rows of text — even without visible column headers (it may be a continuation strip of a larger table) — treat it as a data table and extract every row.
+- When in doubt, attempt extraction.
 
 Return ONLY valid JSON: {"streets": [...]}
 Each street object: {"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "...", "location": "...", "source": "image"}

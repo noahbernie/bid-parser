@@ -859,19 +859,18 @@ def run_extraction(doc_id: str, api_key: str):
             deterministic_streets.extend(text_rows)
             last_text_xmap = new_xmap or last_text_xmap
             last_text_xmap_page = page_idx
-        elif is_relevant:
-            last_text_xmap = None  # reset — image pages break the text section
+        elif is_relevant or len(doc["page_cache"].get(page_idx + 1, "").strip()) == 0:
+            # Send to Gemini if: page is street-relevant OR fully scanned (no text at all).
+            # Scanned pages have no text so is_relevant is always false for them — but they
+            # may contain street tables and must be included regardless.
+            last_text_xmap = None
             last_text_xmap_page = None
-            # Only send to Gemini if the page text looks garbled (raster/CAD content).
-            # Clean text pages that just lack a recognized table structure have nothing
-            # useful for Gemini to extract — skip them.
-            # Fall back to image strips → Gemini
             try:
                 strips = render_page_as_strips(pdf_bytes, page_idx)
                 for strip_num, b64 in enumerate(strips):
                     image_block = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}
                     chunks.append({"blocks": [image_block], "source": "image", "page": page_idx + 1, "strip": strip_num + 1})
-                log(f"  Page {page_idx + 1}: 📷 image strips queued (no text tables found)")
+                log(f"  Page {page_idx + 1}: 📷 image strips queued ({'scanned' if not is_relevant else 'no text tables found'})")
             except Exception as e:
                 log(f"  Page {page_idx + 1}: image render failed ({e}), skipping")
         else:

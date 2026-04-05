@@ -972,7 +972,7 @@ def run_extraction(doc_id: str, api_key: str):
         page = chunk.get("page")
         page_to_chunk_indices.setdefault(page, []).append(i)
 
-    IMAGE_MIN_STREETS = 10  # discard image results if fewer than this per page
+    IMAGE_MIN_STREETS = 15  # discard image results if fewer than this per page
     for page, indices in sorted(page_to_chunk_indices.items(), key=lambda x: x[0]):
         page_streets = []
         for i in sorted(indices):

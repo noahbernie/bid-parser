@@ -965,11 +965,24 @@ def run_extraction(doc_id: str, api_key: str):
         log(f"  📋 Merged {len(deterministic_streets)} deterministic text streets")
 
     # --- Merge image chunk results in original chunk order ---
-    for i in sorted(chunk_results.keys()):
-        streets = chunk_results[i]
-        all_streets.extend(streets)
-        schema["streets"] = all_streets
-        log(f"  📥 [Chunk {i+1}] merged {len(streets)} streets (running total: {len(all_streets)})")
+    # Group strips by page so the 10-street threshold is evaluated per full page,
+    # not per individual strip (a page renders as 2 strips).
+    page_to_chunk_indices = {}
+    for i, chunk in image_chunks:
+        page = chunk.get("page")
+        page_to_chunk_indices.setdefault(page, []).append(i)
+
+    IMAGE_MIN_STREETS = 10  # discard image results if fewer than this per page
+    for page, indices in sorted(page_to_chunk_indices.items(), key=lambda x: x[0]):
+        page_streets = []
+        for i in sorted(indices):
+            page_streets.extend(chunk_results.get(i, []))
+        if len(page_streets) < IMAGE_MIN_STREETS:
+            log(f"  🚫 [Page {page}] image extraction returned only {len(page_streets)} streets — discarding (threshold: {IMAGE_MIN_STREETS})")
+        else:
+            all_streets.extend(page_streets)
+            schema["streets"] = all_streets
+            log(f"  📥 [Page {page}] merged {len(page_streets)} image streets (running total: {len(all_streets)})")
 
     # --- Deduplication ---
     # 1. Remove exact duplicates (same main+from+to+work_type)

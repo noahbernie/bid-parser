@@ -282,6 +282,17 @@
     .conf-high   { background: #d4f4dd; color: #1a7a36; }
     .conf-medium { background: #fff3cd; color: #856404; }
     .conf-low    { background: #ffe0e0; color: #c0392b; }
+    .page-tag {
+      display: inline-block;
+      font-size: 0.68rem;
+      font-weight: 600;
+      color: #888;
+      background: #efefef;
+      border-radius: 4px;
+      padding: 1px 6px;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
 
     .log-console {
       background: #0f1117;
@@ -546,9 +557,10 @@
       ? streets.slice(-200).map(st => {
           const conf = st.confidence || '';
           const badge = conf ? `<span class="conf-badge conf-${conf}">${conf.toUpperCase()}</span>` : '';
+          const pageTag = st.page ? `<span class="page-tag">p.${st.page}</span>` : '';
           return `
           <div class="street-card">
-            <div class="street-main">${badge}${escapeHtml(st.main_street || '—')}</div>
+            <div class="street-main">${badge}${pageTag}${escapeHtml(st.main_street || '—')}</div>
             <div class="street-bounds">
               From: <strong>${escapeHtml(st.from_street || '?')}</strong>
               &nbsp;→&nbsp; To: <strong>${escapeHtml(st.to_street || '?')}</strong>
@@ -603,9 +615,10 @@
       streetsHtml = s.streets.map(st => {
         const conf = st.confidence || '';
         const badge = conf ? `<span class="conf-badge conf-${conf}">${conf.toUpperCase()}</span>` : '';
+        const pageTag = st.page ? `<span class="page-tag">p.${st.page}</span>` : '';
         return `
         <div class="street-card">
-          <div class="street-main">${badge}${escapeHtml(st.main_street || '—')}</div>
+          <div class="street-main">${badge}${pageTag}${escapeHtml(st.main_street || '—')}</div>
           <div class="street-bounds">
             From: <strong>${escapeHtml(st.from_street || '?')}</strong>
             &nbsp;→&nbsp;

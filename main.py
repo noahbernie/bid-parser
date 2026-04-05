@@ -520,6 +520,7 @@ def run_extraction(doc_id: str, api_key: str):
             new_streets = result.get("streets", [])
             for s in new_streets:
                 s.setdefault("source", "image")
+                s["page"] = chunk.get("page")
             chunk_log(f"  ✓ [IMG {i+1}] Done in {elapsed:.1f}s — {len(new_streets)} streets")
             return i, new_streets, chunk_text
 

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import pdfplumber
@@ -1076,6 +1076,57 @@ async def list_docs():
         {"doc_id": k, "filename": v["filename"], "total_pages": v["total_pages"]}
         for k, v in documents.items()
     ]
+
+
+@app.post("/parse")
+async def parse_pdf(
+    file: UploadFile = File(...),
+    x_api_key: str = Header(default=None),
+):
+    """
+    Single-call endpoint for external integrations.
+    Send a PDF as multipart/form-data (field name: 'file').
+    Optionally pass X-Api-Key header matching env var PARSER_API_KEY.
+    Returns the full extraction result synchronously.
+    """
+    parser_api_key = os.environ.get("PARSER_API_KEY")
+    if parser_api_key and x_api_key != parser_api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not anthropic_key:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured on server")
+
+    contents = await file.read()
+    doc_id = str(uuid.uuid4())[:8]
+
+    with pdfplumber.open(io.BytesIO(contents)) as pdf:
+        total = len(pdf.pages)
+
+    documents[doc_id] = {
+        "filename": file.filename,
+        "total_pages": total,
+        "bytes": contents,
+        "page_cache": {},
+        "extracted_schema": None,
+        "progress": {"logs": [], "streets_so_far": []},
+    }
+
+    # Run extraction synchronously (blocks until complete)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, run_extraction, doc_id, anthropic_key)
+
+    result = documents[doc_id].get("extracted_schema")
+    if result is None:
+        raise HTTPException(status_code=500, detail="Extraction failed — check server logs")
+
+    # Clean up in-memory doc to avoid memory leak
+    del documents[doc_id]
+
+    return result
 
 
 @app.get("/")

@@ -758,7 +758,10 @@ def run_extraction(doc_id: str, api_key: str):
             doc["page_cache"][i + 1] = text
             has_table = page_has_tables(page, pdf_bytes=pdf_bytes, page_index=i)
             relevant = is_relevant_page(text)
-            if has_table:
+            # Fully rasterized pages (no extractable text) are likely scanned tables —
+            # include them for image extraction so we don't miss scanned slurry lists etc.
+            is_blank_to_pdfplumber = len(text.strip()) == 0
+            if has_table or is_blank_to_pdfplumber:
                 table_page_indices.add(i)
             if relevant:
                 relevant_indices.append(i)
@@ -767,6 +770,8 @@ def run_extraction(doc_id: str, api_key: str):
                 tags.append("street content")
             if has_table:
                 tags.append("📊 table detected → will send image")
+            elif is_blank_to_pdfplumber:
+                tags.append("🖼 no text (scanned) → will send image")
             if tags:
                 log(f"  Page {i + 1}: {', '.join(tags)}")
 

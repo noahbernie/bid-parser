@@ -62,7 +62,7 @@ Each street object: {"main_street": "...", "from_street": "...", "to_street": ".
 
 """ + _STREETS_PROMPT_BASE.replace("{SOURCE_TAG}", "image") + """
 Read each row carefully left-to-right. Each row is independent — do not carry over values from adjacent rows.
-CRITICAL — MAIN STREET NAME: The main_street is ALWAYS read directly from the first column of that specific row. Never infer, guess, or copy it from another row. If the first column cell is hard to read, do your best to transcribe it exactly as it appears — do not substitute a nearby street name."""
+Important: main_street must be copied exactly from the first column of that specific row. Do not infer or substitute it from another row. If the text is hard to read, transcribe it as closely as possible."""
 
 
 STREET_KEYWORDS = [
@@ -171,6 +171,308 @@ def render_page_as_strips(pdf_bytes: bytes, page_index: int, dpi: int = 250) -> 
         result.append(base64.standard_b64encode(buf.getvalue()).decode())
     return result
 
+def render_page_as_strips(pdf_bytes: bytes, page_index: int, dpi: int = 250) -> list:
+    """Render a PDF page and split into top/bottom half strips. Returns list of b64 strings."""
+    import io
+    from PIL import Image as PILImage
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = doc[page_index].get_pixmap(matrix=mat)
+    doc.close()
+    img = PILImage.open(io.BytesIO(pix.tobytes("png")))
+    mid = img.height // 2
+    strips = [img.crop((0, 0, img.width, mid)), img.crop((0, mid, img.width, img.height))]
+    result = []
+    for strip in strips:
+        buf = io.BytesIO()
+        strip.save(buf, format="PNG")
+        result.append(base64.standard_b64encode(buf.getvalue()).decode())
+    return result
+
+# Column header keyword sets for deterministic text extraction
+_COL_KEYWORDS = {
+    "main_street": ["street name", "street", "roadway", "road name", "location name"],
+    "from_street": ["cross street 1", "cross st 1", "from street", "from", "begin", "start", "limits from", "cross street from"],
+    "to_street":   ["cross street 2", "cross st 2", "to street", "to", "end", "terminus", "limits to", "cross street to"],
+    "work_type":   ["activity", "project description", "work type", "work", "type", "description", "project descripton"],
+    "location":    ["location", "district", "council district", "segment id", "segment", "project title", "community planning area", "zone"],
+}
+
+def _match_col(header_cell: str) -> str:
+    """Return the schema field name that best matches a header cell, or '' if none."""
+    h = (header_cell or "").strip().lower()
+    for field, keywords in _COL_KEYWORDS.items():
+        for kw in keywords:
+            if kw in h:
+                return field
+    return ""
+
+def _is_header_row(row: list) -> bool:
+    """Check if a row looks like a column header (has recognizable field keywords)."""
+    matched = sum(1 for cell in row if _match_col(str(cell or "")))
+    return matched >= 2
+
+def _row_to_street(row: list, col_map: dict, page_num: int) -> dict:
+    """Convert a table row to a street dict using col_map. Returns None if no main_street."""
+    s = {"source": "text", "page": page_num}
+    for col_idx, field in col_map.items():
+        if col_idx < len(row):
+            val = str(row[col_idx] or "").strip()
+            s[field] = val if val else None
+    main = s.get("main_street") or ""
+    skip_values = {"street name", "street", "name", "roadway", "location name", ""}
+    if main.lower() in skip_values:
+        return None
+    return s
+
+
+def _find_header_xmap(all_words: list) -> tuple:
+    """
+    Scan word lines for a header row containing recognizable multi-word column phrases.
+    Returns (header_xmap, header_bottom_y) where header_xmap is {field: x0}, or (None, None).
+
+    Uses n-gram phrase matching so "Cross Street 1" (3 separate words) correctly maps
+    to from_street even though no single word matches.
+    """
+    # Group words into lines by y-position
+    line_buckets = {}
+    for w in all_words:
+        y = round(w["top"] / 3) * 3
+        line_buckets.setdefault(y, []).append(w)
+
+    sorted_ys = sorted(line_buckets.keys())
+
+    for y in sorted_ys:
+        line_words = sorted(line_buckets[y], key=lambda w: w["x0"])
+        matches = {}
+        used_indices = set()
+        # Try n-grams of length 1-5 from left to right
+        for i in range(len(line_words)):
+            if i in used_indices:
+                continue
+            for n in range(5, 0, -1):
+                if i + n > len(line_words):
+                    continue
+                phrase = " ".join(line_words[j]["text"] for j in range(i, i + n)).lower()
+                for field, keywords in _COL_KEYWORDS.items():
+                    if field in matches:
+                        continue
+                    for kw in keywords:
+                        if kw == phrase:
+                            matches[field] = line_words[i]["x0"]
+                            used_indices.update(range(i, i + n))
+                            break
+                    else:
+                        continue
+                    break
+                else:
+                    continue
+                break  # found a match starting at i, move to next unused word
+
+        if len(matches) >= 2 and "main_street" in matches:
+            header_bottom_y = max(w["bottom"] for w in line_words) + 2
+            return matches, header_bottom_y
+
+    return None, None
+
+
+def try_extract_tables_text(pdf_bytes: bytes, page_index: int, page_num: int, fallback_xmap: dict = None) -> tuple:
+    """
+    Deterministic street extraction from text-based PDFs.
+
+    Two-pass approach:
+    1. extract_tables() — captures bordered/structured table rows perfectly
+    2. x-band parsing — captures borderless plain-text rows using column x-positions
+       learned from the header row via n-gram phrase matching.
+
+    fallback_xmap: x-band map inherited from a previous page (for continuation pages
+                   that have no header row of their own).
+
+    Returns (streets, xmap) where streets is a list or None, and xmap is the header
+    map used (to pass as fallback_xmap to the next page).
+    """
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        page = pdf.pages[page_index]
+        tables = page.extract_tables()
+        all_words = page.extract_words()
+
+    all_streets = []
+    found_valid_table = False
+    pass1_rows = set()  # track (main, from, to) tuples added in pass 1 to avoid dupes
+
+    # --- Pass 1: bordered table rows via extract_tables() ---
+    for table in (tables or []):
+        if not table or len(table) < 2:
+            continue
+
+        header_row = None
+        data_start = 0
+        for row_idx, row in enumerate(table):
+            if _is_header_row(row):
+                header_row = row
+                data_start = row_idx + 1
+                break
+        if header_row is None:
+            continue
+
+        col_map = {}
+        for col_idx, cell in enumerate(header_row):
+            field = _match_col(str(cell or ""))
+            if field and field not in col_map.values():
+                col_map[col_idx] = field
+
+        fields_found = set(col_map.values())
+        if "main_street" not in fields_found:
+            continue
+        if "from_street" not in fields_found and "to_street" not in fields_found:
+            continue
+
+        found_valid_table = True
+
+        for row in table[data_start:]:
+            if not row or not any(c and str(c).strip() for c in row):
+                continue
+            s = _row_to_street(row, col_map, page_num)
+            if s:
+                all_streets.append(s)
+                key = (s.get("main_street", ""), s.get("from_street", ""), s.get("to_street", ""))
+                pass1_rows.add(key)
+
+    # --- Pass 2: x-band parsing for borderless / text-only rows ---
+    # Use n-gram phrase matching to find header on this page; fall back to inherited header
+    header_xmap, header_bottom_y = _find_header_xmap(all_words)
+    if header_xmap is None and fallback_xmap is not None:
+        # Continuation page — no header row, inherit column layout from previous page
+        header_xmap = fallback_xmap
+        header_bottom_y = 0  # all words are data
+
+    used_xmap = header_xmap  # return to caller for next page
+
+    if header_xmap and ("from_street" in header_xmap or "to_street" in header_xmap):
+        found_valid_table = True
+
+        sorted_fields = sorted(header_xmap.items(), key=lambda kv: kv[1])
+        xband_list = []
+        for i, (field, x0) in enumerate(sorted_fields):
+            # Use midpoint between adjacent headers as boundary so that data words
+            # starting slightly left of their column header still land in the right band.
+            # e.g. if "Cross Street 1" header is at x=250 but "BROOKBURN" data is at
+            # x=220, the midpoint boundary (e.g. 150) correctly puts it in from_street.
+            if i + 1 < len(sorted_fields):
+                next_x0 = sorted_fields[i + 1][1]
+                x_end = (x0 + next_x0) / 2
+            else:
+                x_end = 9999
+            if i == 0:
+                # First column starts at x=0 to catch multi-word names that begin left
+                # of the header word (e.g. "CAM DE LA COSTA")
+                x_actual_start = 0
+            else:
+                prev_x0 = sorted_fields[i - 1][1]
+                x_actual_start = (prev_x0 + x0) / 2
+            xband_list.append((x_actual_start, x_end, field))
+
+        # Group words below header into lines
+        line_buckets = {}
+        for w in all_words:
+            if w["top"] <= header_bottom_y:
+                continue
+            y = round(w["top"] / 3) * 3
+            line_buckets.setdefault(y, []).append(w)
+
+        for y in sorted(line_buckets.keys()):
+            line_words = sorted(line_buckets[y], key=lambda w: w["x0"])
+            cells = {}
+            for w in line_words:
+                # Use word center for column assignment so words that slightly
+                # straddle a boundary land in whichever column holds most of the word.
+                w_center = (w["x0"] + w["x1"]) / 2
+                for x_start, x_end, field in xband_list:
+                    if w_center >= x_start and w_center < x_end:
+                        cells[field] = (cells.get(field, "") + " " + w["text"]).strip()
+                        break
+
+            main = cells.get("main_street", "").strip()
+            if not main:
+                continue
+            if _match_col(main) or main.lower() in ("street name", "street", "name"):
+                continue
+
+            # Filter garbage: street names are ALL CAPS; mixed-case = sentence text
+            alpha_chars = [c for c in main if c.isalpha()]
+            if alpha_chars and sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars) < 0.8:
+                continue
+
+            # Filter form/legal text: checkbox patterns like "( ) DECLARED", "(X) YES"
+            if any("(" in (cells.get(f) or "") for f in ("main_street", "from_street", "to_street")):
+                continue
+
+            # Require at least one recognized street-type word anywhere in main_street.
+            # This catches garbage like "EMERGENCY", "PROJECT", "EXEMPTION" while allowing
+            # streets with suffixes (BAMBURGH PL), Spanish names (CAM PLAYA AZUL, VIA DEL
+            # COSIRA), and other patterns common across US city docs.
+            _STREET_TYPE_WORDS = {
+                # English suffixes
+                "ST", "AV", "AVE", "DR", "RD", "BL", "BLVD", "CT", "LN", "PL",
+                "WY", "WAY", "CIR", "CR", "TER", "TRL", "TRAIL", "HWY", "FWY",
+                "PKWY", "PY", "LOOP", "EXPY", "ALY", "ALLEY", "XING",
+                # Spanish/California prefixes and types
+                "VIA", "CAM", "CAMINO", "CALLE", "PASEO", "CTE", "CORTE",
+                "AVNDA", "AVENIDA", "RANCHO",
+            }
+            main_words = set(main.upper().split())
+            if not main_words & _STREET_TYPE_WORDS:
+                continue
+
+            # Skip rows where from/to fields are unreasonably long — indicates a different
+            # table format (e.g. work order pages with widths, costs, map refs) where
+            # everything to the right of the cross street bleeds into the to_street band.
+            # Real street names are short; 60 chars is generous.
+            if any(len(cells.get(f) or "") > 60 for f in ("from_street", "to_street")):
+                continue
+
+            # Truncate cross street fields at the first standalone integer word.
+            # In docs with more columns than expected, extra columns (district number,
+            # map reference, planning area, road type) bleed into the to_street band.
+            # e.g. "STEADMAN ST 6 1208-G5 MIRA MESA Residential" → "STEADMAN ST"
+            # Starts at index 1 so a leading digit like "1ST" is not stripped.
+            for f in ("from_street", "to_street"):
+                v = cells.get(f, "")
+                if not v:
+                    continue
+                words = v.split()
+                for idx, word in enumerate(words):
+                    if idx > 0 and word.isdigit():
+                        cells[f] = " ".join(words[:idx]).strip() or None
+                        break
+                else:
+                    if len(words) == 1 and words[0].isdigit():
+                        cells[f] = None  # purely numeric — clear it
+
+            populated = sum(1 for f in ["main_street", "from_street", "to_street"] if cells.get(f))
+            if populated < 2:
+                continue
+
+            key = (cells.get("main_street"), cells.get("from_street"), cells.get("to_street"))
+            if key in pass1_rows:
+                continue  # already captured by bordered table pass
+
+            all_streets.append({
+                "source": "text",
+                "page": page_num,
+                "main_street": cells.get("main_street") or None,
+                "from_street": cells.get("from_street") or None,
+                "to_street":   cells.get("to_street") or None,
+                "work_type":   cells.get("work_type") or None,
+                "location":    cells.get("location") or None,
+            })
+
+    if not found_valid_table:
+        return None, used_xmap
+
+    return (all_streets if all_streets else None), used_xmap
+
+
 def page_has_tables(page, pdf_bytes: bytes = None, page_index: int = None) -> bool:
     """
     Detect if a page likely has table structure by looking for rows with
@@ -268,7 +570,7 @@ def call_gemini_image(prompt: str, b64_image: str, max_retries: int = 4, log_fn=
     if not api_key:
         raise Exception("GEMINI_API_KEY not set")
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"  # TODO: switch back to gemini-2.5-pro
     payload = json.dumps({
         "contents": [{"parts": [
             {"text": prompt},
@@ -442,6 +744,9 @@ def run_extraction(doc_id: str, api_key: str):
     def is_empty(v):
         return not v or str(v).strip() in ("?", "null", "None", "")
 
+    def is_empty(v):
+        return not v or str(v).strip() in ("?", "null", "None", "")
+
     client = anthropic.Anthropic(api_key=api_key)
 
     # --- Step 2: extract header info from first 5 pages ---
@@ -479,23 +784,66 @@ def run_extraction(doc_id: str, api_key: str):
             current_blocks = []
             current_size = 0
 
-    for page_idx in relevant_indices:
-        if page_idx in table_page_indices:
-            flush_text_chunk()
+    # Also track pages that were extracted deterministically (skip Gemini for those)
+    deterministic_streets = []
+    last_text_xmap = None       # sticky header: column layout from last text-extracted page
+    last_text_xmap_page = None  # which page set last_text_xmap (reset if gap > 1)
+
+    # Process table pages in order: relevant ones get Gemini fallback, non-relevant ones
+    # get text-only attempt (if text fails on a non-relevant page, just skip it).
+    relevant_set = set(relevant_indices)
+    all_table_pages = sorted(table_page_indices)
+
+    for page_idx in all_table_pages:
+        is_relevant = page_idx in relevant_set
+        flush_text_chunk()
+
+        # Only propagate sticky header to the immediately following page.
+        # A gap means we've hit a non-table/non-relevant page (e.g. a CAD map)
+        # and the inherited column layout would produce garbage on unrelated content.
+        if last_text_xmap is not None and last_text_xmap_page is not None:
+            if page_idx - last_text_xmap_page > 1:
+                last_text_xmap = None
+                last_text_xmap_page = None
+
+        # Try deterministic text extraction first (pass inherited xmap for headerless pages)
+        try:
+            text_rows, new_xmap = try_extract_tables_text(pdf_bytes, page_idx, page_idx + 1, fallback_xmap=last_text_xmap)
+        except Exception as e:
+            text_rows, new_xmap = None, None
+            if is_relevant:
+                log(f"  Page {page_idx + 1}: text extraction error ({e}), falling back to image")
+
+        if text_rows is not None:
+            log(f"  Page {page_idx + 1}: ✅ deterministic text extraction — {len(text_rows)} rows (no AI needed)")
+            deterministic_streets.extend(text_rows)
+            last_text_xmap = new_xmap or last_text_xmap
+            last_text_xmap_page = page_idx
+        elif is_relevant:
+            last_text_xmap = None  # reset — image pages break the text section
+            last_text_xmap_page = None
+            # Only send to Gemini if the page text looks garbled (raster/CAD content).
+            # Clean text pages that just lack a recognized table structure have nothing
+            # useful for Gemini to extract — skip them.
+            # Fall back to image strips → Gemini
             try:
                 strips = render_page_as_strips(pdf_bytes, page_idx)
                 for strip_num, b64 in enumerate(strips):
                     image_block = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}
                     chunks.append({"blocks": [image_block], "source": "image", "page": page_idx + 1, "strip": strip_num + 1})
-                log(f"  Page {page_idx + 1}: queued {len(strips)} image strips (table page)")
+                log(f"  Page {page_idx + 1}: 📷 image strips queued (no text tables found)")
             except Exception as e:
                 log(f"  Page {page_idx + 1}: image render failed ({e}), skipping")
+        else:
+            last_text_xmap = None  # non-relevant, text failed — reset sticky header
+            last_text_xmap_page = None
 
-        # non-table pages skipped — image-only mode
+        # non-table pages skipped
 
     n_img = sum(1 for c in chunks if c["source"] == "image")
-    n_txt = sum(1 for c in chunks if c["source"] == "text")
-    log(f"Split into {len(chunks)} chunks ({n_txt} text, {n_img} image). Starting street extraction...")
+    n_det = len(deterministic_streets)
+    log(f"Split into {len(chunks)} image chunks + {len([p for p in relevant_indices if p in table_page_indices])} table pages total.")
+    log(f"  📋 {n_det} streets from deterministic text extraction, {n_img} image strip(s) queued for Gemini.")
 
     doc["chunk_debug"] = []
     log_lock = threading.Lock()
@@ -559,7 +907,12 @@ def run_extraction(doc_id: str, api_key: str):
                     log(f"⚡ [IMG {i+1}] finished — {len(streets)} streets (partial total: {len(partial)})", partial)
         log(f"⚡ All image chunks done in {time.time() - t_parallel_start:.1f}s total")
 
-    # --- Merge results in original chunk order ---
+    # --- Merge deterministic text streets first ---
+    if deterministic_streets:
+        all_streets.extend(deterministic_streets)
+        log(f"  📋 Merged {len(deterministic_streets)} deterministic text streets")
+
+    # --- Merge image chunk results in original chunk order ---
     for i in sorted(chunk_results.keys()):
         streets = chunk_results[i]
         all_streets.extend(streets)
@@ -618,7 +971,7 @@ def run_extraction(doc_id: str, api_key: str):
 
     # Drop streets with no from_street AND no to_street
     dropped_empty = [s for s in all_streets if is_empty(s.get("from_street")) and is_empty(s.get("to_street"))]
-    all_streets = [s for s in all_streets if not (is_empty(s.get("from_street")) and is_empty(s.get("to_street")))]
+    all_streets = [s for s in all_streets if not (is_empty(s.get("from_street")) or is_empty(s.get("to_street")))]
 
     schema["streets"] = all_streets
     log(f"  Deduplication: {before} → {len(all_streets)} streets (removed {before - len(all_streets)} duplicates)")

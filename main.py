@@ -214,6 +214,7 @@ def _is_header_row(row: list) -> bool:
 
 def _row_to_street(row: list, col_map: dict, page_num: int) -> dict:
     """Convert a table row to a street dict using col_map. Returns None if no main_street."""
+    import re as _re
     s = {"source": "text", "page": page_num}
     for col_idx, field in col_map.items():
         if col_idx < len(row):
@@ -223,6 +224,17 @@ def _row_to_street(row: list, col_map: dict, page_num: int) -> dict:
     skip_values = {"street name", "street", "name", "roadway", "location name", ""}
     if main.lower() in skip_values:
         return None
+    # Strip leading segment ID (e.g. "SS-026228-PV1 TEASDALE AV" → "TEASDALE AV")
+    main = _re.sub(r'^[A-Z]{1,4}-\d{4,8}-[A-Z0-9]+(?:-[A-Z0-9]+)*\s+', '', main).strip()
+    if main:
+        s["main_street"] = main
+    # Clean work_type: strip date bleed and leading planning-area prefix
+    wt = s.get("work_type") or ""
+    if wt:
+        wt = _re.sub(r'\s+\d{2}/\d{4}.*$', '', wt).strip()
+        wt = _re.sub(r'(\s+\b\d{1,2}\b)+\s*$', '', wt).strip()
+        wt = _re.sub(r'^(?:[A-Z][A-Z /]+?)\s+(?=AC\b|CRACK|SLURRY|CAPE|GRIND|OVERLAY|PATCH|MILL|RESURFACE)', '', wt).strip()
+        s["work_type"] = wt or None
     return s
 
 
@@ -448,6 +460,29 @@ def try_extract_tables_text(pdf_bytes: bytes, page_index: int, page_num: int, fa
                 else:
                     if len(words) == 1 and words[0].isdigit():
                         cells[f] = None  # purely numeric — clear it
+
+            # Strip leading segment ID from main_street (e.g. "SS-026228-PV1 TEASDALE AV" → "TEASDALE AV")
+            import re as _re
+            ms = cells.get("main_street") or ""
+            ms = _re.sub(r'^(?:[A-Z]\d{4}\s+)?[A-Z]{1,4}-\d{4,8}-[A-Z0-9]+(?:-[A-Z0-9]+)*\s+', '', ms).strip()
+            if ms:
+                cells["main_street"] = ms
+
+            # Clean work_type: strip leading ALL-CAPS planning-area prefix and trailing
+            # date/numeric bleed (e.g. "UNIVERSITY AC - Slurry Seal 03/2026 07/2026 5 8 Residential"
+            # → "AC - Slurry Seal").
+            wt = cells.get("work_type") or ""
+            if wt:
+                # Remove trailing: date patterns (MM/YYYY), standalone short integers, and
+                # Residential/Major/Local classification words that bleed in from right columns.
+                wt = _re.sub(r'\s+\d{2}/\d{4}.*$', '', wt).strip()  # truncate at first date
+                wt = _re.sub(r'(\s+\b\d{1,2}\b)+\s*$', '', wt).strip()  # trailing short ints
+                # Strip leading ALL-CAPS single-word prefix that is not part of the activity
+                # (planning area names like "UNIVERSITY", "MIRAMAR RANCH NORTH", etc.)
+                # Heuristic: if work_type starts with all-caps word(s) before "AC " or a
+                # known activity keyword, strip them.
+                wt = _re.sub(r'^(?:[A-Z][A-Z /]+?)\s+(?=AC\b|CRACK|SLURRY|CAPE|GRIND|OVERLAY|PATCH|MILL|RESURFACE)', '', wt).strip()
+                cells["work_type"] = wt or None
 
             populated = sum(1 for f in ["main_street", "from_street", "to_street"] if cells.get(f))
             if populated < 2:

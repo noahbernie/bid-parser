@@ -49,8 +49,12 @@ def similarity(a: str, b: str) -> float:
     na, nb = norm(a), norm(b)
     if not na or not nb:
         return 0.0
-    ta, tb = set(na.split()), set(nb.split())
-    return len(ta & tb) / max(len(ta), len(tb))
+    ta, tb = na.split(), nb.split()
+    sa, sb = set(ta), set(tb)
+    # One name is a subset of the other — suffix likely omitted (e.g. ARLINGTON vs ARLINGTON AV)
+    if sa < sb or sb < sa:
+        return 0.75
+    return len(sa & sb) / max(len(sa), len(sb))
 
 def street_key(s: dict) -> tuple:
     return (norm(s.get("main_street", "")),

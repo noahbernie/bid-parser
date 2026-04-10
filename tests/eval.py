@@ -184,6 +184,15 @@ def match_streets(truth: list, parsed: list) -> dict:
     matched, missed, extra = [], [], []
     used = set()
 
+    # Deduplicate parsed streets — strip exact (main, from, to) duplicates
+    seen_keys, deduped = set(), []
+    for p in parsed:
+        k = (norm(p.get("main_street","")), norm(p.get("from_street","")), norm(p.get("to_street","")))
+        if k not in seen_keys:
+            seen_keys.add(k)
+            deduped.append(p)
+    parsed = deduped
+
     for t in truth:
         tk = street_key(t)
         best_score, best_idx = 0.0, -1

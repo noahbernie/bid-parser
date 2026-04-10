@@ -176,7 +176,7 @@ def render_page_as_image(pdf_bytes: bytes, page_index: int, dpi: int = 250) -> s
     return base64.standard_b64encode(img_bytes).decode()
 
 def render_page_as_strips(pdf_bytes: bytes, page_index: int, dpi: int = 250) -> list:
-    """Render a PDF page and split into top/bottom half strips. Returns list of b64 strings."""
+    """Render a PDF page and split into 4 equal horizontal strips. Returns list of b64 strings."""
     import io
     from PIL import Image as PILImage
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -184,26 +184,14 @@ def render_page_as_strips(pdf_bytes: bytes, page_index: int, dpi: int = 250) -> 
     pix = doc[page_index].get_pixmap(matrix=mat)
     doc.close()
     img = PILImage.open(io.BytesIO(pix.tobytes("png")))
-    mid = img.height // 2
-    strips = [img.crop((0, 0, img.width, mid)), img.crop((0, mid, img.width, img.height))]
-    result = []
-    for strip in strips:
-        buf = io.BytesIO()
-        strip.save(buf, format="PNG")
-        result.append(base64.standard_b64encode(buf.getvalue()).decode())
-    return result
-
-def render_page_as_strips(pdf_bytes: bytes, page_index: int, dpi: int = 250) -> list:
-    """Render a PDF page and split into top/bottom half strips. Returns list of b64 strings."""
-    import io
-    from PIL import Image as PILImage
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    pix = doc[page_index].get_pixmap(matrix=mat)
-    doc.close()
-    img = PILImage.open(io.BytesIO(pix.tobytes("png")))
-    mid = img.height // 2
-    strips = [img.crop((0, 0, img.width, mid)), img.crop((0, mid, img.width, img.height))]
+    h, w = img.height, img.width
+    q = h // 4
+    strips = [
+        img.crop((0, 0,     w, q)),
+        img.crop((0, q,     w, q * 2)),
+        img.crop((0, q * 2, w, q * 3)),
+        img.crop((0, q * 3, w, h)),
+    ]
     result = []
     for strip in strips:
         buf = io.BytesIO()

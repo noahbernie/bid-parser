@@ -627,7 +627,7 @@ def call_gemini_image(prompt: str, b64_image: str, max_retries: int = 4, log_fn=
     if not api_key:
         raise Exception("GEMINI_API_KEY not set")
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"  # TODO: switch back to gemini-2.5-pro
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={api_key}"
     payload = json.dumps({
         "contents": [{"parts": [
             {"text": prompt},

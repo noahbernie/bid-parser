@@ -2,209 +2,319 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Bid Parser — Eval</title>
+  <title>Eval Dashboard — Bid Parser</title>
   <style>
+    :root {
+      --bg:       #f1f5f9;
+      --surface:  #ffffff;
+      --border:   #e2e8f0;
+      --text:     #0f172a;
+      --muted:    #64748b;
+      --indigo:   #6366f1;
+      --indigo-l: #eef2ff;
+      --green:    #10b981;
+      --green-l:  #d1fae5;
+      --amber:    #f59e0b;
+      --amber-l:  #fef3c7;
+      --red:      #ef4444;
+      --red-l:    #fee2e2;
+      --blue:     #3b82f6;
+      --blue-l:   #dbeafe;
+      --radius:   10px;
+      --shadow:   0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.04);
+      --shadow-md:0 4px 12px rgba(0,0,0,.1);
+    }
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: system-ui, sans-serif; background: #f0f2f5; color: #222; min-height: 100vh; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
 
     /* ── Header ── */
     header {
-      background: #1a1a2e; color: white;
-      padding: 14px 24px; display: flex; align-items: center; gap: 16px;
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 0 24px; height: 52px; display: flex; align-items: center; gap: 16px;
+      flex-shrink: 0;
     }
-    header h1 { font-size: 1rem; font-weight: 600; flex: 1; }
-    header a { color: #a5b4fc; font-size: 0.8rem; text-decoration: none; }
-    header a:hover { color: white; }
+    .logo { font-size: 0.88rem; font-weight: 700; color: var(--text); }
+    .logo span { color: var(--indigo); }
+    .back-link { font-size: 0.78rem; color: var(--muted); text-decoration: none;
+                 display: flex; align-items: center; gap: 4px; }
+    .back-link:hover { color: var(--indigo); }
+    .header-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
 
-    /* ── Summary bar ── */
-    .summary-bar {
-      background: white; border-bottom: 1px solid #ddd;
-      padding: 14px 24px; display: flex; align-items: center; gap: 24px; flex-wrap: wrap;
+    /* ── Overall progress bar (top) ── */
+    #overall-progress-wrap {
+      display: none; background: var(--indigo); height: 3px; flex-shrink: 0;
     }
-    .stat { text-align: center; }
-    .stat .val { font-size: 1.4rem; font-weight: 700; color: #1a1a2e; }
-    .stat .lbl { font-size: 0.7rem; color: #888; text-transform: uppercase; letter-spacing: .5px; margin-top: 2px; }
-    .summary-bar .actions { margin-left: auto; display: flex; gap: 8px; }
-    .btn { border: none; border-radius: 6px; padding: 8px 16px; font-size: 0.82rem; cursor: pointer; font-weight: 600; }
-    .btn-primary { background: #4f46e5; color: white; }
-    .btn-primary:hover { background: #3730a3; }
-    .btn-primary:disabled { background: #a5b4fc; cursor: not-allowed; }
-    .btn-danger  { background: #fee2e2; color: #b91c1c; }
-    .btn-danger:hover  { background: #fecaca; }
-    .btn-sm { padding: 5px 10px; font-size: 0.75rem; }
-
-    /* ── Layout ── */
-    .layout { display: flex; height: calc(100vh - 109px); }
-
-    /* ── Doc list ── */
-    .doc-list {
-      width: 420px; min-width: 420px; overflow-y: auto;
-      padding: 16px; display: flex; flex-direction: column; gap: 10px;
+    #overall-progress-bar {
+      height: 100%; background: white; opacity: .5;
+      transition: width .4s; width: 0%;
     }
+
+    /* ── Summary strip ── */
+    .summary {
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 12px 24px; display: flex; align-items: center; gap: 0; flex-shrink: 0;
+    }
+    .stat-item { padding: 0 20px; border-right: 1px solid var(--border); }
+    .stat-item:first-child { padding-left: 0; }
+    .stat-item:last-child { border-right: none; }
+    .stat-val { font-size: 1.25rem; font-weight: 700; color: var(--text); line-height: 1; }
+    .stat-lbl { font-size: 0.68rem; color: var(--muted); text-transform: uppercase;
+                letter-spacing: .5px; margin-top: 3px; }
+    .stat-val.green  { color: var(--green); }
+    .stat-val.indigo { color: var(--indigo); }
+    .stat-val.blue   { color: var(--blue); }
+    .summary-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+    #run-all-progress { font-size: 0.75rem; color: var(--muted); }
+
+    /* ── Buttons ── */
+    .btn { border: none; border-radius: 7px; padding: 8px 14px; font-size: 0.8rem;
+           cursor: pointer; font-weight: 600; transition: all .15s; display: inline-flex;
+           align-items: center; gap: 5px; }
+    .btn-primary { background: var(--indigo); color: white; }
+    .btn-primary:hover:not(:disabled) { background: #4f46e5; }
+    .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+    .btn-ghost:hover { background: var(--bg); color: var(--text); }
+    .btn-sm { padding: 5px 10px; font-size: 0.72rem; border-radius: 6px; }
+    .btn-danger { background: var(--red-l); color: var(--red); border: 1px solid #fecaca; }
+    .btn-danger:hover { background: #fecaca; }
+
+    /* ── Main layout ── */
+    .layout { display: flex; flex: 1; overflow: hidden; }
+
+    /* ── Doc list panel ── */
+    .doc-list-panel {
+      width: 400px; min-width: 400px; overflow-y: auto; padding: 16px;
+      display: flex; flex-direction: column; gap: 8px; border-right: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .panel-label { font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
+                   letter-spacing: .6px; color: var(--muted); padding: 4px 2px 8px; }
+
+    /* ── Doc card ── */
     .doc-card {
-      background: white; border: 2px solid #e5e5e5; border-radius: 10px;
-      padding: 14px 16px; cursor: pointer; transition: border-color .15s, box-shadow .15s;
+      background: var(--surface); border: 1.5px solid var(--border);
+      border-radius: var(--radius); padding: 14px; cursor: pointer;
+      transition: border-color .15s, box-shadow .15s;
+      box-shadow: var(--shadow);
     }
-    .doc-card:hover { border-color: #a5b4fc; box-shadow: 0 2px 8px rgba(79,70,229,.1); }
-    .doc-card.active { border-color: #4f46e5; }
-    .doc-card.running { border-color: #f59e0b; animation: pulse .8s infinite alternate; }
-    @keyframes pulse { from { border-color: #f59e0b; } to { border-color: #fbbf24; } }
+    .doc-card:hover  { border-color: #a5b4fc; box-shadow: var(--shadow-md); }
+    .doc-card.active { border-color: var(--indigo); box-shadow: 0 0 0 3px rgba(99,102,241,.1); }
+    .doc-card.running{ border-color: var(--amber); animation: card-pulse 1.2s infinite alternate; }
+    @keyframes card-pulse { to { border-color: #fcd34d; box-shadow: 0 0 0 3px rgba(245,158,11,.1); } }
 
-    .card-top { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; }
-    .card-name { font-size: 0.8rem; font-weight: 600; color: #1a1a2e; flex: 1; line-height: 1.4; }
-    .card-actions { display: flex; gap: 5px; flex-shrink: 0; }
+    .card-header { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; }
+    .card-name { font-size: 0.78rem; font-weight: 600; color: var(--text); flex: 1;
+                 line-height: 1.4; word-break: break-word; }
+    .card-btns { display: flex; gap: 4px; flex-shrink: 0; }
 
-    .f1-bar-wrap { margin-bottom: 8px; }
-    .f1-label { display: flex; justify-content: space-between; font-size: 0.7rem; color: #888; margin-bottom: 3px; }
-    .f1-label strong { color: #1a1a2e; font-size: 0.85rem; }
-    .f1-track { height: 6px; background: #e5e5e5; border-radius: 3px; overflow: hidden; }
-    .f1-fill  { height: 100%; border-radius: 3px; transition: width .4s; }
-    .f1-fill.good   { background: #22c55e; }
-    .f1-fill.ok     { background: #f59e0b; }
-    .f1-fill.bad    { background: #ef4444; }
-    .f1-fill.none   { background: #d1d5db; }
+    /* F1 progress ring */
+    .card-scores { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+    .score-ring { position: relative; width: 52px; height: 52px; flex-shrink: 0; }
+    .score-ring svg { transform: rotate(-90deg); }
+    .ring-bg  { fill: none; stroke: var(--border); stroke-width: 4; }
+    .ring-fill{ fill: none; stroke-width: 4; stroke-linecap: round;
+                transition: stroke-dashoffset .5s ease; }
+    .ring-label { position: absolute; inset: 0; display: flex; flex-direction: column;
+                  align-items: center; justify-content: center; }
+    .ring-val { font-size: 0.72rem; font-weight: 800; color: var(--text); line-height: 1; }
+    .ring-sub { font-size: 0.55rem; color: var(--muted); }
 
-    .prf-row { display: flex; gap: 10px; margin-bottom: 8px; }
-    .prf-chip { background: #f4f4ff; border: 1px solid #e0e0ff; border-radius: 5px; padding: 3px 8px; font-size: 0.7rem; }
-    .prf-chip span { font-weight: 700; }
+    .score-details { flex: 1; }
+    .prf-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 6px; }
+    .prf-item { background: var(--bg); border-radius: 5px; padding: 4px 7px; }
+    .prf-item .pv { font-size: 0.8rem; font-weight: 700; }
+    .prf-item .pl { font-size: 0.6rem; color: var(--muted); }
+    .prf-item.p .pv { color: var(--indigo); }
+    .prf-item.r .pv { color: var(--blue); }
+    .prf-item.tr .pv { color: var(--muted); }
+    .prf-item.tp .pv { color: var(--muted); }
 
-    .counts-row { display: flex; gap: 8px; }
-    .count-badge { font-size: 0.7rem; font-weight: 600; padding: 2px 7px; border-radius: 10px; }
-    .count-matched { background: #dcfce7; color: #166534; }
-    .count-missed  { background: #fee2e2; color: #991b1b; }
-    .count-extra   { background: #fef9c3; color: #854d0e; }
+    .counts-row { display: flex; gap: 5px; flex-wrap: wrap; }
+    .chip { font-size: 0.67rem; font-weight: 600; padding: 2px 8px; border-radius: 20px; }
+    .chip-green  { background: var(--green-l); color: #065f46; }
+    .chip-red    { background: var(--red-l);   color: #991b1b; }
+    .chip-amber  { background: var(--amber-l); color: #92400e; }
 
-    .cache-row { margin-top: 8px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-    .cache-badge { font-size: 0.65rem; padding: 2px 7px; border-radius: 8px; font-weight: 600; }
-    .cache-hit  { background: #dbeafe; color: #1d4ed8; }
-    .cache-miss { background: #f3f4f6; color: #9ca3af; }
-    .cache-time { font-size: 0.65rem; color: #aaa; }
+    /* Progress bar during run */
+    .run-progress { margin-top: 10px; }
+    .run-phase { font-size: 0.7rem; color: var(--muted); margin-bottom: 4px;
+                 display: flex; justify-content: space-between; }
+    .run-phase strong { color: var(--text); }
+    .progress-track { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+    .progress-fill  { height: 100%; border-radius: 2px; transition: width .4s;
+                      background: linear-gradient(90deg, var(--indigo), #818cf8); }
+    .progress-fill.indeterminate {
+      width: 40%; animation: indeterminate 1.4s infinite ease-in-out;
+    }
+    @keyframes indeterminate {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(350%); }
+    }
 
-    .status-pending { color: #9ca3af; font-size: 0.78rem; text-align: center; padding: 12px 0; }
-    .status-running { color: #f59e0b; font-size: 0.78rem; text-align: center; padding: 6px 0; }
-    .status-error   { color: #ef4444; font-size: 0.75rem; padding: 6px 0; }
+    .card-footer { margin-top: 8px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .cache-chip { font-size: 0.62rem; font-weight: 600; padding: 2px 7px; border-radius: 20px; }
+    .cache-hit  { background: var(--blue-l); color: #1e40af; }
+    .cache-miss { background: var(--bg); color: var(--muted); border: 1px solid var(--border); }
+    .cache-time { font-size: 0.62rem; color: var(--muted); }
+    .status-error { font-size: 0.72rem; color: var(--red); margin-top: 6px; }
+    .not-run { font-size: 0.72rem; color: var(--muted); font-style: italic; }
 
     /* ── Detail panel ── */
-    .detail-panel {
-      flex: 1; background: white; border-left: 1px solid #ddd;
-      display: flex; flex-direction: column; overflow: hidden;
-    }
-    .detail-empty {
-      flex: 1; display: flex; align-items: center; justify-content: center;
-      color: #aaa; font-size: 0.9rem; flex-direction: column; gap: 8px;
-    }
-    .detail-header {
-      padding: 14px 20px; border-bottom: 1px solid #ddd;
-      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-    }
-    .detail-title { font-size: 0.85rem; font-weight: 700; flex: 1; }
-    .detail-scores { display: flex; gap: 12px; }
-    .dscore { text-align: center; }
-    .dscore .dv { font-size: 1.1rem; font-weight: 700; }
-    .dscore .dl { font-size: 0.65rem; color: #888; text-transform: uppercase; }
-    .dscore.dp .dv { color: #4f46e5; }
-    .dscore.dr .dv { color: #0891b2; }
-    .dscore.df .dv { color: #059669; }
+    .detail-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--surface); }
 
-    .tabs { display: flex; border-bottom: 1px solid #e5e5e5; padding: 0 20px; }
-    .tab-btn {
-      padding: 10px 16px; font-size: 0.8rem; font-weight: 600; cursor: pointer;
-      border: none; background: none; border-bottom: 2px solid transparent; color: #888;
-    }
-    .tab-btn.active { color: #4f46e5; border-bottom-color: #4f46e5; }
+    .detail-empty { flex: 1; display: flex; flex-direction: column; align-items: center;
+                    justify-content: center; color: var(--muted); gap: 10px; }
+    .detail-empty .icon { font-size: 2.5rem; opacity: .4; }
 
+    .detail-header { padding: 16px 24px; border-bottom: 1px solid var(--border);
+                     display: flex; align-items: center; gap: 16px; flex-wrap: wrap; flex-shrink: 0; }
+    .detail-title  { font-size: 0.88rem; font-weight: 700; flex: 1; }
+    .detail-meta   { font-size: 0.7rem; color: var(--muted); margin-top: 2px; }
+    .d-scores      { display: flex; gap: 16px; }
+    .d-score       { text-align: center; }
+    .d-score .dv   { font-size: 1.15rem; font-weight: 800; }
+    .d-score .dl   { font-size: 0.62rem; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+    .d-score.f1 .dv   { color: var(--green); }
+    .d-score.pre .dv  { color: var(--indigo); }
+    .d-score.rec .dv  { color: var(--blue); }
+
+    /* Log console */
+    #log-wrap { flex-shrink: 0; padding: 0 24px 0; }
+    .log-card { background: #0d1117; border-radius: 8px; overflow: hidden; margin: 12px 0 0; }
+    .log-card-header { background: #161b22; padding: 7px 14px; display: flex;
+                       align-items: center; justify-content: space-between; }
+    .log-card-title { font-size: 0.68rem; font-weight: 700; color: #8b949e;
+                      text-transform: uppercase; letter-spacing: 1px; }
+    .log-toggle { font-size: 0.68rem; color: #58a6ff; cursor: pointer; background: none;
+                  border: none; padding: 0; }
+    .log-toggle:hover { color: white; }
+    .log-body { max-height: 160px; overflow-y: auto; padding: 10px 14px; font-family: 'SF Mono', 'Fira Code', monospace; }
+    .log-line { font-size: 0.7rem; line-height: 1.7; white-space: pre-wrap; display: flex; gap: 8px; }
+    .log-ts   { color: #484f58; flex-shrink: 0; }
+    .log-msg  { color: #e6edf3; }
+    .log-msg.success { color: #3fb950; }
+    .log-msg.error   { color: #f85149; }
+    .log-msg.parser  { color: #79c0ff; }
+    .log-msg.warning { color: #d29922; }
+
+    /* Tabs */
+    .tabs-bar { display: flex; border-bottom: 1px solid var(--border); padding: 0 24px; flex-shrink: 0; }
+    .tab-btn  { padding: 11px 16px; font-size: 0.8rem; font-weight: 600; cursor: pointer;
+                border: none; background: none; border-bottom: 2px solid transparent;
+                color: var(--muted); transition: color .15s; }
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.active { color: var(--indigo); border-bottom-color: var(--indigo); }
+
+    /* Street table */
     .street-table { flex: 1; overflow-y: auto; }
-    .street-row {
-      display: grid; grid-template-columns: 2fr 1.5fr 1.5fr 80px;
-      padding: 9px 20px; border-bottom: 1px solid #f0f0f0; font-size: 0.78rem;
-      align-items: center;
-    }
+    .street-row { display: grid; grid-template-columns: 2.2fr 1.5fr 1.5fr 80px;
+                  padding: 9px 24px; border-bottom: 1px solid #f8fafc; font-size: 0.76rem;
+                  align-items: center; transition: background .1s; }
     .street-row:hover { background: #fafafa; }
-    .street-row.header { font-weight: 700; font-size: 0.7rem; text-transform: uppercase;
-      letter-spacing: .4px; color: #888; background: #f9f9f9; position: sticky; top: 0; }
-    .street-row.missed-row  { background: #fff8f8; }
-    .street-row.extra-row   { background: #fffef0; }
-    .street-row.matched-row { background: #f0fdf4; }
-    .cell-main { font-weight: 600; color: #1a1a2e; }
-    .cell-from-to { color: #555; }
-    .cell-page { color: #999; font-size: 0.72rem; }
-    .cell-score { color: #059669; font-size: 0.72rem; font-weight: 600; }
-    .cell-tab { color: #888; font-size: 0.68rem; }
+    .street-row.hdr { font-size: 0.67rem; font-weight: 700; text-transform: uppercase;
+                      letter-spacing: .4px; color: var(--muted); background: var(--bg);
+                      border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 1; }
+    .street-row.missed  { border-left: 3px solid var(--red); }
+    .street-row.extra   { border-left: 3px solid var(--amber); }
+    .street-row.matched { border-left: 3px solid var(--green); }
+    .cell-name  { font-weight: 600; color: var(--text); }
+    .cell-limit { color: var(--muted); }
+    .cell-page  { color: var(--muted); font-size: 0.7rem; }
+    .cell-score { font-size: 0.7rem; font-weight: 700; color: var(--green); }
+    .cell-tab   { color: var(--muted); font-size: 0.66rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .no-rows    { padding: 48px 24px; text-align: center; color: var(--muted); font-size: 0.85rem; }
 
-    .log-panel {
-      background: #0f1117; border-radius: 6px; margin: 12px 20px; overflow: hidden;
-    }
-    .log-header { background: #1e2130; color: #888; font-size: 0.68rem; padding: 4px 10px; letter-spacing: 1px; text-transform: uppercase; }
-    .log-body { max-height: 120px; overflow-y: auto; padding: 8px 10px; }
-    .log-line { color: #a8ff78; font-size: 0.72rem; font-family: monospace; line-height: 1.6; white-space: pre-wrap; }
-
-    .no-results { color: #aaa; text-align: center; padding: 40px; font-size: 0.85rem; }
-
-    .toast { position: fixed; bottom: 20px; right: 20px; background: #1a1a2e; color: white;
-      padding: 10px 16px; border-radius: 7px; font-size: 0.82rem;
-      opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 999; }
+    /* Toast */
+    .toast { position: fixed; bottom: 20px; right: 20px; background: var(--text); color: white;
+             padding: 10px 16px; border-radius: 8px; font-size: 0.8rem; font-weight: 500;
+             box-shadow: var(--shadow-md); opacity: 0; transition: opacity .25s;
+             pointer-events: none; z-index: 999; }
     .toast.show { opacity: 1; }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
   </style>
 </head>
 <body>
 
+<!-- Header -->
 <header>
-  <h1>Bid Parser — Eval Dashboard</h1>
-  <a href="/">← Back to Parser</a>
+  <div class="logo">Bid Parser <span>/ Eval</span></div>
+  <a class="back-link" href="/">← Parser</a>
+  <div class="header-right">
+    <span id="run-all-progress" style="display:none"></span>
+    <button class="btn btn-primary btn-sm" id="run-all-btn" onclick="runAll()">▶ Run All</button>
+  </div>
 </header>
 
-<div class="summary-bar" id="summary-bar">
-  <div class="stat"><div class="val" id="s-docs">—</div><div class="lbl">Documents</div></div>
-  <div class="stat"><div class="val" id="s-truth">—</div><div class="lbl">Truth Streets</div></div>
-  <div class="stat"><div class="val" id="s-f1" style="color:#059669">—</div><div class="lbl">Overall F1</div></div>
-  <div class="stat"><div class="val" id="s-recall" style="color:#0891b2">—</div><div class="lbl">Overall Recall</div></div>
-  <div class="stat"><div class="val" id="s-precision" style="color:#4f46e5">—</div><div class="lbl">Overall Precision</div></div>
-  <div class="actions">
-    <button class="btn btn-primary" id="run-all-btn" onclick="runAll()">▶ Run All</button>
-  </div>
+<!-- Overall top progress bar -->
+<div id="overall-progress-wrap">
+  <div id="overall-progress-bar"></div>
 </div>
 
+<!-- Summary strip -->
+<div class="summary">
+  <div class="stat-item"><div class="stat-val" id="s-docs">—</div><div class="stat-lbl">Documents</div></div>
+  <div class="stat-item"><div class="stat-val" id="s-truth">—</div><div class="stat-lbl">Truth Streets</div></div>
+  <div class="stat-item"><div class="stat-val green" id="s-f1">—</div><div class="stat-lbl">Overall F1</div></div>
+  <div class="stat-item"><div class="stat-val indigo" id="s-precision">—</div><div class="stat-lbl">Precision</div></div>
+  <div class="stat-item"><div class="stat-val blue" id="s-recall">—</div><div class="stat-lbl">Recall</div></div>
+  <div class="stat-item"><div class="stat-val" id="s-run">0 / —</div><div class="stat-lbl">Docs Run</div></div>
+</div>
+
+<!-- Layout -->
 <div class="layout">
+
   <!-- Doc list -->
-  <div class="doc-list" id="doc-list">
-    <p style="color:#aaa;font-size:.85rem;text-align:center;padding:20px">Loading...</p>
+  <div class="doc-list-panel" id="doc-list">
+    <div class="panel-label">Documents</div>
+    <p style="color:var(--muted);font-size:.82rem;text-align:center;padding:20px">Loading...</p>
   </div>
 
   <!-- Detail panel -->
   <div class="detail-panel" id="detail-panel">
     <div class="detail-empty" id="detail-empty">
-      <div style="font-size:2.5rem">📊</div>
-      <div>Click a document to see results</div>
+      <div class="icon">📊</div>
+      <div style="font-size:.88rem;font-weight:600">Select a document</div>
+      <div style="font-size:.78rem">Click any doc card to view results</div>
     </div>
-    <div id="detail-content" style="display:none; display:flex; flex-direction:column; flex:1; overflow:hidden;">
+    <div id="detail-content" style="display:none;flex-direction:column;flex:1;overflow:hidden">
       <div class="detail-header">
-        <div class="detail-title" id="d-title">—</div>
-        <div class="detail-scores">
-          <div class="dscore dp"><div class="dv" id="d-precision">—</div><div class="dl">Precision</div></div>
-          <div class="dscore dr"><div class="dv" id="d-recall">—</div><div class="dl">Recall</div></div>
-          <div class="dscore df"><div class="dv" id="d-f1">—</div><div class="dl">F1</div></div>
+        <div>
+          <div class="detail-title" id="d-title">—</div>
+          <div class="detail-meta" id="d-meta"></div>
         </div>
-        <div style="display:flex;gap:6px">
-          <span class="count-badge count-matched" id="d-matched">—</span>
-          <span class="count-badge count-missed" id="d-missed">—</span>
-          <span class="count-badge count-extra" id="d-extra">—</span>
+        <div class="d-scores">
+          <div class="d-score f1" ><div class="dv" id="d-f1">—</div><div class="dl">F1</div></div>
+          <div class="d-score pre"><div class="dv" id="d-precision">—</div><div class="dl">Precision</div></div>
+          <div class="d-score rec"><div class="dv" id="d-recall">—</div><div class="dl">Recall</div></div>
         </div>
-      </div>
-      <!-- Log console -->
-      <div id="log-wrap" style="display:none">
-        <div class="log-console" style="margin:10px 20px 0">
-          <div class="log-header" style="display:flex;justify-content:space-between;align-items:center">
-            <span>RUN LOG</span>
-            <span id="log-toggle" onclick="toggleLog()" style="cursor:pointer;font-size:0.7rem;color:#a5b4fc">▼ hide</span>
-          </div>
-          <div class="log-body" id="log-body" style="max-height:180px"></div>
+        <div class="counts-row">
+          <span class="chip chip-green" id="d-matched">—</span>
+          <span class="chip chip-red"   id="d-missed">—</span>
+          <span class="chip chip-amber" id="d-extra">—</span>
         </div>
       </div>
 
-      <div class="tabs" style="margin-top:10px">
-        <button class="tab-btn active" onclick="switchTab('missed')" id="tab-missed">❌ Missed</button>
-        <button class="tab-btn" onclick="switchTab('extra')" id="tab-extra">➕ Extra</button>
-        <button class="tab-btn" onclick="switchTab('matched')" id="tab-matched">✅ Matched</button>
+      <!-- Log -->
+      <div id="log-wrap" style="display:none;padding:0 24px">
+        <div class="log-card">
+          <div class="log-card-header">
+            <span class="log-card-title">Run Log</span>
+            <button class="log-toggle" id="log-toggle-btn" onclick="toggleLog()">▼ collapse</button>
+          </div>
+          <div class="log-body" id="log-body"></div>
+        </div>
+      </div>
+
+      <div class="tabs-bar" style="margin-top:8px">
+        <button class="tab-btn active" id="tab-missed"  onclick="switchTab('missed')">❌ Missed <span id="tab-missed-ct"></span></button>
+        <button class="tab-btn"        id="tab-extra"   onclick="switchTab('extra')">➕ Extra <span id="tab-extra-ct"></span></button>
+        <button class="tab-btn"        id="tab-matched" onclick="switchTab('matched')">✅ Matched <span id="tab-matched-ct"></span></button>
       </div>
       <div class="street-table" id="street-table"></div>
     </div>
@@ -214,17 +324,13 @@
 <div class="toast" id="toast"></div>
 
 <script>
-let allDocs = [];
-let selectedDoc = null;
-let selectedResults = null;
-let currentTab = 'missed';
-let runningJobs = {};  // doc_key -> job_id
+let allDocs = [], selectedDoc = null, selectedResults = null;
+let currentTab = 'missed', logVisible = true;
+let runningJobs = {};   // doc_key -> job_id
+let runAllTotal = 0, runAllDone = 0;
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-
-async function init() {
-  await loadDocs();
-}
+async function init() { await loadDocs(); }
 
 async function loadDocs() {
   const res = await fetch('/eval/docs');
@@ -233,154 +339,163 @@ async function loadDocs() {
   updateSummary();
 }
 
-// ── Summary bar ───────────────────────────────────────────────────────────────
-
+// ── Summary ───────────────────────────────────────────────────────────────────
 function updateSummary() {
-  const withResults = allDocs.filter(d => d.f1 !== null);
-  document.getElementById('s-docs').textContent = allDocs.length;
-  const totalTruth = allDocs.reduce((s, d) => s + (d.total_truth || 0), 0);
-  document.getElementById('s-truth').textContent = totalTruth.toLocaleString();
+  const withR = allDocs.filter(d => d.f1 !== null);
+  set('s-docs',  allDocs.length);
+  set('s-truth', allDocs.reduce((s,d)=>s+(d.total_truth||0),0).toLocaleString());
+  set('s-run',   `${withR.length} / ${allDocs.length}`);
 
-  if (withResults.length === 0) {
-    ['s-f1','s-recall','s-precision'].forEach(id => document.getElementById(id).textContent = '—');
-    return;
-  }
+  if (!withR.length) { ['s-f1','s-precision','s-recall'].forEach(id=>set(id,'—')); return; }
 
-  const totalMatched = withResults.reduce((s, d) => s + (d.matched_count || 0), 0);
-  const totalMissed  = withResults.reduce((s, d) => s + (d.missed_count || 0), 0);
-  const totalExtra   = withResults.reduce((s, d) => s + (d.extra_count || 0), 0);
-  const totalTruthR  = withResults.reduce((s, d) => s + (d.total_truth || 0), 0);
+  const tm = withR.reduce((s,d)=>s+(d.matched_count||0),0);
+  const te = withR.reduce((s,d)=>s+(d.extra_count||0),0);
+  const tt = withR.reduce((s,d)=>s+(d.total_truth||0),0);
+  const p  = tm/(tm+te)||0, r = tm/tt||0, f1 = 2*p*r/(p+r)||0;
 
-  const p  = totalMatched / (totalMatched + totalExtra) || 0;
-  const r  = totalMatched / totalTruthR || 0;
-  const f1 = 2 * p * r / (p + r) || 0;
-
-  document.getElementById('s-f1').textContent        = pct(f1);
-  document.getElementById('s-recall').textContent    = pct(r);
-  document.getElementById('s-precision').textContent = pct(p);
+  set('s-f1',        pct(f1));
+  set('s-precision', pct(p));
+  set('s-recall',    pct(r));
 }
 
 // ── Doc list ──────────────────────────────────────────────────────────────────
-
 function renderDocList() {
   const list = document.getElementById('doc-list');
-  list.innerHTML = allDocs.map(d => renderCard(d)).join('');
+  list.innerHTML = '<div class="panel-label">Documents</div>' + allDocs.map(renderCard).join('');
 }
 
 function renderCard(d) {
-  const isRunning = runningJobs[d.key] != null;
-  const hasResult = d.f1 !== null;
-  const f1 = d.f1 || 0;
-  const fillClass = !hasResult ? 'none' : f1 >= 0.8 ? 'good' : f1 >= 0.5 ? 'ok' : 'bad';
-  const fillPct = hasResult ? Math.round(f1 * 100) : 0;
-  const active = selectedDoc === d.key ? 'active' : '';
-  const running = isRunning ? 'running' : '';
+  const isRunning = !!runningJobs[d.key];
+  const hasR = d.f1 !== null;
+  const f1v  = d.f1 || 0;
 
-  const f1Bar = `
-    <div class="f1-bar-wrap">
-      <div class="f1-label">
-        <span>F1 Score</span>
-        <strong>${hasResult ? pct(f1) : '—'}</strong>
+  // SVG ring
+  const r = 22, circ = 2 * Math.PI * r;
+  const pct_v = hasR ? Math.round(f1v * 100) : 0;
+  const offset = circ - (pct_v / 100) * circ;
+  const ringColor = !hasR ? '#e2e8f0' : f1v >= .8 ? '#10b981' : f1v >= .5 ? '#f59e0b' : '#ef4444';
+
+  const ring = `
+    <div class="score-ring">
+      <svg width="52" height="52" viewBox="0 0 52 52">
+        <circle class="ring-bg"   cx="26" cy="26" r="${r}"/>
+        <circle class="ring-fill" cx="26" cy="26" r="${r}"
+          stroke="${ringColor}"
+          stroke-dasharray="${circ}"
+          stroke-dashoffset="${offset}"/>
+      </svg>
+      <div class="ring-label">
+        <span class="ring-val" style="color:${ringColor}">${pct_v}</span>
+        <span class="ring-sub">F1%</span>
       </div>
-      <div class="f1-track"><div class="f1-fill ${fillClass}" style="width:${fillPct}%"></div></div>
     </div>`;
 
-  const prfRow = hasResult ? `
-    <div class="prf-row">
-      <div class="prf-chip">P <span>${pct(d.precision)}</span></div>
-      <div class="prf-chip">R <span>${pct(d.recall)}</span></div>
-      <div class="prf-chip">Truth <span>${d.total_truth}</span></div>
-      <div class="prf-chip">Parsed <span>${d.total_parsed}</span></div>
-    </div>` : '';
+  const scores = hasR ? `
+    <div class="score-details">
+      <div class="prf-grid">
+        <div class="prf-item p"><div class="pv">${pct(d.precision)}</div><div class="pl">Precision</div></div>
+        <div class="prf-item r"><div class="pv">${pct(d.recall)}</div><div class="pl">Recall</div></div>
+        <div class="prf-item tr"><div class="pv">${d.total_truth}</div><div class="pl">Truth</div></div>
+        <div class="prf-item tp"><div class="pv">${d.total_parsed}</div><div class="pl">Parsed</div></div>
+      </div>
+      <div class="counts-row">
+        <span class="chip chip-green">✓ ${d.matched_count}</span>
+        <span class="chip chip-red">✗ ${d.missed_count}</span>
+        <span class="chip chip-amber">+ ${d.extra_count}</span>
+      </div>
+    </div>` : `<div class="score-details"><div class="not-run">Not run yet</div></div>`;
 
-  const countsRow = hasResult ? `
-    <div class="counts-row">
-      <span class="count-badge count-matched">✓ ${d.matched_count} matched</span>
-      <span class="count-badge count-missed">✗ ${d.missed_count} missed</span>
-      <span class="count-badge count-extra">+ ${d.extra_count} extra</span>
-    </div>` : '';
+  // Progress bar if running
+  const job = Object.entries(runningJobs).find(([k]) => k === d.key);
+  let progressHtml = '';
+  if (isRunning) {
+    const p = runningJobProgress[d.key] || {};
+    const phase = p.phase || 'loading';
+    const phaseLabel = {loading:'Loading...', scanning:'Scanning pages', parsing:'Extracting with AI',
+                        matching:'Matching streets', done:'Done'}[phase] || phase;
+    const chunkInfo = p.total_chunks > 0 ? `${p.chunks_done}/${p.total_chunks} chunks` : '';
+    const streetsInfo = p.streets_found > 0 ? `· ${p.streets_found} streets` : '';
+    const pctFill = p.total_chunks > 0 ? Math.round((p.chunks_done/p.total_chunks)*100) : 0;
+    progressHtml = `
+      <div class="run-progress">
+        <div class="run-phase">
+          <strong>${phaseLabel}</strong>
+          <span>${chunkInfo} ${streetsInfo}</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill ${pctFill===0?'indeterminate':''}" style="width:${pctFill}%"></div>
+        </div>
+      </div>`;
+  }
 
-  const cacheRow = `
-    <div class="cache-row">
-      <span class="cache-badge ${d.has_parser_cache ? 'cache-hit' : 'cache-miss'}">
-        ${d.has_parser_cache ? '📦 parser cached' : '⭕ no parser cache'}
-      </span>
-      ${d.eval_cache_time ? `<span class="cache-time">eval: ${d.eval_cache_time}</span>` : ''}
-    </div>`;
+  const clearBtn = (d.has_parser_cache || d.has_eval_cache)
+    ? `<button class="btn btn-danger btn-sm" onclick="clearCache(event,'${esc(d.key)}')">🗑</button>` : '';
 
-  const statusArea = isRunning
-    ? `<div class="status-running" id="status-${d.key.replace(/[^a-z0-9]/gi,'_')}">⏳ Running...</div>`
-    : !hasResult
-      ? `<div class="status-pending">Not run yet</div>`
-      : '';
-
-  const runBtn = `<button class="btn btn-primary btn-sm" onclick="runDoc(event,'${esc(d.key)}')" ${isRunning?'disabled':''}>▶ Run</button>`;
-  const clearBtn = d.has_parser_cache || d.has_eval_cache
-    ? `<button class="btn btn-danger btn-sm" onclick="clearCache(event,'${esc(d.key)}')">🗑 Clear</button>` : '';
+  const cacheChip = d.has_parser_cache
+    ? `<span class="cache-chip cache-hit">📦 cached</span>`
+    : `<span class="cache-chip cache-miss">no cache</span>`;
+  const cacheTime = d.eval_cache_time ? `<span class="cache-time">${d.eval_cache_time}</span>` : '';
 
   return `
-    <div class="doc-card ${active} ${running}" id="card-${cardId(d.key)}" onclick="selectDoc('${esc(d.key)}')">
-      <div class="card-top">
+    <div class="doc-card ${selectedDoc===d.key?'active':''} ${isRunning?'running':''}"
+         id="card-${cid(d.key)}" onclick="selectDoc('${esc(d.key)}')">
+      <div class="card-header">
         <div class="card-name">${d.key}</div>
-        <div class="card-actions">${runBtn}${clearBtn}</div>
+        <div class="card-btns">
+          <button class="btn btn-primary btn-sm" onclick="runDoc(event,'${esc(d.key)}')"
+            ${isRunning?'disabled':''}>▶</button>
+          ${clearBtn}
+        </div>
       </div>
-      ${f1Bar}${prfRow}${countsRow}${cacheRow}${statusArea}
+      <div class="card-scores">${ring}${scores}</div>
+      ${progressHtml}
+      <div class="card-footer">${cacheChip}${cacheTime}</div>
     </div>`;
 }
 
 // ── Doc selection ─────────────────────────────────────────────────────────────
-
 async function selectDoc(key) {
   selectedDoc = key;
   renderDocList();
-
   const res = await fetch(`/eval/results/${encodeURIComponent(key)}`);
   const data = await res.json();
-
   if (data.error) {
+    // Show empty state with name
     document.getElementById('detail-empty').style.display = 'flex';
     document.getElementById('detail-content').style.display = 'none';
     return;
   }
-
   selectedResults = data;
   currentTab = 'missed';
   renderDetail();
 }
 
-let logVisible = true;
-function toggleLog() {
-  logVisible = !logVisible;
-  document.getElementById('log-body').style.display = logVisible ? '' : 'none';
-  document.getElementById('log-toggle').textContent = logVisible ? '▼ hide' : '▶ show';
-}
-
-function showLogs(lines, running) {
-  const wrap = document.getElementById('log-wrap');
-  const body = document.getElementById('log-body');
-  if (!lines || lines.length === 0) { wrap.style.display = 'none'; return; }
-  wrap.style.display = 'block';
-  body.innerHTML = lines.map(l => `<div class="log-line">${esc(l)}</div>`).join('');
-  if (running || logVisible) body.scrollTop = body.scrollHeight;
-}
-
 function renderDetail() {
   const d = selectedResults;
   document.getElementById('detail-empty').style.display = 'none';
-  document.getElementById('detail-content').style.display = 'flex';
+  const dc = document.getElementById('detail-content');
+  dc.style.display = 'flex';
 
-  document.getElementById('d-title').textContent     = d.doc_key;
-  document.getElementById('d-precision').textContent = pct(d.precision);
-  document.getElementById('d-recall').textContent    = pct(d.recall);
-  document.getElementById('d-f1').textContent        = pct(d.f1);
-  document.getElementById('d-matched').textContent   = `✓ ${d.matched_count} matched`;
-  document.getElementById('d-missed').textContent    = `✗ ${d.missed_count} missed`;
-  document.getElementById('d-extra').textContent     = `+ ${d.extra_count} extra`;
-  showLogs(d.logs || [], false);
+  set('d-title',     d.doc_key);
+  set('d-meta',      d.timestamp ? `Last run: ${new Date(d.timestamp).toLocaleString()}` : '');
+  set('d-f1',        pct(d.f1));
+  set('d-precision', pct(d.precision));
+  set('d-recall',    pct(d.recall));
+  set('d-matched',   `✓ ${d.matched_count} matched`);
+  set('d-missed',    `✗ ${d.missed_count} missed`);
+  set('d-extra',     `+ ${d.extra_count} extra`);
 
-  ['missed','extra','matched'].forEach(t => {
-    document.getElementById('tab-' + t).classList.toggle('active', t === currentTab);
-  });
+  // Update tab counts
+  set('tab-missed-ct',  d.missed_count  != null ? `(${d.missed_count})`  : '');
+  set('tab-extra-ct',   d.extra_count   != null ? `(${d.extra_count})`   : '');
+  set('tab-matched-ct', d.matched_count != null ? `(${d.matched_count})` : '');
+
+  // Logs
+  if (d.logs && d.logs.length) showLogs(d.logs, false);
+  else document.getElementById('log-wrap').style.display = 'none';
+
+  ['missed','extra','matched'].forEach(t =>
+    document.getElementById('tab-'+t).classList.toggle('active', t === currentTab));
 
   renderStreetTable();
 }
@@ -393,166 +508,195 @@ function switchTab(tab) {
 function renderStreetTable() {
   const tbl = document.getElementById('street-table');
   const d = selectedResults;
-  let rows, rowClass, cols;
+  if (!d) return;
 
   if (currentTab === 'missed') {
-    rows = d.missed || [];
-    rowClass = 'missed-row';
-    cols = ['main_street','from_street','to_street','_tab'];
+    const rows = d.missed || [];
     tbl.innerHTML = `
-      <div class="street-row header">
-        <div>Street</div><div>From</div><div>To</div><div>Tab</div>
-      </div>` + (rows.length ? rows.map(s => `
-      <div class="street-row ${rowClass}">
-        <div class="cell-main">${esc(s.main_street||'—')}</div>
-        <div class="cell-from-to">${esc(s.from_street||'')}</div>
-        <div class="cell-from-to">${esc(s.to_street||'')}</div>
+      <div class="street-row hdr"><div>Street</div><div>From</div><div>To</div><div>Tab</div></div>` +
+      (rows.length ? rows.map(s=>`
+      <div class="street-row missed">
+        <div class="cell-name">${esc(s.main_street||'—')}</div>
+        <div class="cell-limit">${esc(s.from_street||'')}</div>
+        <div class="cell-limit">${esc(s.to_street||'')}</div>
         <div class="cell-tab">${esc(s._tab||'')}</div>
-      </div>`).join('') : '<div class="no-results">None missed 🎉</div>');
+      </div>`).join('') : '<div class="no-rows">🎉 Nothing missed</div>');
 
   } else if (currentTab === 'extra') {
-    rows = d.extra || [];
-    rowClass = 'extra-row';
+    const rows = d.extra || [];
     tbl.innerHTML = `
-      <div class="street-row header">
-        <div>Street</div><div>From</div><div>To</div><div>Page</div>
-      </div>` + (rows.length ? rows.map(s => `
-      <div class="street-row ${rowClass}">
-        <div class="cell-main">${esc(s.main_street||'—')}</div>
-        <div class="cell-from-to">${esc(s.from_street||'')}</div>
-        <div class="cell-from-to">${esc(s.to_street||'')}</div>
+      <div class="street-row hdr"><div>Street</div><div>From</div><div>To</div><div>Page</div></div>` +
+      (rows.length ? rows.map(s=>`
+      <div class="street-row extra">
+        <div class="cell-name">${esc(s.main_street||'—')}</div>
+        <div class="cell-limit">${esc(s.from_street||'')}</div>
+        <div class="cell-limit">${esc(s.to_street||'')}</div>
         <div class="cell-page">p.${s.page||'?'}</div>
-      </div>`).join('') : '<div class="no-results">No false positives 🎉</div>');
+      </div>`).join('') : '<div class="no-rows">🎉 No false positives</div>');
 
   } else {
-    rows = d.matched || [];
-    rowClass = 'matched-row';
+    const rows = d.matched || [];
     tbl.innerHTML = `
-      <div class="street-row header" style="grid-template-columns:2fr 1.5fr 1.5fr 60px 60px">
+      <div class="street-row hdr" style="grid-template-columns:2.2fr 1.5fr 1.5fr 52px 60px">
         <div>Street</div><div>From</div><div>To</div><div>Score</div><div>Page</div>
-      </div>` + (rows.length ? rows.map(m => `
-      <div class="street-row ${rowClass}" style="grid-template-columns:2fr 1.5fr 1.5fr 60px 60px">
-        <div class="cell-main">${esc(m.truth.main_street||'—')}</div>
-        <div class="cell-from-to">${esc(m.truth.from_street||'')}</div>
-        <div class="cell-from-to">${esc(m.truth.to_street||'')}</div>
+      </div>` +
+      (rows.length ? rows.map(m=>`
+      <div class="street-row matched" style="grid-template-columns:2.2fr 1.5fr 1.5fr 52px 60px">
+        <div class="cell-name">${esc(m.truth.main_street||'—')}</div>
+        <div class="cell-limit">${esc(m.truth.from_street||'')}</div>
+        <div class="cell-limit">${esc(m.truth.to_street||'')}</div>
         <div class="cell-score">${Math.round(m.score*100)}%</div>
         <div class="cell-page">p.${m.parsed&&m.parsed.page||'?'}</div>
-      </div>`).join('') : '<div class="no-results">No matches yet</div>');
+      </div>`).join('') : '<div class="no-rows">No matches yet</div>');
   }
 }
 
+// ── Log console ───────────────────────────────────────────────────────────────
+function showLogs(lines, isRunning) {
+  const wrap = document.getElementById('log-wrap');
+  const body = document.getElementById('log-body');
+  if (!lines || !lines.length) { wrap.style.display = 'none'; return; }
+  wrap.style.display = 'block';
+  body.innerHTML = lines.map(entry => {
+    const ts  = typeof entry === 'object' ? entry.ts  : '';
+    const msg = typeof entry === 'object' ? entry.msg : entry;
+    const lvl = typeof entry === 'object' ? entry.level : 'info';
+    return `<div class="log-line"><span class="log-ts">${ts}</span><span class="log-msg ${lvl}">${esc(msg)}</span></div>`;
+  }).join('');
+  if (isRunning) body.scrollTop = body.scrollHeight;
+}
+
+function toggleLog() {
+  logVisible = !logVisible;
+  document.getElementById('log-body').style.display = logVisible ? '' : 'none';
+  document.getElementById('log-toggle-btn').textContent = logVisible ? '▼ collapse' : '▶ expand';
+}
+
 // ── Run / Clear ───────────────────────────────────────────────────────────────
+const runningJobProgress = {};  // doc_key -> progress obj
 
 async function runDoc(evt, key) {
   evt.stopPropagation();
-  const forceReparse = false;
-  const res = await fetch(`/eval/run?doc_key=${encodeURIComponent(key)}&force_reparse=${forceReparse}`, { method: 'POST' });
+  const res = await fetch(`/eval/run?doc_key=${encodeURIComponent(key)}`, { method: 'POST' });
   const { job_id } = await res.json();
   runningJobs[key] = job_id;
-  // If this doc is selected, open detail panel and show live log immediately
+  runningJobProgress[key] = {};
   selectedDoc = key;
   document.getElementById('detail-empty').style.display = 'none';
   document.getElementById('detail-content').style.display = 'flex';
-  document.getElementById('d-title').textContent = key;
-  ['d-precision','d-recall','d-f1'].forEach(id => document.getElementById(id).textContent = '—');
-  showLogs(['Starting...'], true);
+  set('d-title', key);
+  ['d-f1','d-precision','d-recall'].forEach(id => set(id,'—'));
+  set('d-matched','—'); set('d-missed','—'); set('d-extra','—');
+  set('d-meta','Running...');
+  showLogs([{ts:'',msg:'Starting...', level:'info'}], true);
   renderDocList();
   pollJob(job_id, key);
-  toast(`Started eval for ${key.split(' ')[0]}...`);
+  toast(`Running eval on ${key.split(' ').slice(0,3).join(' ')}...`);
 }
 
 async function clearCache(evt, key) {
   evt.stopPropagation();
   await fetch(`/eval/cache/${encodeURIComponent(key)}`, { method: 'DELETE' });
-  // Reload doc info
   const idx = allDocs.findIndex(d => d.key === key);
-  if (idx >= 0) {
-    allDocs[idx].has_parser_cache = false;
-    allDocs[idx].has_eval_cache = false;
-    allDocs[idx].f1 = null; allDocs[idx].precision = null;
-    allDocs[idx].recall = null; allDocs[idx].matched_count = null;
-    allDocs[idx].missed_count = null; allDocs[idx].extra_count = null;
-  }
+  if (idx >= 0) Object.assign(allDocs[idx], {
+    has_parser_cache:false, has_eval_cache:false, f1:null, precision:null,
+    recall:null, matched_count:null, missed_count:null, extra_count:null,
+    total_parsed:null,
+  });
   if (selectedDoc === key) {
     selectedResults = null;
     document.getElementById('detail-empty').style.display = 'flex';
     document.getElementById('detail-content').style.display = 'none';
   }
-  renderDocList();
-  updateSummary();
-  toast('Cache cleared');
+  renderDocList(); updateSummary(); toast('Cache cleared');
 }
 
 async function runAll() {
   const btn = document.getElementById('run-all-btn');
-  btn.disabled = true;
-  btn.textContent = '⏳ Running...';
-  // Run docs sequentially that don't already have eval results
+  const lbl = document.getElementById('run-all-progress');
   const toRun = allDocs.filter(d => !d.has_eval_cache);
-  toast(`Running ${toRun.length} docs sequentially...`);
+  if (!toRun.length) { toast('All docs already have results — clear cache to re-run'); return; }
+
+  btn.disabled = true;
+  runAllTotal = toRun.length; runAllDone = 0;
+  lbl.style.display = 'inline';
+  document.getElementById('overall-progress-wrap').style.display = 'block';
 
   for (const d of toRun) {
+    lbl.textContent = `${runAllDone}/${runAllTotal}`;
+    updateOverallBar();
     await new Promise(resolve => {
       fetch(`/eval/run?doc_key=${encodeURIComponent(d.key)}`, { method: 'POST' })
         .then(r => r.json())
         .then(({ job_id }) => {
           runningJobs[d.key] = job_id;
+          runningJobProgress[d.key] = {};
           renderDocList();
-          pollJob(job_id, d.key, resolve);
+          pollJob(job_id, d.key, () => { runAllDone++; resolve(); });
         });
     });
   }
+
   btn.disabled = false;
-  btn.textContent = '▶ Run All';
-  toast('All docs complete!');
+  lbl.style.display = 'none';
+  document.getElementById('overall-progress-wrap').style.display = 'none';
+  toast(`All ${runAllTotal} docs complete!`);
+}
+
+function updateOverallBar() {
+  const pct = runAllTotal > 0 ? Math.round((runAllDone / runAllTotal) * 100) : 0;
+  document.getElementById('overall-progress-bar').style.width = pct + '%';
 }
 
 // ── Polling ───────────────────────────────────────────────────────────────────
-
 function pollJob(job_id, doc_key, onDone) {
-  const interval = setInterval(async () => {
+  const iv = setInterval(async () => {
     const res = await fetch(`/eval/job/${job_id}`);
     const job = await res.json();
+    if (job.progress) runningJobProgress[doc_key] = job.progress;
 
-    // Update log if card is selected
-    const idx = allDocs.findIndex(d => d.key === doc_key);
+    // Update card progress bar
+    const cardEl = document.getElementById('card-'+cid(doc_key));
+    if (cardEl) {
+      const d = allDocs.find(x => x.key === doc_key) || {};
+      cardEl.outerHTML = renderCard(d);
+    }
+
+    if (selectedDoc === doc_key) {
+      showLogs(job.log || [], true);
+    }
 
     if (job.status === 'done') {
-      clearInterval(interval);
+      clearInterval(iv);
       delete runningJobs[doc_key];
-      if (idx >= 0 && job.result) {
-        Object.assign(allDocs[idx], {
-          f1: job.result.f1, precision: job.result.precision, recall: job.result.recall,
-          matched_count: job.result.matched_count, missed_count: job.result.missed_count,
-          extra_count: job.result.extra_count, total_truth: job.result.total_truth,
-          total_parsed: job.result.total_parsed, has_eval_cache: true,
-        });
-      }
-      renderDocList();
-      updateSummary();
+      delete runningJobProgress[doc_key];
+      const idx = allDocs.findIndex(d => d.key === doc_key);
+      if (idx >= 0 && job.result) Object.assign(allDocs[idx], {
+        f1: job.result.f1, precision: job.result.precision, recall: job.result.recall,
+        matched_count: job.result.matched_count, missed_count: job.result.missed_count,
+        extra_count: job.result.extra_count, total_truth: job.result.total_truth,
+        total_parsed: job.result.total_parsed, has_eval_cache: true,
+      });
+      renderDocList(); updateSummary();
       if (selectedDoc === doc_key) selectDoc(doc_key);
       if (onDone) onDone();
+
     } else if (job.status === 'error') {
-      clearInterval(interval);
+      clearInterval(iv);
       delete runningJobs[doc_key];
-      toast(`Error on ${doc_key}: ${job.error}`);
+      delete runningJobProgress[doc_key];
+      toast(`Error: ${job.error}`);
       renderDocList();
       if (onDone) onDone();
-    } else {
-      // Still running — update status text in card
-      const el = document.getElementById('status-' + doc_key.replace(/[^a-z0-9]/gi,'_'));
-      if (el && job.log.length) el.textContent = '⏳ ' + job.log[job.log.length - 1];
-      // If this doc is currently selected, stream logs live
-      if (selectedDoc === doc_key) showLogs(job.log, true);
     }
   }, 2000);
 }
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
-
-function pct(v) { return v != null ? Math.round(v * 100) + '%' : '—'; }
+function pct(v) { return v != null ? Math.round(v*100)+'%' : '—'; }
 function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-function cardId(k) { return k.replace(/[^a-z0-9]/gi,'_'); }
+function set(id, val) { const el=document.getElementById(id); if(el) el.textContent=val; }
+function cid(k) { return k.replace(/[^a-z0-9]/gi,'_'); }
 function toast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg; t.classList.add('show');

@@ -40,6 +40,9 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 from highway.routes import router as highway_router
 app.include_router(highway_router)
 
+from eval_routes import router as eval_router
+app.include_router(eval_router)
+
 documents = {}
 
 CHUNK_CHAR_LIMIT = 20000  # ~5k tokens input → response fits in 32k output tokens

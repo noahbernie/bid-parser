@@ -327,10 +327,26 @@
   <!-- ── Results pane ── -->
   <div class="results-pane" id="results-pane">
 
-    <!-- Empty state -->
+    <!-- Empty state (no doc selected) -->
     <div class="right-empty" id="res-empty">
       <div class="icon">◈</div>
-      <div class="em">Run eval to see results</div>
+      <div class="em">Select a document</div>
+    </div>
+
+    <!-- Truth view (shown whenever a doc is selected, before eval runs) -->
+    <div id="res-truth" style="display:none;flex-direction:column;flex:1;overflow:hidden">
+      <div class="res-header">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <div>
+            <div class="res-title" id="r-title-truth">—</div>
+            <div class="res-meta"  id="r-meta-truth"></div>
+          </div>
+          <button class="btn btn-primary" id="r-run-btn" onclick="runFromPanel()">▶ Run Eval</button>
+        </div>
+      </div>
+      <div style="flex:1;overflow:auto;padding:14px 16px">
+        <pre id="truth-pre" style="font-family:'SF Mono','Fira Code',monospace;font-size:11px;line-height:1.7;color:#a0a0b8;white-space:pre-wrap;word-break:break-word">Loading…</pre>
+      </div>
     </div>
 
     <!-- Running: logs -->
@@ -392,11 +408,15 @@
           <button class="tab-btn active" id="tab-missed"  onclick="switchTab('missed')">Missed <span class="tab-ct" id="tab-missed-ct"></span></button>
           <button class="tab-btn"        id="tab-extra"   onclick="switchTab('extra')">Extra <span class="tab-ct" id="tab-extra-ct"></span></button>
           <button class="tab-btn"        id="tab-matched" onclick="switchTab('matched')">Matched <span class="tab-ct" id="tab-matched-ct"></span></button>
-          <button class="tab-btn"        id="tab-json"    onclick="switchTab('json')">JSON</button>
+          <button class="tab-btn"        id="tab-json"    onclick="switchTab('json')">Eval JSON</button>
+          <button class="tab-btn"        id="tab-truth"   onclick="switchTab('truth')">Truth JSON <span class="tab-ct" id="tab-truth-ct"></span></button>
         </div>
         <div class="street-table" id="street-table"></div>
         <div id="json-view" style="display:none;flex:1;overflow:auto;padding:14px 16px">
           <pre id="json-pre" style="font-family:'SF Mono','Fira Code',monospace;font-size:11px;line-height:1.7;color:#a0a0b8;white-space:pre-wrap;word-break:break-word"></pre>
+        </div>
+        <div id="truth-view" style="display:none;flex:1;overflow:auto;padding:14px 16px">
+          <pre id="truth-pre-done" style="font-family:'SF Mono','Fira Code',monospace;font-size:11px;line-height:1.7;color:#a0a0b8;white-space:pre-wrap;word-break:break-word"></pre>
         </div>
       </div>
     </div>
@@ -511,22 +531,50 @@ async function selectDoc(key) {
   renderDocList();
   loadPdf(key);
 
-  // If currently running, show the running state
+  // Always load truth JSON immediately
+  showTruthState(key);
+
+  // If currently running, switch to running state
   if (runningJobs[key]) {
     showRunningState(key);
     return;
   }
 
-  // Try to load results
+  // Try to load eval results
   const res = await fetch(`/eval/results/${encodeURIComponent(key)}`);
   const data = await res.json();
-  if (data.error) {
-    showResEmpty();
+  if (!data.error) {
+    selectedResults = data;
+    currentTab = 'missed';
+    showDoneState(data);
+  }
+  // else: stay on truth state
+}
+
+let truthCache = {};  // doc_key -> truth data
+
+async function showTruthState(key) {
+  document.getElementById('res-empty').style.display   = 'none';
+  document.getElementById('res-running').style.display = 'none';
+  document.getElementById('res-done').style.display    = 'none';
+  const el = document.getElementById('res-truth');
+  el.style.display = 'flex';
+  set('r-title-truth', key);
+  set('r-meta-truth', 'Ground truth — loading…');
+  document.getElementById('truth-pre').textContent = 'Loading…';
+
+  if (!truthCache[key]) {
+    const r = await fetch(`/eval/truth/${encodeURIComponent(key)}`);
+    truthCache[key] = await r.json();
+  }
+  const t = truthCache[key];
+  if (t.error) {
+    document.getElementById('truth-pre').textContent = 'Error: ' + t.error;
+    set('r-meta-truth', 'Error loading ground truth');
     return;
   }
-  selectedResults = data;
-  currentTab = 'missed';
-  showDoneState(data);
+  set('r-meta-truth', `${t.count} ground truth streets`);
+  document.getElementById('truth-pre').textContent = JSON.stringify(t.streets, null, 2);
 }
 
 function loadPdf(key) {
@@ -540,14 +588,16 @@ function loadPdf(key) {
 
 // ── State transitions ─────────────────────────────────────────────────────────
 function showResEmpty() {
-  document.getElementById('res-empty').style.display = 'flex';
+  document.getElementById('res-empty').style.display   = 'flex';
   document.getElementById('res-running').style.display = 'none';
-  document.getElementById('res-done').style.display = 'none';
+  document.getElementById('res-done').style.display    = 'none';
+  document.getElementById('res-truth').style.display   = 'none';
 }
 
 function showRunningState(key) {
-  document.getElementById('res-empty').style.display = 'none';
-  document.getElementById('res-done').style.display = 'none';
+  document.getElementById('res-empty').style.display   = 'none';
+  document.getElementById('res-done').style.display    = 'none';
+  document.getElementById('res-truth').style.display   = 'none';
   const el = document.getElementById('res-running');
   el.style.display = 'flex';
   set('r-title-running', key);
@@ -555,8 +605,9 @@ function showRunningState(key) {
 }
 
 function showDoneState(data) {
-  document.getElementById('res-empty').style.display = 'none';
+  document.getElementById('res-empty').style.display   = 'none';
   document.getElementById('res-running').style.display = 'none';
+  document.getElementById('res-truth').style.display   = 'none';
   const el = document.getElementById('res-done');
   el.style.display = 'flex';
 
@@ -580,14 +631,30 @@ function showDoneState(data) {
     document.getElementById('log-done-wrap').style.display = 'none';
   }
 
-  ['missed','extra','matched','json'].forEach(t => {
-    const el = document.getElementById('tab-'+t);
-    if (el) el.classList.toggle('active', t === currentTab);
+  const t = truthCache[data.doc_key];
+  set('tab-truth-ct', t ? `(${t.count})` : '');
+
+  ['missed','extra','matched','json','truth'].forEach(tab => {
+    const el = document.getElementById('tab-'+tab);
+    if (el) el.classList.toggle('active', tab === currentTab);
   });
-  document.getElementById('street-table').style.display = currentTab === 'json' ? 'none' : '';
-  document.getElementById('json-view').style.display    = currentTab === 'json' ? 'block' : 'none';
+  _applyTabView(data);
+}
+
+function _applyTabView(data) {
+  const tbl = document.getElementById('street-table');
+  const jv  = document.getElementById('json-view');
+  const tv  = document.getElementById('truth-view');
+  tbl.style.display = (currentTab === 'json' || currentTab === 'truth') ? 'none' : '';
+  jv.style.display  = currentTab === 'json'  ? 'block' : 'none';
+  tv.style.display  = currentTab === 'truth' ? 'block' : 'none';
   if (currentTab === 'json') {
-    document.getElementById('json-pre').textContent = JSON.stringify(data, null, 2);
+    document.getElementById('json-pre').textContent = JSON.stringify(data || selectedResults, null, 2);
+  } else if (currentTab === 'truth') {
+    const t = data ? truthCache[data.doc_key] : truthCache[selectedDoc];
+    document.getElementById('truth-pre-done').textContent = t ? JSON.stringify(t.streets, null, 2) : 'Loading…';
+    if (!t && selectedDoc) fetch(`/eval/truth/${encodeURIComponent(selectedDoc)}`)
+      .then(r=>r.json()).then(d=>{ truthCache[selectedDoc]=d; document.getElementById('truth-pre-done').textContent=JSON.stringify(d.streets,null,2); });
   } else {
     renderStreetTable();
   }
@@ -615,23 +682,15 @@ function updateRunningHeader(p) {
 
 function switchTab(tab) {
   currentTab = tab;
-  ['missed','extra','matched','json'].forEach(t => {
+  ['missed','extra','matched','json','truth'].forEach(t => {
     const el = document.getElementById('tab-'+t);
     if (el) el.classList.toggle('active', t === tab);
   });
-  const tbl = document.getElementById('street-table');
-  const jv  = document.getElementById('json-view');
-  if (tab === 'json') {
-    tbl.style.display = 'none';
-    jv.style.display  = 'block';
-    if (selectedResults) {
-      document.getElementById('json-pre').textContent = JSON.stringify(selectedResults, null, 2);
-    }
-  } else {
-    tbl.style.display = '';
-    jv.style.display  = 'none';
-    renderStreetTable();
-  }
+  _applyTabView(selectedResults);
+}
+
+function runFromPanel() {
+  if (selectedDoc) runDoc({ stopPropagation: ()=>{} }, selectedDoc);
 }
 
 function renderStreetTable() {
@@ -710,6 +769,7 @@ async function runDoc(evt, key) {
   showRunningState(key);
   renderLogs('log-body-running', [{ts:'',msg:'Starting…',level:'info'}], true);
   renderDocList();
+  if (!truthCache[key]) fetch(`/eval/truth/${encodeURIComponent(key)}`).then(r=>r.json()).then(d=>{ truthCache[key]=d; });
   pollJob(job_id, key);
   toast(`Running: ${key.split(' ').slice(0,3).join(' ')}…`);
 }

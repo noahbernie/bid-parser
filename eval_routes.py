@@ -338,6 +338,17 @@ async def clear_cache(doc_key: str):
     return {"cleared": cleared}
 
 
+@router.get("/truth/{doc_key:path}")
+async def get_truth(doc_key: str):
+    try:
+        with open(COL_MAP) as f:
+            col_map = json.load(f)
+        rows = load_ground_truth(doc_key, col_map)
+        return {"doc_key": doc_key, "count": len(rows), "streets": rows}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @router.get("/pdf/{doc_key:path}")
 async def serve_pdf(doc_key: str):
     path = os.path.join(PDF_DIR, doc_key + ".pdf")

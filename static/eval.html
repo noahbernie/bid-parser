@@ -704,13 +704,16 @@ function renderStreetTable() {
     const rows = d.missed || [];
     tbl.innerHTML = `
       <div class="street-row hdr"><div>Street</div><div>From</div><div>To</div><div>Tab</div></div>` +
-      (rows.length ? rows.map(s=>`
-        <div class="street-row missed">
+      (rows.length ? rows.map(s=>{
+        const pg = pageFromTab(s._tab);
+        return `
+        <div class="street-row missed${pg?' clickable':''}" ${pg?`onclick="jumpToPage(${pg})"`:''}>
           <div class="cell-name">${esc(s.main_street||'—')}</div>
           <div class="cell-limit">${esc(s.from_street||'')}</div>
           <div class="cell-limit">${esc(s.to_street||'')}</div>
-          <div class="cell-tab">${esc(s._tab||'')}</div>
-        </div>`).join('') : '<div class="no-rows">Nothing missed</div>');
+          <div class="cell-tab" style="${pg?'color:var(--violet)':''}">${esc(s._tab||'')}</div>
+        </div>`;
+      }).join('') : '<div class="no-rows">Nothing missed</div>');
 
   } else if (currentTab === 'extra') {
     const rows = d.extra || [];
@@ -751,8 +754,14 @@ function renderStreetTable() {
 function jumpToPage(page) {
   if (!selectedDoc || !page) return;
   const frame = document.getElementById('pdf-frame');
-  // ?p= busts the cache so Chrome treats it as a new URL and respects #page=N
-  frame.src = `/eval/pdf/${encodeURIComponent(selectedDoc)}?p=${page}#page=${page}`;
+  // Timestamp ensures a unique URL every click so Chrome always reloads + navigates
+  frame.src = `/eval/pdf/${encodeURIComponent(selectedDoc)}?_=${Date.now()}#page=${page}`;
+}
+
+function pageFromTab(tab) {
+  // Extract first page number from tab names like "Page 128", "Page 104-106"
+  const m = String(tab||'').match(/\d+/);
+  return m ? parseInt(m[0]) : null;
 }
 
 function renderLogs(bodyId, lines, autoScroll) {

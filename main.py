@@ -633,8 +633,7 @@ def call_gemini_image(prompt: str, b64_image: str, max_retries: int = 4, log_fn=
             {"text": prompt},
             {"inline_data": {"mime_type": "image/png", "data": b64_image}},
         ]}],
-        "generationConfig": {"maxOutputTokens": 65536, "temperature": 0,
-                             "thinkingConfig": {"thinkingBudget": 0}},
+        "generationConfig": {"maxOutputTokens": 65536, "temperature": 0},
     }).encode()
 
     for attempt in range(max_retries):

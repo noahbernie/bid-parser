@@ -641,7 +641,7 @@ def call_gemini_image(prompt: str, b64_image: str, max_retries: int = 4, log_fn=
             if log_fn:
                 log_fn(f"    → [Gemini] Sending request (attempt {attempt+1}, payload {len(payload)//1024}KB)...")
             req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=90) as resp:
+            with urllib.request.urlopen(req, timeout=120) as resp:
                 if log_fn:
                     log_fn(f"    ← [Gemini] Response received, reading body...")
                 data = json.loads(resp.read())

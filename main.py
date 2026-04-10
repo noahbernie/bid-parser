@@ -84,7 +84,9 @@ Each street object: {"main_street": "...", "from_street": "...", "to_street": ".
 
 """ + _STREETS_PROMPT_BASE.replace("{SOURCE_TAG}", "image") + """
 Read each row carefully left-to-right. Each row is independent — do not carry over values from adjacent rows.
-Important: main_street must be copied exactly from the first column of that specific row. Do not infer or substitute it from another row. If the text is hard to read, transcribe it as closely as possible."""
+Important: main_street must be copied exactly from the first column of that specific row. Do not infer or substitute it from another row. If the text is hard to read, transcribe it as closely as possible.
+Important: "EOS" (End of Street), "EOC" (End of Curb), "BOS" (Beginning of Street), "BOC" (Beginning of Curb), "EOP" (End of Pavement) are valid cross-street values — copy them exactly into from_street or to_street. Do NOT skip them or treat them as empty.
+Important: Some tables have extra numeric columns (e.g. a Location # or sequence number). Do not map numeric-only values into from_street or to_street. Ignore columns that contain only numbers."""
 
 
 STREET_KEYWORDS = [

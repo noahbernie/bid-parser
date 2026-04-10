@@ -1,0 +1,143 @@
+{
+  "_instructions": "For each document, map its sheet column headers to the canonical fields: main_street, from_street, to_street, work_type. Use the exact header text from the CSV. Set to null if that column doesn't exist in the sheet.",
+
+  "K-26-2431-DBB-3": {
+    "main_street": "Street Name",
+    "from_street": "Cross Street 1",
+    "to_street": "Cross Street 2",
+    "work_type": "Activity"
+  },
+
+  "K-21-1999-DBB-3-A": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "20251113162630992 Bid 8167": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "20240604091722399 Bid 8081": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "2026 Slurry Project Plans Bid Set": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "Project Plans 2025 Slurry Seal SAB": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "20230602181841165 STL455&STL457": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "20230602181843757 STL0455 & STL0457 plans": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "20260304073432504 WPR026": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "20240418150106123 WPR024": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "IFB 12-2816": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "K-20-1905-DBB-3": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "20251218123130399 K-26-2429-DBB-3": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "20251008082645040 K-26-2428-DBB-3": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "K-22-1977-DBB-3-A": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "Bid 8081 - SPECIAL PROVISIONS": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "20230307115819832 FY 22-23 Street Rehab": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "IFB 22-3163": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "IFB 21-1824": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  },
+
+  "20210709163252325 Attachment 2 List of Streets": {
+    "main_street": "FILL IN",
+    "from_street": "FILL IN",
+    "to_street": "FILL IN",
+    "work_type": "FILL IN"
+  }
+}

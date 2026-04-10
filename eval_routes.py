@@ -338,6 +338,15 @@ async def clear_cache(doc_key: str):
     return {"cleared": cleared}
 
 
+@router.get("/pdf/{doc_key:path}")
+async def serve_pdf(doc_key: str):
+    path = os.path.join(PDF_DIR, doc_key + ".pdf")
+    if not os.path.exists(path):
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "PDF not found"}, status_code=404)
+    return FileResponse(path, media_type="application/pdf")
+
+
 @router.get("/history")
 async def get_history():
     return _load_history()

@@ -199,12 +199,14 @@ def match_streets(truth: list, parsed: list) -> dict:
         for i, p in enumerate(parsed):
             if i in used:
                 continue
-            ms_score = similarity(tk[0], street_key(p)[0])
-            from_ok  = (not tk[1] or not street_key(p)[1] or
-                        similarity(tk[1], street_key(p)[1]) > 0.5)
-            to_ok    = (not tk[2] or not street_key(p)[2] or
-                        similarity(tk[2], street_key(p)[2]) > 0.5)
-            if ms_score > best_score and from_ok and to_ok:
+            pk = street_key(p)
+            ms_score = similarity(tk[0], pk[0])
+            # Check normal orientation and swapped FROM/TO (limits can be written either direction)
+            from_ok  = (not tk[1] or not pk[1] or similarity(tk[1], pk[1]) > 0.5)
+            to_ok    = (not tk[2] or not pk[2] or similarity(tk[2], pk[2]) > 0.5)
+            swap_ok  = ((not tk[1] or not pk[2] or similarity(tk[1], pk[2]) > 0.5) and
+                        (not tk[2] or not pk[1] or similarity(tk[2], pk[1]) > 0.5))
+            if ms_score > best_score and (from_ok and to_ok or swap_ok):
                 best_score, best_idx = ms_score, i
         if best_score >= FUZZY_THRESHOLD and best_idx >= 0:
             matched.append({"truth": t, "parsed": parsed[best_idx], "score": round(best_score, 2)})

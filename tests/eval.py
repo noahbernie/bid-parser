@@ -104,7 +104,8 @@ def load_ground_truth(doc_key: str, col_map: dict) -> list:
             print(f"  ⚠  main_street col '{ms_col}' not found in tab '{tab_name}' — skipping tab")
             continue
 
-        for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+        data_start = tab_cfg.get("data_start_row", header_row_idx + 1)
+        for row in ws.iter_rows(min_row=data_start, values_only=True):
             vals = list(row)
 
             def get(col_name):

@@ -392,8 +392,12 @@
           <button class="tab-btn active" id="tab-missed"  onclick="switchTab('missed')">Missed <span class="tab-ct" id="tab-missed-ct"></span></button>
           <button class="tab-btn"        id="tab-extra"   onclick="switchTab('extra')">Extra <span class="tab-ct" id="tab-extra-ct"></span></button>
           <button class="tab-btn"        id="tab-matched" onclick="switchTab('matched')">Matched <span class="tab-ct" id="tab-matched-ct"></span></button>
+          <button class="tab-btn"        id="tab-json"    onclick="switchTab('json')">JSON</button>
         </div>
         <div class="street-table" id="street-table"></div>
+        <div id="json-view" style="display:none;flex:1;overflow:auto;padding:14px 16px">
+          <pre id="json-pre" style="font-family:'SF Mono','Fira Code',monospace;font-size:11px;line-height:1.7;color:#a0a0b8;white-space:pre-wrap;word-break:break-word"></pre>
+        </div>
       </div>
     </div>
 
@@ -576,9 +580,17 @@ function showDoneState(data) {
     document.getElementById('log-done-wrap').style.display = 'none';
   }
 
-  ['missed','extra','matched'].forEach(t =>
-    document.getElementById('tab-'+t).classList.toggle('active', t === currentTab));
-  renderStreetTable();
+  ['missed','extra','matched','json'].forEach(t => {
+    const el = document.getElementById('tab-'+t);
+    if (el) el.classList.toggle('active', t === currentTab);
+  });
+  document.getElementById('street-table').style.display = currentTab === 'json' ? 'none' : '';
+  document.getElementById('json-view').style.display    = currentTab === 'json' ? 'block' : 'none';
+  if (currentTab === 'json') {
+    document.getElementById('json-pre').textContent = JSON.stringify(data, null, 2);
+  } else {
+    renderStreetTable();
+  }
 }
 
 function updateRunningHeader(p) {
@@ -603,9 +615,23 @@ function updateRunningHeader(p) {
 
 function switchTab(tab) {
   currentTab = tab;
-  ['missed','extra','matched'].forEach(t =>
-    document.getElementById('tab-'+t).classList.toggle('active', t === tab));
-  renderStreetTable();
+  ['missed','extra','matched','json'].forEach(t => {
+    const el = document.getElementById('tab-'+t);
+    if (el) el.classList.toggle('active', t === tab);
+  });
+  const tbl = document.getElementById('street-table');
+  const jv  = document.getElementById('json-view');
+  if (tab === 'json') {
+    tbl.style.display = 'none';
+    jv.style.display  = 'block';
+    if (selectedResults) {
+      document.getElementById('json-pre').textContent = JSON.stringify(selectedResults, null, 2);
+    }
+  } else {
+    tbl.style.display = '';
+    jv.style.display  = 'none';
+    renderStreetTable();
+  }
 }
 
 function renderStreetTable() {

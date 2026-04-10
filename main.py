@@ -641,7 +641,7 @@ def call_gemini_image(prompt: str, b64_image: str, max_retries: int = 4, log_fn=
             if log_fn:
                 log_fn(f"    → [Gemini] Sending request (attempt {attempt+1}, payload {len(payload)//1024}KB)...")
             req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=240) as resp:
+            with urllib.request.urlopen(req, timeout=90) as resp:
                 if log_fn:
                     log_fn(f"    ← [Gemini] Response received, reading body...")
                 data = json.loads(resp.read())
@@ -919,6 +919,7 @@ def run_extraction(doc_id: str, api_key: str):
                 log(msg, data)
 
         page_label = f"p{chunk.get('page','?')} strip {chunk.get('strip','?')}"
+        time.sleep(i * 1.5)   # stagger launches to avoid simultaneous rate-limit hits
         chunk_log(f"🚀 [IMG {i+1}/{len(chunks)} {page_label}] Starting parallel extraction...")
         t_start = time.time()
         try:

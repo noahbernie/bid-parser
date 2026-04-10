@@ -243,6 +243,8 @@
       font-size: 11.5px; align-items: center;
     }
     .street-row:hover { background: var(--s0); }
+    .street-row.clickable { cursor: pointer; }
+    .street-row.clickable:hover { background: rgba(139,92,246,.07); }
     .street-row.hdr {
       font-size: 10px; font-weight: 600; text-transform: uppercase;
       letter-spacing: .5px; color: var(--muted); background: var(--s0);
@@ -714,13 +716,16 @@ function renderStreetTable() {
     const rows = d.extra || [];
     tbl.innerHTML = `
       <div class="street-row hdr"><div>Street</div><div>From</div><div>To</div><div>Page</div></div>` +
-      (rows.length ? rows.map(s=>`
-        <div class="street-row extra">
+      (rows.length ? rows.map(s=>{
+        const pg = s.page;
+        return `
+        <div class="street-row extra${pg?' clickable':''}" ${pg?`onclick="jumpToPage(${pg})"`:''}>
           <div class="cell-name">${esc(s.main_street||'—')}</div>
           <div class="cell-limit">${esc(s.from_street||'')}</div>
           <div class="cell-limit">${esc(s.to_street||'')}</div>
-          <div class="cell-page">p.${s.page||'?'}</div>
-        </div>`).join('') : '<div class="no-rows">No false positives</div>');
+          <div class="cell-page" style="${pg?'color:var(--violet)':''}">p.${pg||'?'}</div>
+        </div>`;
+      }).join('') : '<div class="no-rows">No false positives</div>');
 
   } else {
     const rows = d.matched || [];
@@ -728,15 +733,27 @@ function renderStreetTable() {
       <div class="street-row hdr" style="grid-template-columns:2fr 1.2fr 1.2fr 44px 50px">
         <div>Street</div><div>From</div><div>To</div><div>Score</div><div>Page</div>
       </div>` +
-      (rows.length ? rows.map(m=>`
-        <div class="street-row matched" style="grid-template-columns:2fr 1.2fr 1.2fr 44px 50px">
+      (rows.length ? rows.map(m=>{
+        const pg = m.parsed && m.parsed.page;
+        return `
+        <div class="street-row matched clickable" style="grid-template-columns:2fr 1.2fr 1.2fr 44px 50px"
+             onclick="jumpToPage(${pg||1})">
           <div class="cell-name">${esc(m.truth.main_street||'—')}</div>
           <div class="cell-limit">${esc(m.truth.from_street||'')}</div>
           <div class="cell-limit">${esc(m.truth.to_street||'')}</div>
           <div class="cell-score">${Math.round(m.score*100)}%</div>
-          <div class="cell-page">p.${m.parsed&&m.parsed.page||'?'}</div>
-        </div>`).join('') : '<div class="no-rows">No matches yet</div>');
+          <div class="cell-page" style="color:var(--violet)">p.${pg||'?'}</div>
+        </div>`;
+      }).join('') : '<div class="no-rows">No matches yet</div>');
   }
+}
+
+function jumpToPage(page) {
+  if (!selectedDoc || !page) return;
+  const frame = document.getElementById('pdf-frame');
+  const base = `/eval/pdf/${encodeURIComponent(selectedDoc)}`;
+  // Setting src with #page=N navigates the browser PDF viewer to that page
+  frame.src = base + '#page=' + page;
 }
 
 function renderLogs(bodyId, lines, autoScroll) {

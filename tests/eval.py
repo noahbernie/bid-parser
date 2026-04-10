@@ -117,6 +117,9 @@ def load_ground_truth(doc_key: str, col_map: dict) -> list:
             main = get(ms_col)
             if not main or main in ("None", ""):
                 continue
+            # Skip repeated header rows (second table within same tab)
+            if norm(main) == norm(ms_col) or norm(main) in ("STREET NAME", "STREET", "NAME"):
+                continue
 
             from_v, to_v = "", ""
             if lim_col:

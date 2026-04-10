@@ -85,9 +85,7 @@ Each street object: {"main_street": "...", "from_street": "...", "to_street": ".
 """ + _STREETS_PROMPT_BASE.replace("{SOURCE_TAG}", "image") + """
 Read each row carefully left-to-right. Each row is independent — do not carry over values from adjacent rows.
 Important: main_street must be copied exactly from the first column of that specific row. Do not infer or substitute it from another row. If the text is hard to read, transcribe it as closely as possible.
-Important: "EOS" (End of Street), "EOC" (End of Curb), "BOS" (Beginning of Street), "BOC" (Beginning of Curb), "EOP" (End of Pavement) are valid cross-street values — copy them exactly into from_street or to_street. Do NOT skip them or treat them as empty.
-Important: Some tables have extra numeric columns (e.g. a Location # or sequence number). Do not map numeric-only values into from_street or to_street. Ignore columns that contain only numbers.
-Important: Street type suffixes are critical and distinct — AV (Avenue), ST (Street), DR (Drive), BL/BLVD (Boulevard), RD (Road), CT (Court), PL (Place), LN (Lane), WY (Way) are NOT interchangeable. Read the suffix carefully and copy it exactly."""
+Important: Copy street values exactly — suffixes like AV, ST, DR, BL, RD are distinct and not interchangeable. Placeholders like EOS, EOC, BOS, BOC, EOP are valid cross-street values, not blanks. Numeric-only cells (location numbers, sequence numbers) are not street names — do not put them in from_street or to_street."""
 
 
 STREET_KEYWORDS = [

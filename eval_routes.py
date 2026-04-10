@@ -157,7 +157,28 @@ def _run_eval(job_id: str, doc_key: str, force_reparse: bool):
             }
 
             log(f"  Parsing {total} pages (this may take a few minutes)...")
+
+            # Pipe parser progress logs into this job's log in real-time
+            import time as _time
+            def _tail_parser_logs():
+                seen = 0
+                while docs_store.get(doc_id, {}).get("extracted_schema") is None:
+                    plogs = docs_store.get(doc_id, {}).get("progress", {}).get("logs", [])
+                    for line in plogs[seen:]:
+                        log(f"  [parser] {line}")
+                    seen = len(plogs)
+                    _time.sleep(1)
+
+            tail_thread = threading.Thread(target=_tail_parser_logs, daemon=True)
+            tail_thread.start()
             run_extraction(doc_id, api_key)
+            tail_thread.join(timeout=2)
+
+            # Flush any remaining parser logs
+            plogs = docs_store.get(doc_id, {}).get("progress", {}).get("logs", [])
+            for line in plogs:
+                if f"  [parser] {line}" not in job["log"]:
+                    log(f"  [parser] {line}")
 
             schema = docs_store.get(doc_id, {}).get("extracted_schema") or {}
             parsed = schema.get("streets", [])
@@ -175,6 +196,7 @@ def _run_eval(job_id: str, doc_key: str, force_reparse: bool):
         serialized = {
             "doc_key":       doc_key,
             "timestamp":     datetime.now().isoformat(),
+            "logs":          list(job["log"]),
             "total_truth":   r["total_truth"],
             "total_parsed":  r["total_parsed"],
             "precision":     round(r["precision"], 4),

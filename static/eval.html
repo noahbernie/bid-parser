@@ -190,7 +190,18 @@
           <span class="count-badge count-extra" id="d-extra">—</span>
         </div>
       </div>
-      <div class="tabs">
+      <!-- Log console -->
+      <div id="log-wrap" style="display:none">
+        <div class="log-console" style="margin:10px 20px 0">
+          <div class="log-header" style="display:flex;justify-content:space-between;align-items:center">
+            <span>RUN LOG</span>
+            <span id="log-toggle" onclick="toggleLog()" style="cursor:pointer;font-size:0.7rem;color:#a5b4fc">▼ hide</span>
+          </div>
+          <div class="log-body" id="log-body" style="max-height:180px"></div>
+        </div>
+      </div>
+
+      <div class="tabs" style="margin-top:10px">
         <button class="tab-btn active" onclick="switchTab('missed')" id="tab-missed">❌ Missed</button>
         <button class="tab-btn" onclick="switchTab('extra')" id="tab-extra">➕ Extra</button>
         <button class="tab-btn" onclick="switchTab('matched')" id="tab-matched">✅ Matched</button>
@@ -337,6 +348,22 @@ async function selectDoc(key) {
   renderDetail();
 }
 
+let logVisible = true;
+function toggleLog() {
+  logVisible = !logVisible;
+  document.getElementById('log-body').style.display = logVisible ? '' : 'none';
+  document.getElementById('log-toggle').textContent = logVisible ? '▼ hide' : '▶ show';
+}
+
+function showLogs(lines, running) {
+  const wrap = document.getElementById('log-wrap');
+  const body = document.getElementById('log-body');
+  if (!lines || lines.length === 0) { wrap.style.display = 'none'; return; }
+  wrap.style.display = 'block';
+  body.innerHTML = lines.map(l => `<div class="log-line">${esc(l)}</div>`).join('');
+  if (running || logVisible) body.scrollTop = body.scrollHeight;
+}
+
 function renderDetail() {
   const d = selectedResults;
   document.getElementById('detail-empty').style.display = 'none';
@@ -349,6 +376,7 @@ function renderDetail() {
   document.getElementById('d-matched').textContent   = `✓ ${d.matched_count} matched`;
   document.getElementById('d-missed').textContent    = `✗ ${d.missed_count} missed`;
   document.getElementById('d-extra').textContent     = `+ ${d.extra_count} extra`;
+  showLogs(d.logs || [], false);
 
   ['missed','extra','matched'].forEach(t => {
     document.getElementById('tab-' + t).classList.toggle('active', t === currentTab);
@@ -421,6 +449,13 @@ async function runDoc(evt, key) {
   const res = await fetch(`/eval/run?doc_key=${encodeURIComponent(key)}&force_reparse=${forceReparse}`, { method: 'POST' });
   const { job_id } = await res.json();
   runningJobs[key] = job_id;
+  // If this doc is selected, open detail panel and show live log immediately
+  selectedDoc = key;
+  document.getElementById('detail-empty').style.display = 'none';
+  document.getElementById('detail-content').style.display = 'flex';
+  document.getElementById('d-title').textContent = key;
+  ['d-precision','d-recall','d-f1'].forEach(id => document.getElementById(id).textContent = '—');
+  showLogs(['Starting...'], true);
   renderDocList();
   pollJob(job_id, key);
   toast(`Started eval for ${key.split(' ')[0]}...`);
@@ -507,6 +542,8 @@ function pollJob(job_id, doc_key, onDone) {
       // Still running — update status text in card
       const el = document.getElementById('status-' + doc_key.replace(/[^a-z0-9]/gi,'_'));
       if (el && job.log.length) el.textContent = '⏳ ' + job.log[job.log.length - 1];
+      // If this doc is currently selected, stream logs live
+      if (selectedDoc === doc_key) showLogs(job.log, true);
     }
   }, 2000);
 }

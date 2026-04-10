@@ -751,9 +751,8 @@ function renderStreetTable() {
 function jumpToPage(page) {
   if (!selectedDoc || !page) return;
   const frame = document.getElementById('pdf-frame');
-  const base = `/eval/pdf/${encodeURIComponent(selectedDoc)}`;
-  // Setting src with #page=N navigates the browser PDF viewer to that page
-  frame.src = base + '#page=' + page;
+  // ?p= busts the cache so Chrome treats it as a new URL and respects #page=N
+  frame.src = `/eval/pdf/${encodeURIComponent(selectedDoc)}?p=${page}#page=${page}`;
 }
 
 function renderLogs(bodyId, lines, autoScroll) {

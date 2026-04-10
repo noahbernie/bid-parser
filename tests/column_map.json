@@ -1,143 +1,143 @@
 {
-  "_instructions": "For each document, map its sheet column headers to the canonical fields: main_street, from_street, to_street, work_type. Use the exact header text from the CSV. Set to null if that column doesn't exist in the sheet.",
+  "_instructions": "Keys are xlsx filenames (without .xlsx). Each tab has: header_row (1-indexed), main_street/from_street/to_street/work_type (exact column header text), limits_col (for combined 'FROM to TO' columns), skip (true to exclude tab from eval).",
 
-  "K-26-2431-DBB-3": {
-    "main_street": "Street Name",
-    "from_street": "Cross Street 1",
-    "to_street": "Cross Street 2",
-    "work_type": "Activity"
+  "20210709163252325 Attachment 2_List of Streets": {
+    "tabs": {
+      "Sheet1": { "header_row": 2, "main_street": "Street Name", "from_street": "From", "to_street": "To", "work_type": null }
+    }
   },
 
-  "K-21-1999-DBB-3-A": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
+  "20230307115819832 FY 22-23 Street Rehab and Slurry Seal Specification Final 2": {
+    "tabs": {
+      "Page 218-241": { "header_row": 2, "main_street": "STREET", "limits_col": "LIMITS", "work_type": null }
+    }
   },
 
-  "20251113162630992 Bid 8167": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
-  },
-
-  "20240604091722399 Bid 8081": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
-  },
-
-  "2026 Slurry Project Plans Bid Set": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
-  },
-
-  "Project Plans 2025 Slurry Seal SAB": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
-  },
-
-  "20230602181841165 STL455&STL457": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
+  "20230602181841165 STL455&STL457 Bid Document_Final": {
+    "tabs": {
+      "Page-79": { "header_row": 1, "main_street": "Street Name", "from_street": "Begin", "to_street": "End", "work_type": null },
+      "Page-80": { "header_row": 1, "main_street": "Street Name", "from_street": "Begin", "to_street": "End", "work_type": null }
+    }
   },
 
   "20230602181843757 STL0455 & STL0457 plans": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
+    "tabs": {
+      "Page-02": { "header_row": 2, "main_street": "STREET  NAME", "from_street": "BEGIN", "to_street": "END", "work_type": null },
+      "Page-08": { "header_row": 2, "main_street": "STREET  NAME", "from_street": "BEGIN", "to_street": "END", "work_type": null }
+    }
   },
 
-  "20260304073432504 WPR026": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
+  "20240418150106123 FINAL WPR024-Slurry Seal Specs Non-CWTA": {
+    "tabs": {
+      "Page 192-193":    { "header_row": 2, "main_street": "STREET NAME", "from_street": "BEGIN LOCATION", "to_street": "END LOCATION", "work_type": "TREATMENT" },
+      "Page 194":        { "header_row": 2, "main_street": "Street Name",  "from_street": "Begin Location",  "to_street": "End Location",  "work_type": "Treatment" },
+      "Page 195":        { "header_row": 2, "main_street": "Street Name",  "from_street": "Begin Location",  "to_street": "End Location",  "work_type": "Treatment" },
+      "Page 196":        { "header_row": 2, "main_street": "Street Name",  "from_street": "Begin Location",  "to_street": "End Location",  "work_type": "Treatment" },
+      "Page 211-214  ":  { "skip": true },
+      "Page 244-248":    { "skip": true }
+    }
   },
 
-  "20240418150106123 WPR024": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
-  },
-
-  "IFB 12-2816": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
-  },
-
-  "K-20-1905-DBB-3": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
-  },
-
-  "20251218123130399 K-26-2429-DBB-3": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
+  "20240604091722399 Bid 8081 - SPECIAL PROVISIONS_FULL BID DOCUMENT": {
+    "tabs": {
+      "Page 128": { "header_row": 2, "main_street": "STREET NAME", "from_street": "START", "to_street": "END", "work_type": null }
+    }
   },
 
   "20251008082645040 K-26-2428-DBB-3": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
+    "tabs": {
+      "Page 104-106": { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": "Activity" },
+      "Page 162-164": { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null },
+      "Page 176-178": { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null }
+    }
   },
 
-  "K-22-1977-DBB-3-A": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
+  "20251113162630992 Bid 8167 - Preservation Plans": {
+    "tabs": {
+      "Page 02": { "header_row": 2, "main_street": "STREET NAME", "from_street": "START", "to_street": "END", "work_type": null }
+    }
   },
 
-  "Bid 8081 - SPECIAL PROVISIONS": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
+  "2026 Slurry Project Plans Bid Set - SIGNED": {
+    "tabs": {
+      "Page 03": { "header_row": 2, "main_street": "STREET NAME", "from_street": null, "to_street": null, "work_type": null }
+    }
   },
 
-  "20230307115819832 FY 22-23 Street Rehab": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
+  "20260304073432504 WPR026 Treatments Specs FINAL": {
+    "tabs": {
+      "Page 187-188": { "header_row": 2, "main_street": "Street Name", "from_street": "Begin Location", "to_street": "End Location", "work_type": "Treatment Type" },
+      "Page 189-190": { "header_row": 2, "main_street": "Street Name", "from_street": "Begin Location", "to_street": "End Location", "work_type": "Treatment Type" },
+      "Page 191":     { "header_row": 2, "main_street": "Street Name", "from_street": "Begin Location", "to_street": "End Location", "work_type": "Treatment Type" },
+      "Page 192":     { "header_row": 2, "main_street": "Street Name", "from_street": "Begin Location", "to_street": "End Location", "work_type": "Treatment Type" },
+      "Page 207-212": { "skip": true },
+      "Page 213-216": { "skip": true }
+    }
   },
 
-  "IFB 22-3163": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
+  "Bid 8081 - SPECIAL PROVISIONS_FULL BID DOCUMENT": {
+    "tabs": {
+      "Page 128": { "header_row": 2, "main_street": "STREET NAME", "from_street": "START", "to_street": "END", "work_type": null }
+    }
+  },
+
+  "IFB 12-2816": {
+    "tabs": {
+      "Page 194-196": { "header_row": 2, "main_street": "STREET", "limits_col": "LIMITS", "work_type": null }
+    }
   },
 
   "IFB 21-1824": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
+    "tabs": {
+      "Page 208-210": { "header_row": 2, "main_street": "STREET", "limits_col": "LIMITS", "work_type": null }
+    }
   },
 
-  "20210709163252325 Attachment 2 List of Streets": {
-    "main_street": "FILL IN",
-    "from_street": "FILL IN",
-    "to_street": "FILL IN",
-    "work_type": "FILL IN"
+  "IFB 22-3163": {
+    "tabs": {
+      "Page 213-219": { "header_row": 2, "main_street": "STREET", "limits_col": "LIMITS", "work_type": null },
+      "Page 222":     { "skip": true }
+    }
+  },
+
+  "K-20-1905-DBB-3 - Solicitation": {
+    "tabs": {
+      "Page 63-74":   { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null },
+      "Page 150-154": { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null }
+    }
+  },
+
+  "K-21-1999-DBB-3-A - Solicitation": {
+    "tabs": {
+      "Page 72-80":   { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null },
+      "Page 130-133": { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null }
+    }
+  },
+
+  "K-22-1977-DBB-3-A - Solicitation": {
+    "tabs": {
+      "Page 73-81":   { "header_row": 2, "main_street": "Street Name",  "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null },
+      "Page 109-114": { "header_row": 2, "main_street": "Street Name",  "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null },
+      "Page 160-166": { "header_row": 2, "main_street": "Street Name",  "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null }
+    }
+  },
+
+  "K-26-2431-DBB-3 - Solicitation Document": {
+    "tabs": {
+      "Page 106": { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": "Activity" },
+      "Page 107": { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": "Activity" },
+      "Page 108": { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": "Activity" },
+      "Page 146": { "header_row": 2, "main_street": "Street",      "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null },
+      "Page 147": { "header_row": 2, "main_street": "Street",      "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null },
+      "Page 149": { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null },
+      "Page 150": { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null }
+    }
+  },
+
+  "Project Plans 2025 Slurry Seal SAB": {
+    "tabs": {
+      "SLURRY SEAL (Page 03)": { "header_row": 2, "main_street": "STREET NAME", "from_street": null, "to_street": null, "work_type": null },
+      "CAPE SEAL (Page 03)":   { "header_row": 2, "main_street": "STREET NAME", "from_street": null, "to_street": null, "work_type": null }
+    }
   }
 }

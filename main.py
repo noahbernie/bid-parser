@@ -734,12 +734,12 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
     all_tables: dict = {}
 
     def _cell_text(cell) -> str:
-        """Extract text from a Layout Parser table cell."""
+        """Extract text from a Layout Parser table cell, preserving newlines between blocks."""
         parts = []
         for block in cell.blocks:
             if block.text_block.text:
-                parts.append(block.text_block.text.strip().replace("\n", " "))
-        return " ".join(parts).strip()
+                parts.append(block.text_block.text.strip())
+        return "\n".join(parts).strip()
 
     def _parse_table_block(table_block, page_offset: int) -> tuple:
         """
@@ -1008,10 +1008,12 @@ Headers:"""
     header_cache: dict = {}  # header tuple → col_map dict
 
     def get_col_map(header_row: list) -> dict:
-        key = tuple(h.strip().upper() for h in header_row)
+        # Flatten multiline header cells — use only the first line of each cell as the label
+        flat = [h.split("\n")[0].strip() for h in header_row]
+        key = tuple(h.upper() for h in flat)
         if key in header_cache:
             return header_cache[key]
-        header_text = " | ".join(header_row)
+        header_text = " | ".join(flat)
         log(f"  🔍 Mapping headers: {header_text}")
         try:
             result = call_gemini_text(HEADER_PROMPT_DOCAI, header_text, log_fn=log)
@@ -1022,8 +1024,65 @@ Headers:"""
             log(f"  ✗ Header mapping failed: {e}")
             return {}
 
+    STREET_SUFFIXES = {"RD", "AV", "AVE", "DR", "LN", "CT", "PL", "ST", "BL", "BLVD", "WY", "WAY",
+                        "TR", "TRL", "CIR", "TER", "ML", "HWY", "PKWY", "FWY"}
+
+    def _looks_merged(cell: str, ms_idx: int, fr_idx, to_idx) -> bool:
+        """Return True if a cell looks like multiple street names jammed together."""
+        words = cell.strip().split()
+        # Count how many words look like street suffixes — if >1, multiple names are merged
+        suffix_count = sum(1 for w in words if w.upper() in STREET_SUFFIXES)
+        return suffix_count > 1
+
+    def _unscramble_row_with_llm(row: list, col_map: dict, page_num: int) -> list:
+        """Send a merged row to Gemini to split it into individual street records."""
+        ms_idx = col_map.get("main_street")
+        fr_idx = col_map.get("from_street")
+        to_idx = col_map.get("to_street")
+        wt_idx = col_map.get("work_type")
+
+        # Build a readable representation of the relevant columns
+        col_labels = {ms_idx: "Street Name", fr_idx: "Cross Street 1", to_idx: "Cross Street 2"}
+        if wt_idx is not None:
+            col_labels[wt_idx] = "Work Type"
+
+        cell_lines = []
+        for idx, label in sorted((i, l) for i, l in col_labels.items() if i is not None):
+            val = row[idx] if idx < len(row) else ""
+            cell_lines.append(f"{label}: {val}")
+
+        prompt = """These cells from a road construction bid table each contain multiple street names jammed together without delimiters.
+Split them back into individual rows. Each row = one street segment.
+Return ONLY valid JSON: {"rows": [{"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "..."}]}
+Use null for work_type if not present. Do not invent values — only use what is given.
+The values in each cell correspond positionally (1st street name goes with 1st cross street 1, etc).
+
+Cells:
+"""
+        try:
+            result = call_gemini_text(prompt, "\n".join(cell_lines), log_fn=log)
+            rows_out = result.get("rows", [])
+            streets = []
+            for r in rows_out:
+                main = (r.get("main_street") or "").strip()
+                if not main:
+                    continue
+                streets.append({
+                    "main_street": main,
+                    "from_street": r.get("from_street") or None,
+                    "to_street":   r.get("to_street") or None,
+                    "work_type":   r.get("work_type") or None,
+                    "source": "docai+llm",
+                    "page": page_num,
+                })
+            return streets
+        except Exception as e:
+            log(f"  ✗ Unscramble failed for page {page_num}: {e}")
+            return []
+
     def apply_col_map(rows: list, col_map: dict, page_num: int) -> list:
-        """Apply a column index map to data rows, returning street dicts."""
+        """Apply a column index map to data rows, returning street dicts.
+        Detects merged multi-value cells and unscrambles them via LLM."""
         streets = []
         ms_idx = col_map.get("main_street")
         fr_idx = col_map.get("from_street")
@@ -1037,8 +1096,13 @@ Headers:"""
                 if idx is None or idx >= len(row):
                     return None
                 v = row[idx].strip()
-                # drop purely numeric values from street fields
                 return None if v.replace(",", "").replace(".", "").isdigit() else (v or None)
+            main_cell = row[ms_idx] if ms_idx < len(row) else ""
+            # Detect merged multi-value cells — send to LLM to unscramble
+            if _looks_merged(main_cell, ms_idx, fr_idx, to_idx):
+                unscrambled = _unscramble_row_with_llm(row, col_map, page_num)
+                streets.extend(unscrambled)
+                continue
             main = get(ms_idx)
             if not main:
                 continue
@@ -1067,9 +1131,18 @@ Headers:"""
                     for col in range(max(len(r) for r in header_rows))
                 ]
             else:
-                # No explicit header row from DocAI — fall back to first body row
-                header_row = body_rows[0]
-                body_rows = body_rows[1:]
+                # No explicit header row from DocAI.
+                # First body row may have format "Column Label\nFirst Data Value" per cell —
+                # extract just the first line of each cell as the column label, then
+                # treat the remaining lines as data for that first row.
+                raw_first = body_rows[0]
+                header_row = [cell.split("\n")[0] for cell in raw_first]
+                # Rebuild first row with header labels stripped, keep only data lines
+                first_data_lines = ["\n".join(cell.split("\n")[1:]) for cell in raw_first]
+                if any(v.strip() for v in first_data_lines):
+                    body_rows = [first_data_lines] + body_rows[1:]
+                else:
+                    body_rows = body_rows[1:]
             col_map = get_col_map(header_row)
             if not col_map:
                 log(f"  ⚠️ Page {page_num}: no column map returned, skipping table")

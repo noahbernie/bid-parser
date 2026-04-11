@@ -705,7 +705,7 @@ def _get_docai_credentials():
     return None
 
 
-def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None) -> dict:
+def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) -> dict:
     """
     Send PDF to Document AI Layout Parser in 15-page chunks.
     Returns {page_num (1-indexed): [list of table row lists]}.
@@ -743,15 +743,13 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None) -> dict:
 
     def _parse_table_block(table_block, page_offset: int) -> tuple:
         """
-        Parse a Layout Parser table_block into (page_num, rows).
-        Returns (page_num, rows) where rows is list of list of strings.
+        Parse a Layout Parser table_block into (header_rows, body_rows).
+        Uses Document AI's native header/body split — no guessing needed.
+        Returns (header_rows, body_rows) each as list of list of strings.
         """
-        rows = []
-        for row in table_block.header_rows:
-            rows.append([_cell_text(cell) for cell in row.cells])
-        for row in table_block.body_rows:
-            rows.append([_cell_text(cell) for cell in row.cells])
-        return rows
+        header_rows = [[_cell_text(cell) for cell in row.cells] for row in table_block.header_rows]
+        body_rows   = [[_cell_text(cell) for cell in row.cells] for row in table_block.body_rows]
+        return header_rows, body_rows
 
     for chunk_start in range(0, total_pages, CHUNK_SIZE):
         chunk_end = min(chunk_start + CHUNK_SIZE, total_pages)
@@ -780,24 +778,41 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None) -> dict:
                 if has_table:
                     local_page = block.page_span.page_start
                     global_page = chunk_start + local_page
-                    rows = _parse_table_block(block.table_block, chunk_start)
-                    if rows:
-                        yield global_page, rows
+                    header_rows, body_rows = _parse_table_block(block.table_block, chunk_start)
+                    if body_rows:
+                        yield global_page, (header_rows, body_rows)
                 # recurse into text_block children
                 if block.text_block.text is not None:
                     children = list(block.text_block.blocks)
                     if children:
                         yield from _recurse_blocks(children)
 
-        for global_page, rows in _recurse_blocks(layout.blocks):
-            all_tables.setdefault(global_page, []).append(rows)
+        for global_page, table_tuple in _recurse_blocks(layout.blocks):
+            all_tables.setdefault(global_page, []).append(table_tuple)
 
         # Log summary for this chunk
         chunk_pages = [p for p in all_tables if chunk_start < p <= chunk_end]
         if log_fn and chunk_pages:
             for p in sorted(chunk_pages):
-                total_rows = sum(len(t) for t in all_tables[p])
+                total_rows = sum(len(t[1]) for t in all_tables[p])
                 log_fn(f"    Page {p}: {len(all_tables[p])} table(s), {total_rows} rows")
+
+    # Optionally save raw parsed table data for debugging
+    if save_raw_path:
+        try:
+            serializable = {}
+            for page_num, tables in all_tables.items():
+                serializable[str(page_num)] = [
+                    {"header_rows": hdr, "body_rows": body}
+                    for hdr, body in tables
+                ]
+            with open(save_raw_path, "w") as f:
+                json.dump(serializable, f, indent=2)
+            if log_fn:
+                log_fn(f"  💾 Raw DocAI table data saved to {save_raw_path}")
+        except Exception as e:
+            if log_fn:
+                log_fn(f"  ⚠️ Could not save raw DocAI data: {e}")
 
     return all_tables
 
@@ -957,7 +972,8 @@ def run_extraction(doc_id: str, api_key: str):
     # --- Step 2: Extract all tables via Document AI Layout Parser ---
     log("📄 Sending to Document AI Layout Parser...")
     try:
-        all_page_tables = docai_extract_all_tables(pdf_bytes, log_fn=log)
+        raw_save_path = os.path.join(BASE_DIR, f"docai_raw_{doc_id}.json")
+        all_page_tables = docai_extract_all_tables(pdf_bytes, log_fn=log, save_raw_path=raw_save_path)
         log(f"✓ Document AI complete — {len(all_page_tables)} pages with tables found")
     except Exception as e:
         log(f"✗ Document AI failed: {e}")
@@ -1039,18 +1055,21 @@ Headers:"""
 
     log("🧠 Mapping column headers with Gemini, then extracting rows in Python...")
     for page_num in sorted(all_page_tables.keys()):
-        for table_rows in all_page_tables[page_num]:
-            if not table_rows:
+        for table_tuple in all_page_tables[page_num]:
+            header_rows, body_rows = table_tuple
+            if not body_rows:
                 continue
-            # Find the header row — first row that has recognizable column names
-            header_idx = 0
-            for i, row in enumerate(table_rows[:5]):
-                joined = " ".join(c.upper() for c in row)
-                if any(kw in joined for kw in ["STREET NAME", "STREET", "CROSS STREET", "ROADWAY", "START", "FROM", "END", "TO", "LIMITS"]):
-                    header_idx = i
-                    break
-            header_row = table_rows[header_idx]
-            data_rows = table_rows[header_idx + 1:]
+            # Use Document AI's native header rows — combine all header rows into one flat header
+            # (some tables have 2-row headers; join them with space)
+            if header_rows:
+                header_row = [
+                    " ".join(filter(None, [header_rows[i][col] if i < len(header_rows) and col < len(header_rows[i]) else "" for i in range(len(header_rows))]))
+                    for col in range(max(len(r) for r in header_rows))
+                ]
+            else:
+                # No explicit header row from DocAI — fall back to first body row
+                header_row = body_rows[0]
+                body_rows = body_rows[1:]
             col_map = get_col_map(header_row)
             if not col_map:
                 log(f"  ⚠️ Page {page_num}: no column map returned, skipping table")
@@ -1058,9 +1077,9 @@ Headers:"""
             if col_map.get("main_street") is None:
                 log(f"  ⚠️ Page {page_num}: main_street column not found in map {col_map}, skipping table")
                 continue
-            streets = apply_col_map(data_rows, col_map, page_num)
+            streets = apply_col_map(body_rows, col_map, page_num)
             all_streets.extend(streets)
-            log(f"  ✓ Page {page_num} table: {len(data_rows)} rows → {len(streets)} streets extracted (map={col_map})")
+            log(f"  ✓ Page {page_num} table: {len(body_rows)} rows → {len(streets)} streets extracted (map={col_map})")
 
     # --- Step 4: Deduplication ---
     _SUFFIX_MAP = {
@@ -1127,6 +1146,16 @@ async def extract_schema(doc_id: str):
     loop.run_in_executor(None, run_extraction, doc_id, api_key)
 
     return {"status": "started"}
+
+
+@app.get("/doc/{doc_id}/docai_raw")
+async def get_docai_raw(doc_id: str):
+    """Return the raw Document AI parsed table data saved during extraction."""
+    path = os.path.join(BASE_DIR, f"docai_raw_{doc_id}.json")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Raw DocAI data not found — run extraction first")
+    with open(path) as f:
+        return json.load(f)
 
 
 @app.delete("/doc/{doc_id}/extract")

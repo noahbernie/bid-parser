@@ -26,7 +26,7 @@ STATIC_DIR   = os.path.join(BASE_DIR, "static")
 TESTS_DIR    = os.path.join(BASE_DIR, "tests")
 GT_DIR       = os.path.join(TESTS_DIR, "ground_truth")
 PDF_DIR      = os.path.join(TESTS_DIR, "pdfs")
-CACHE_DIR    = os.path.join(TESTS_DIR, "cache")
+CACHE_DIR    = os.environ.get("EVAL_CACHE_DIR", os.path.join(TESTS_DIR, "cache"))
 COL_MAP      = os.path.join(TESTS_DIR, "column_map.json")
 HISTORY_FILE = os.path.join(CACHE_DIR, "_history.json")
 
@@ -177,7 +177,11 @@ def _run_eval(job_id: str, doc_key: str, force_reparse: bool):
             with open(pdf_path, "rb") as f:
                 pdf_bytes = f.read()
 
-            from main import run_extraction, documents as docs_store
+            _main_module = os.environ.get("MAIN_MODULE", "main")
+            import importlib as _il
+            _m = _il.import_module(_main_module)
+            run_extraction = _m.run_extraction
+            docs_store = _m.documents
             import time as _time
 
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:

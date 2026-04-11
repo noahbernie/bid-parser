@@ -1030,9 +1030,14 @@ Headers:"""
     def _looks_merged(cell: str, ms_idx: int, fr_idx, to_idx) -> bool:
         """Return True if a cell looks like multiple street names jammed together."""
         words = cell.strip().split()
-        # Count how many words look like street suffixes — if >1, multiple names are merged
+        # Trigger 1: multiple street suffixes found
         suffix_count = sum(1 for w in words if w.upper() in STREET_SUFFIXES)
-        return suffix_count > 1
+        if suffix_count > 1:
+            return True
+        # Trigger 2: too many words to be a single street name (>5 words = almost certainly merged)
+        if len(words) > 5:
+            return True
+        return False
 
     def _unscramble_row_with_llm(row: list, col_map: dict, page_num: int) -> list:
         """Send a merged row to Gemini to split it into individual street records."""

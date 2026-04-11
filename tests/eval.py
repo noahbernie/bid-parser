@@ -62,6 +62,21 @@ def norm(v) -> str:
     s = s.replace("-", " ")  # normalize hyphens so "CDS-WEST END" == "CDS - WEST END"
     s = re.sub(r"[^\w\s]", "", s)
     parts = s.split()
+    # Collapse adjacent single-letter tokens: "E H ST" → "EH ST"
+    # Handles GT xlsx entries where abbreviated names have extra spaces (e.g. "E   H  ST")
+    merged = []
+    i = 0
+    while i < len(parts):
+        if len(parts[i]) == 1 and i + 1 < len(parts) and len(parts[i + 1]) == 1:
+            run = parts[i]
+            while i + 1 < len(parts) and len(parts[i + 1]) == 1:
+                i += 1
+                run += parts[i]
+            merged.append(run)
+        else:
+            merged.append(parts[i])
+        i += 1
+    parts = merged
     if parts and parts[-1] in _SUFFIX_MAP:
         parts[-1] = _SUFFIX_MAP[parts[-1]]
     return " ".join(parts)

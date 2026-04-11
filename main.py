@@ -1177,6 +1177,41 @@ Cell: """
             log(f"  ✗ Triple-merge split failed for page {page_num}: {e}")
             return []
 
+    def _split_begin_street_name(merged: str, end_val: str, page_num: int) -> tuple:
+        """Split a 'BEGIN STREET NAME' merged cell into (main_street, from_street).
+        Uses Claude Haiku with the END column as context to disambiguate ordering.
+        Returns (main, from_street) — falls back to suffix-split if LLM fails."""
+        prompt = """A road construction document has a column called "BEGIN STREET NAME" where two fields were merged into one cell:
+- STREET NAME: the primary street being paved/sealed (the main road being worked on)
+- BEGIN: the cross-street where the work segment starts
+
+The cell contains two street names concatenated. The END column shows where the work segment ends.
+
+Given the merged cell and the END value, identify which part is STREET NAME (main) and which is BEGIN (from).
+The STREET NAME is the road that runs continuously between BEGIN and END cross-streets.
+
+Return ONLY valid JSON: {"main_street": "...", "from_street": "..."}
+Do not invent names — only use the exact text from the merged cell."""
+        try:
+            content_blocks = [{"type": "text", "text": f"Merged cell: {merged}\nEND value: {end_val or '(unknown)'}"}]
+            result = call_claude_with_retry(
+                anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY")),
+                prompt, content_blocks, max_tokens=128,
+                model="claude-haiku-4-5-20251001", log_fn=log
+            )
+            main = (result.get("main_street") or "").strip()
+            from_s = (result.get("from_street") or "").strip()
+            if main and from_s:
+                return main, from_s
+        except Exception as e:
+            log(f"  ✗ BEGIN/STREET NAME split failed p.{page_num}: {e}")
+        # Fallback: suffix split, second part = main (BEGIN precedes STREET NAME)
+        words = merged.split()
+        split_at = next((wi for wi, w in enumerate(words) if w.upper() in STREET_SUFFIXES), None)
+        if split_at is not None and split_at < len(words) - 1:
+            return " ".join(words[split_at + 1:]), " ".join(words[:split_at + 1])
+        return merged, ""
+
     def apply_col_map(rows: list, col_map: dict, page_num: int) -> list:
         """Apply a column index map to data rows, returning street dicts.
         Detects merged multi-value cells and unscrambles them via LLM."""
@@ -1271,12 +1306,8 @@ Cell: """
                     continue
 
             if split_from_main:
-                words = main.split()
-                split_at = next((wi for wi, w in enumerate(words) if w.upper() in STREET_SUFFIXES), None)
-                if split_at is not None and split_at < len(words) - 1:
-                    from_val = " ".join(words[split_at + 1:])
-                    main = " ".join(words[:split_at + 1])
-                to_val = get(to_idx)  # read END column (was missing before)
+                to_val = get(to_idx)
+                main, from_val = _split_begin_street_name(main_cell, to_val, page_num)
             elif split_from_to and from_val:
                 # Split "Perris Bl Lasselle St" → from="Perris Bl", to="Lasselle St"
                 words = from_val.split()

@@ -1007,9 +1007,30 @@ Headers:"""
     # Build a set of unique header signatures → ask Gemini once per unique header layout
     header_cache: dict = {}  # header tuple → col_map dict
 
+    def _clean_header_cell(cell: str) -> str:
+        """Strip data values from a header cell, keeping only the column label.
+        Stops at the first token that looks like data: a digit, a street name,
+        a Segment ID (SS-...), or a work order number."""
+        first_line = cell.split("\n")[0].strip()
+        words = first_line.split()
+        label_words = []
+        for w in words:
+            wu = w.upper().strip("().,:")
+            # Stop if we hit a digit-containing token (measurements, IDs, dates)
+            if any(c.isdigit() for c in w):
+                break
+            # Stop if we hit an all-caps word that looks like a street name value
+            # (i.e. is a street suffix or is 2+ caps letters that aren't a known label word)
+            if wu in STREET_SUFFIXES:
+                # If we already have label words, this suffix is part of a street name value
+                if label_words:
+                    break
+            label_words.append(w)
+        return " ".join(label_words).strip() if label_words else first_line
+
     def get_col_map(header_row: list) -> dict:
-        # Flatten multiline header cells — use only the first line of each cell as the label
-        flat = [h.split("\n")[0].strip() for h in header_row]
+        # Clean each header cell to strip out data values mixed in with labels
+        flat = [_clean_header_cell(h) for h in header_row]
         key = tuple(h.upper() for h in flat)
         if key in header_cache:
             return header_cache[key]

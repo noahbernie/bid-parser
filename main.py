@@ -616,7 +616,7 @@ def call_gemini_image(prompt: str, b64_image: str, max_retries: int = 4, log_fn=
     if not api_key:
         raise Exception("GEMINI_API_KEY not set")
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     payload = json.dumps({
         "contents": [{"parts": [
             {"text": prompt},
@@ -660,6 +660,183 @@ def call_gemini_image(prompt: str, b64_image: str, max_retries: int = 4, log_fn=
             else:
                 raise Exception(f"Gemini HTTP {e.code}: {body[:200]}")
         except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(3)
+            else:
+                raise
+    raise Exception("Gemini max retries exceeded")
+
+
+# ─── Document AI Layout Parser ───────────────────────────────────────────────
+DOCAI_PROJECT      = "bid-parser-492923"
+DOCAI_LOCATION     = "us"
+DOCAI_PROCESSOR_ID = "7bb46b34cc5383cf"
+DOCAI_CRED_FILE    = os.path.join(BASE_DIR, "bid-parser-492923-ea3bbe06380d.json")
+
+STREETS_PROMPT_DOCAI = """You are parsing road construction bid document tables extracted by a layout parser.
+Each table is shown with pipe-separated cells. The first row is usually the column header.
+
+Map columns to these fields and return ONLY valid JSON: {"streets": [...]}
+Each entry: {"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "...", "location": "..."}
+
+Column mapping:
+- main_street: THE STREET BEING WORKED ON — first data column. Copy exactly.
+- from_street: where work BEGINS — FROM, START, BEGIN, LIMITS FROM, CROSS STREET 1, or similar.
+- to_street: where work ENDS — TO, END, TERMINUS, LIMITS TO, CROSS STREET 2, or similar.
+- work_type: type of work — use section header if no explicit column.
+- location: location/zone/district number if present, otherwise null.
+
+Important: Copy street values exactly — suffixes like AV, ST, DR, BL, RD are distinct and not interchangeable.
+Placeholders like EOS, EOC, BOS, BOC, EOP are valid cross-street values, not blanks.
+Numeric-only cells are not street names — do not put them in main_street, from_street, or to_street.
+Skip header rows and tables with no from/to column. Extract every data row."""
+
+
+def _get_docai_credentials():
+    """Load Document AI service account creds from env var or local key file."""
+    from google.oauth2 import service_account
+    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+    creds_json_str = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if creds_json_str:
+        info = json.loads(creds_json_str)
+        return service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    if os.path.exists(DOCAI_CRED_FILE):
+        return service_account.Credentials.from_service_account_file(DOCAI_CRED_FILE, scopes=scopes)
+    return None
+
+
+def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None) -> dict:
+    """
+    Send PDF to Document AI Layout Parser in 15-page chunks.
+    Returns {page_num (1-indexed): [list of table row lists]}.
+    Each table is a list of rows; each row is a list of cell strings.
+
+    Layout Parser returns data in document_layout.blocks (not document.pages).
+    Each block has table_block / text_block / list_block and a page_span.
+    """
+    from google.cloud import documentai
+
+    credentials = _get_docai_credentials()
+    if not credentials:
+        raise Exception("No Document AI credentials — set GOOGLE_APPLICATION_CREDENTIALS_JSON or provide key file")
+
+    client = documentai.DocumentProcessorServiceClient(
+        credentials=credentials,
+        client_options={"api_endpoint": f"{DOCAI_LOCATION}-documentai.googleapis.com"},
+    )
+    processor_name = f"projects/{DOCAI_PROJECT}/locations/{DOCAI_LOCATION}/processors/{DOCAI_PROCESSOR_ID}"
+
+    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total_pages = len(src)
+    src.close()
+
+    CHUNK_SIZE = 15
+    all_tables: dict = {}
+
+    def _cell_text(cell) -> str:
+        """Extract text from a Layout Parser table cell."""
+        parts = []
+        for block in cell.blocks:
+            if block.text_block.text:
+                parts.append(block.text_block.text.strip().replace("\n", " "))
+        return " ".join(parts).strip()
+
+    def _parse_table_block(table_block, page_offset: int) -> tuple:
+        """
+        Parse a Layout Parser table_block into (page_num, rows).
+        Returns (page_num, rows) where rows is list of list of strings.
+        """
+        rows = []
+        for row in table_block.header_rows:
+            rows.append([_cell_text(cell) for cell in row.cells])
+        for row in table_block.body_rows:
+            rows.append([_cell_text(cell) for cell in row.cells])
+        return rows
+
+    for chunk_start in range(0, total_pages, CHUNK_SIZE):
+        chunk_end = min(chunk_start + CHUNK_SIZE, total_pages)
+        if log_fn:
+            log_fn(f"  DocAI: pages {chunk_start+1}–{chunk_end} of {total_pages}...")
+
+        src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        chunk_doc = fitz.open()
+        chunk_doc.insert_pdf(src_doc, from_page=chunk_start, to_page=chunk_end - 1)
+        chunk_bytes = chunk_doc.tobytes()
+        src_doc.close()
+        chunk_doc.close()
+
+        req = documentai.ProcessRequest(
+            name=processor_name,
+            raw_document=documentai.RawDocument(content=chunk_bytes, mime_type="application/pdf"),
+        )
+        resp = client.process_document(request=req)
+        doc_obj = resp.document
+        layout = doc_obj.document_layout
+
+        def _recurse_blocks(blocks):
+            """Walk all blocks recursively, yielding (global_page, rows) for every table found."""
+            for block in blocks:
+                has_table = block.table_block.body_rows or block.table_block.header_rows
+                if has_table:
+                    local_page = block.page_span.page_start
+                    global_page = chunk_start + local_page
+                    rows = _parse_table_block(block.table_block, chunk_start)
+                    if rows:
+                        yield global_page, rows
+                # recurse into text_block children
+                if block.text_block.text is not None:
+                    children = list(block.text_block.blocks)
+                    if children:
+                        yield from _recurse_blocks(children)
+
+        for global_page, rows in _recurse_blocks(layout.blocks):
+            all_tables.setdefault(global_page, []).append(rows)
+
+        # Log summary for this chunk
+        chunk_pages = [p for p in all_tables if chunk_start < p <= chunk_end]
+        if log_fn and chunk_pages:
+            for p in sorted(chunk_pages):
+                total_rows = sum(len(t) for t in all_tables[p])
+                log_fn(f"    Page {p}: {len(all_tables[p])} table(s), {total_rows} rows")
+
+    return all_tables
+
+
+def call_gemini_text(prompt: str, text: str, max_retries: int = 4, log_fn=None) -> dict:
+    """Call Gemini Flash with a text-only prompt."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise Exception("GEMINI_API_KEY not set")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt + "\n\n" + text}]}],
+        "generationConfig": {"maxOutputTokens": 65536, "temperature": 0},
+    }).encode()
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+            raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if "```" in raw:
+                for part in raw.split("```"):
+                    if part.startswith("json"):
+                        raw = part[4:].strip(); break
+                    elif part.strip().startswith("{"):
+                        raw = part.strip(); break
+            return json.loads(raw)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            if e.code == 429:
+                wait = 30 * (2 ** attempt)
+                if log_fn:
+                    log_fn(f"  ⚠ Gemini rate limit — waiting {wait}s...")
+                time.sleep(wait)
+            elif attempt < max_retries - 1:
+                time.sleep(3)
+            else:
+                raise Exception(f"Gemini HTTP {e.code}: {body[:200]}")
+        except Exception:
             if attempt < max_retries - 1:
                 time.sleep(3)
             else:
@@ -747,8 +924,9 @@ async def get_chunks(doc_id: str):
 
 
 def run_extraction(doc_id: str, api_key: str):
-    """Run the full extraction pipeline — text only, no images."""
+    """Extract streets using Document AI for table extraction + Gemini for column mapping."""
     doc = documents[doc_id]
+    pdf_bytes = doc["bytes"]
 
     def log(msg, streets_so_far=None):
         p = doc.get("progress") or {"logs": [], "streets_so_far": []}
@@ -757,60 +935,15 @@ def run_extraction(doc_id: str, api_key: str):
             p["streets_so_far"] = streets_so_far
         doc["progress"] = p
 
-    # --- Step 1: scan all pages with smart text extraction ---
-    log("Scanning all pages...")
-    relevant_indices = []
-    table_page_indices = set()  # pages that have detected table grid structures
-
-    pdf_bytes = doc["bytes"]
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for i, page in enumerate(pdf.pages):
-            text = extract_text_smart(page, page_index=i, pdf_bytes=pdf_bytes)
-            doc["page_cache"][i + 1] = text
-            has_table = page_has_tables(page, pdf_bytes=pdf_bytes, page_index=i)
-            relevant = is_relevant_page(text)
-            # Fully rasterized pages (no extractable text) are likely scanned tables —
-            # include them for image extraction so we don't miss scanned slurry lists etc.
-            is_blank_to_pdfplumber = len(text.strip()) == 0
-            if has_table or is_blank_to_pdfplumber:
-                table_page_indices.add(i)
-            if relevant:
-                relevant_indices.append(i)
-            tags = []
-            if relevant:
-                tags.append("street content")
-            if has_table:
-                tags.append("📊 table detected → will send image")
-            elif is_blank_to_pdfplumber:
-                tags.append("🖼 no text (scanned) → will send image")
-            if tags:
-                log(f"  Page {i + 1}: {', '.join(tags)}")
-
-    log(f"────────────────────────────────────")
-    log(f"Scan complete: {doc['total_pages']} pages total")
-    log(f"  Street-relevant: {len(relevant_indices)} pages ({[i+1 for i in relevant_indices]})")
-    log(f"  Table pages (image): {len(table_page_indices)} pages ({sorted([i+1 for i in table_page_indices])})")
-    log(f"────────────────────────────────────")
-
-    def is_empty(v):
-        return not v or str(v).strip() in ("?", "null", "None", "")
-
-    def is_empty(v):
-        return not v or str(v).strip() in ("?", "null", "None", "")
-
     client = anthropic.Anthropic(api_key=api_key)
 
-    # --- Step 2: extract header info from first 5 pages ---
+    # --- Step 1: Extract project header from first 5 pages ---
     log("Extracting project info from cover pages...")
-    header_indices = list(range(min(5, doc["total_pages"])))
     header_blocks = []
-    header_chars = 0
-    for page_idx in header_indices:
-        text = doc["page_cache"].get(page_idx + 1, "")
-        entry = f"\n--- Page {page_idx + 1} ---\n{text}"
-        header_blocks.append({"type": "text", "text": entry})
-        header_chars += len(entry)
-
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for i in range(min(5, len(pdf.pages))):
+            text = pdf.pages[i].extract_text() or ""
+            header_blocks.append({"type": "text", "text": f"\n--- Page {i+1} ---\n{text}"})
     try:
         schema = call_claude_with_retry(client, HEADER_PROMPT, header_blocks, max_tokens=1024, log_fn=log)
         log(f"✓ Project: {schema.get('project_name')} | {schema.get('city')} | {schema.get('bid_number')}")
@@ -821,171 +954,106 @@ def run_extraction(doc_id: str, api_key: str):
     schema["streets"] = []
     all_streets = []
 
-    # --- Step 3: build chunks from all relevant pages ---
-    # Table pages send image-only. Non-table pages are batched as text chunks.
-    # chunks is a list of {"blocks": [...], "source": "text"|"image"}
-    chunks = []
-    current_blocks = []
-    current_size = 0
+    # --- Step 2: Extract all tables via Document AI Layout Parser ---
+    log("📄 Sending to Document AI Layout Parser...")
+    try:
+        all_page_tables = docai_extract_all_tables(pdf_bytes, log_fn=log)
+        log(f"✓ Document AI complete — {len(all_page_tables)} pages with tables found")
+    except Exception as e:
+        log(f"✗ Document AI failed: {e}")
+        doc["extracted_schema"] = schema
+        return
 
-    def flush_text_chunk():
-        nonlocal current_blocks, current_size
-        if current_blocks:
-            chunks.append({"blocks": current_blocks, "source": "text"})
-            current_blocks = []
-            current_size = 0
+    if not all_page_tables:
+        log("⚠ No tables found in document")
+        doc["extracted_schema"] = schema
+        return
 
-    # Also track pages that were extracted deterministically (skip Gemini for those)
-    deterministic_streets = []
-    last_text_xmap = None       # sticky header: column layout from last text-extracted page
-    last_text_xmap_page = None  # which page set last_text_xmap (reset if gap > 1)
+    # --- Step 3: Map column headers with Gemini, then extract rows in Python ---
+    # Collect all unique header rows across all tables
+    HEADER_PROMPT_DOCAI = """You are mapping column headers from a road construction bid table to these fields.
+Return ONLY valid JSON: {"main_street": <col_index>, "from_street": <col_index>, "to_street": <col_index>, "work_type": <col_index_or_null>, "location": <col_index_or_null>}
+Use 0-based column index. Use null if no matching column exists.
 
-    # Process table pages in order: relevant ones get Gemini fallback, non-relevant ones
-    # get text-only attempt (if text fails on a non-relevant page, just skip it).
-    relevant_set = set(relevant_indices)
-    all_table_pages = sorted(table_page_indices)
+Column roles:
+- main_street: THE STREET BEING WORKED ON (STREET NAME, ROADWAY, or similar)
+- from_street: where work BEGINS (START, FROM, BEGIN, LIMITS FROM, or similar)
+- to_street: where work ENDS (END, TO, TERMINUS, LIMITS TO, or similar)
+- work_type: type of work if present
+- location: location/zone/district number if present
 
-    for page_idx in all_table_pages:
-        is_relevant = page_idx in relevant_set
-        flush_text_chunk()
+Headers:"""
 
-        # Only propagate sticky header to the immediately following page.
-        # A gap means we've hit a non-table/non-relevant page (e.g. a CAD map)
-        # and the inherited column layout would produce garbage on unrelated content.
-        if last_text_xmap is not None and last_text_xmap_page is not None:
-            if page_idx - last_text_xmap_page > 1:
-                last_text_xmap = None
-                last_text_xmap_page = None
+    # Build a set of unique header signatures → ask Gemini once per unique header layout
+    header_cache: dict = {}  # header tuple → col_map dict
 
-        # Try deterministic text extraction first (pass inherited xmap for headerless pages)
+    def get_col_map(header_row: list) -> dict:
+        key = tuple(h.strip().upper() for h in header_row)
+        if key in header_cache:
+            return header_cache[key]
+        header_text = " | ".join(header_row)
         try:
-            text_rows, new_xmap = try_extract_tables_text(pdf_bytes, page_idx, page_idx + 1, fallback_xmap=last_text_xmap)
+            result = call_gemini_text(HEADER_PROMPT_DOCAI, header_text, log_fn=log)
+            header_cache[key] = result
+            log(f"  📐 Column map: {result}")
+            return result
         except Exception as e:
-            text_rows, new_xmap = None, None
-            if is_relevant:
-                log(f"  Page {page_idx + 1}: text extraction error ({e}), falling back to image")
+            log(f"  ✗ Header mapping failed: {e}")
+            return {}
 
-        if text_rows is not None:
-            log(f"  Page {page_idx + 1}: ✅ deterministic text extraction — {len(text_rows)} rows (no AI needed)")
-            deterministic_streets.extend(text_rows)
-            last_text_xmap = new_xmap or last_text_xmap
-            last_text_xmap_page = page_idx
-        elif is_relevant or len(doc["page_cache"].get(page_idx + 1, "").strip()) == 0:
-            # Send to Gemini if: page is street-relevant OR fully scanned (no text at all).
-            # Scanned pages have no text so is_relevant is always false for them — but they
-            # may contain street tables and must be included regardless.
-            last_text_xmap = None
-            last_text_xmap_page = None
-            try:
-                strips = render_page_as_strips(pdf_bytes, page_idx)
-                for strip_num, b64 in enumerate(strips):
-                    image_block = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}
-                    chunks.append({"blocks": [image_block], "source": "image", "page": page_idx + 1, "strip": strip_num + 1})
-                log(f"  Page {page_idx + 1}: 📷 image strips queued ({'scanned' if not is_relevant else 'no text tables found'})")
-            except Exception as e:
-                log(f"  Page {page_idx + 1}: image render failed ({e}), skipping")
-        else:
-            last_text_xmap = None  # non-relevant, text failed — reset sticky header
-            last_text_xmap_page = None
+    def apply_col_map(rows: list, col_map: dict, page_num: int) -> list:
+        """Apply a column index map to data rows, returning street dicts."""
+        streets = []
+        ms_idx = col_map.get("main_street")
+        fr_idx = col_map.get("from_street")
+        to_idx = col_map.get("to_street")
+        wt_idx = col_map.get("work_type")
+        lo_idx = col_map.get("location")
+        if ms_idx is None or (fr_idx is None and to_idx is None):
+            return streets  # can't extract without at least main + one cross street
+        for row in rows:
+            def get(idx):
+                if idx is None or idx >= len(row):
+                    return None
+                v = row[idx].strip()
+                # drop purely numeric values from street fields
+                return None if v.replace(",", "").replace(".", "").isdigit() else (v or None)
+            main = get(ms_idx)
+            if not main:
+                continue
+            streets.append({
+                "main_street": main,
+                "from_street": get(fr_idx),
+                "to_street":   get(to_idx),
+                "work_type":   row[wt_idx].strip() if wt_idx is not None and wt_idx < len(row) else None,
+                "location":    row[lo_idx].strip() if lo_idx is not None and lo_idx < len(row) else None,
+                "source": "docai",
+                "page": page_num,
+            })
+        return streets
 
-        # non-table pages skipped
+    log("🧠 Mapping column headers with Gemini, then extracting rows in Python...")
+    for page_num in sorted(all_page_tables.keys()):
+        for table_rows in all_page_tables[page_num]:
+            if not table_rows:
+                continue
+            # Find the header row — first row that has recognizable column names
+            header_idx = 0
+            for i, row in enumerate(table_rows[:3]):
+                joined = " ".join(c.upper() for c in row)
+                if any(kw in joined for kw in ["STREET NAME", "STREET", "START", "FROM", "END", "TO"]):
+                    header_idx = i
+                    break
+            header_row = table_rows[header_idx]
+            data_rows = table_rows[header_idx + 1:]
+            col_map = get_col_map(header_row)
+            if not col_map:
+                continue
+            streets = apply_col_map(data_rows, col_map, page_num)
+            all_streets.extend(streets)
+            log(f"  ✓ Page {page_num} table: {len(streets)} streets extracted", all_streets[:])
 
-    n_img = sum(1 for c in chunks if c["source"] == "image")
-    n_det = len(deterministic_streets)
-    log(f"Split into {len(chunks)} image chunks + {len([p for p in relevant_indices if p in table_page_indices])} table pages total.")
-    log(f"  📋 {n_det} streets from deterministic text extraction, {n_img} image strip(s) queued for Gemini.")
-
-    doc["chunk_debug"] = []
-    log_lock = threading.Lock()
-
-    def process_image_chunk(i, chunk):
-        """Process a single image chunk: main Gemini call + optional rescue. Returns (i, streets, logs)."""
-        chunk_blocks = chunk["blocks"]
-        chunk_text = "\n".join(b.get("text", "") for b in chunk_blocks if b["type"] == "text")
-
-        def chunk_log(msg, data=None):
-            with log_lock:
-                log(msg, data)
-
-        page_label = f"p{chunk.get('page','?')} strip {chunk.get('strip','?')}"
-        time.sleep(i * 1.5)   # stagger launches to avoid simultaneous rate-limit hits
-        chunk_log(f"🚀 [IMG {i+1}/{len(chunks)} {page_label}] Starting parallel extraction...")
-        t_start = time.time()
-        try:
-            b64 = chunk_blocks[0]["source"]["data"]
-            chunk_log(f"  → [IMG {i+1} {page_label}] Sending to Gemini ({len(b64) * 3 // 4 // 1024}KB)...")
-            result = call_gemini_image(STREETS_PROMPT_IMAGE, b64, log_fn=chunk_log)
-            elapsed = time.time() - t_start
-            new_streets = result.get("streets", [])
-            for s in new_streets:
-                s.setdefault("source", "image")
-                s["page"] = chunk.get("page")
-            chunk_log(f"  ✓ [IMG {i+1}] Done in {elapsed:.1f}s — {len(new_streets)} streets")
-            return i, new_streets, chunk_text
-
-        except Exception as e:
-            chunk_log(f"  ✗ [IMG {i+1}] Error: {str(e)[:200]}")
-            return i, [], chunk_text
-
-    # Separate image and text chunks, preserving original order index
-    image_chunks = [(i, c) for i, c in enumerate(chunks) if c["source"] == "image"]
-
-    # Build chunk debug info
-    for i, chunk in enumerate(chunks):
-        chunk_text = "\n".join(b.get("text", "") for b in chunk["blocks"] if b["type"] == "text")
-        doc["chunk_debug"].append({
-            "index": i, "total": len(chunks), "source": chunk["source"],
-            "char_count": len(chunk_text), "text": chunk_text,
-        })
-
-    # Collect results keyed by original chunk index so we can merge in order
-    chunk_results = {}  # index -> list of streets
-
-    # --- Run all image chunks in parallel ---
-    if image_chunks:
-        log(f"⚡ Launching {len(image_chunks)} image chunk(s) in parallel...")
-        t_parallel_start = time.time()
-        with ThreadPoolExecutor(max_workers=len(image_chunks)) as executor:
-            futures = {executor.submit(process_image_chunk, i, c): i for i, c in image_chunks}
-            for future in as_completed(futures):
-                i, streets, _ = future.result()
-                chunk_results[i] = streets
-                # Stream partial results immediately as each chunk finishes
-                partial = []
-                for idx in sorted(chunk_results.keys()):
-                    partial.extend(chunk_results[idx])
-                with log_lock:
-                    log(f"⚡ [IMG {i+1}] finished — {len(streets)} streets (partial total: {len(partial)})", partial)
-        log(f"⚡ All image chunks done in {time.time() - t_parallel_start:.1f}s total")
-
-    # --- Merge deterministic text streets first ---
-    if deterministic_streets:
-        all_streets.extend(deterministic_streets)
-        log(f"  📋 Merged {len(deterministic_streets)} deterministic text streets")
-
-    # --- Merge image chunk results in original chunk order ---
-    # Group strips by page so the 10-street threshold is evaluated per full page,
-    # not per individual strip (a page renders as 2 strips).
-    page_to_chunk_indices = {}
-    for i, chunk in image_chunks:
-        page = chunk.get("page")
-        page_to_chunk_indices.setdefault(page, []).append(i)
-
-    IMAGE_MIN_STREETS = 15  # discard image results if fewer than this per page
-    for page, indices in sorted(page_to_chunk_indices.items(), key=lambda x: x[0]):
-        page_streets = []
-        for i in sorted(indices):
-            page_streets.extend(chunk_results.get(i, []))
-        if len(page_streets) < IMAGE_MIN_STREETS:
-            log(f"  🚫 [Page {page}] image extraction returned only {len(page_streets)} streets — discarding (threshold: {IMAGE_MIN_STREETS})")
-        else:
-            all_streets.extend(page_streets)
-            schema["streets"] = all_streets
-            log(f"  📥 [Page {page}] merged {len(page_streets)} image streets (running total: {len(all_streets)})")
-
-    # --- Deduplication ---
-    # 1. Remove exact duplicates (same main+from+to+work_type)
-    # 2. If a street has null/? from AND null/? to, and a richer version exists, drop the sparse one
+    # --- Step 4: Deduplication ---
     _SUFFIX_MAP = {
         "STREET": "ST", "AVENUE": "AV", "DRIVE": "DR", "BOULEVARD": "BL",
         "ROAD": "RD", "COURT": "CT", "LANE": "LN", "PLACE": "PL",
@@ -999,6 +1067,12 @@ def run_extraction(doc_id: str, api_key: str):
             parts[-1] = _SUFFIX_MAP[parts[-1]]
         return " ".join(parts)
 
+    def is_empty(v):
+        return not v or str(v).strip() in ("?", "null", "None", "")
+
+    before = len(all_streets)
+    all_streets = [s for s in all_streets if not (is_empty(s.get("from_street")) and is_empty(s.get("to_street")))]
+
     seen = {}
     for s in all_streets:
         key = (
@@ -1007,60 +1081,20 @@ def run_extraction(doc_id: str, api_key: str):
             norm_name(s.get("to_street")),
             (s.get("work_type") or "").strip().upper(),
         )
-        empty = is_empty(s.get("from_street")) and is_empty(s.get("to_street"))
-        src = s.get("source", "text")
         if key not in seen:
-            seen[key] = (s, empty)
-        else:
-            existing, existing_empty = seen[key]
-            existing_src = existing.get("source", "text")
-            # Priority: image > text; richer (non-empty) > sparse within same source
-            if src == "image" and existing_src != "image":
-                seen[key] = (s, empty)  # image wins over text
-            elif not empty and existing_empty and src == existing_src:
-                seen[key] = (s, empty)  # richer wins within same source
-
-    # Also drop sparse entries whose main_street has ANY richer entry
-    mains_with_data = {k[0] for k, (_, emp) in seen.items() if not emp}
-    dropped_sparse = []
-    deduped = []
-    for (k, (s, emp)) in seen.items():
-        if not emp or k[0] not in mains_with_data:
-            deduped.append(s)
-        else:
-            dropped_sparse.append({"reason": "sparse+richer_exists", "street": s})
-
-    before = len(all_streets)
-    all_streets = deduped
-
-    # Drop streets with no from_street AND no to_street
-    dropped_empty = [s for s in all_streets if is_empty(s.get("from_street")) and is_empty(s.get("to_street"))]
-    all_streets = [s for s in all_streets if not (is_empty(s.get("from_street")) or is_empty(s.get("to_street")))]
+            seen[key] = s
+    all_streets = list(seen.values())
+    log(f"  Dedup: {before} → {len(all_streets)} streets")
 
     schema["streets"] = all_streets
-    log(f"  Deduplication: {before} → {len(all_streets)} streets (removed {before - len(all_streets)} duplicates)")
-
-    # Write drop log for debugging
-    with open("/tmp/dedup_dropped.txt", "w") as f:
-        f.write(f"=== DROPPED: sparse (richer version exists) — {len(dropped_sparse)} ===\n")
-        for d in dropped_sparse:
-            s = d["street"]
-            f.write(f"  {s.get('main_street')} | {s.get('from_street')} → {s.get('to_street')} | src={s.get('source')}\n")
-        f.write(f"\n=== DROPPED: both from+to empty — {len(dropped_empty)} ===\n")
-        for s in dropped_empty:
-            f.write(f"  {s.get('main_street')} | {s.get('from_street')} → {s.get('to_street')} | src={s.get('source')}\n")
-        f.write(f"\n=== KEPT: {len(all_streets)} streets ===\n")
-        for s in all_streets:
-            f.write(f"  {s.get('main_street')} | {s.get('from_street')} → {s.get('to_street')} | src={s.get('source')}\n")
-
     schema["_meta"] = {
         "total_pages": doc["total_pages"],
-        "chunks_processed": len(chunks),
-        "street_pages_found": len(relevant_indices),
+        "table_pages_found": len(all_page_tables),
         "total_streets": len(all_streets),
     }
     doc["extracted_schema"] = schema
-    log(f"✓ Done! {len(all_streets)} streets extracted total.", all_streets)
+    log(f"✓ Done! {len(all_streets)} streets extracted.", all_streets)
+
 
 
 @app.post("/doc/{doc_id}/extract")

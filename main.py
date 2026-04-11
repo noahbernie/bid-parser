@@ -1180,12 +1180,15 @@ Cells:
                     body_rows = [first_data_lines] + body_rows[1:]
                 else:
                     body_rows = body_rows[1:]
-            # Skip tables with no street-related keywords in header — no LLM call needed
+            # Skip tables with no street-related keywords in header or first few body rows
             STREET_HEADER_KW = {"STREET", "ST", "ROAD", "RD", "CROSS", "FROM", "TO", "LIMITS",
-                                 "LOCATION", "ROADWAY", "AVENUE", "AV", "BLVD", "DRIVE", "DR"}
-            joined_header = " ".join(header_row).upper()
-            header_words = set(joined_header.split())
-            if not header_words & STREET_HEADER_KW:
+                                 "LOCATION", "ROADWAY", "AVENUE", "AV", "BLVD", "DRIVE", "DR",
+                                 "START", "END", "BEGIN", "NAME", "MAIN", "SEGMENT", "AT"}
+            # Check header + first 3 body rows for keywords
+            rows_to_check = [header_row] + body_rows[:3]
+            combined = " ".join(cell for row in rows_to_check for cell in row).upper()
+            combined_words = set(combined.split())
+            if not combined_words & STREET_HEADER_KW:
                 continue
 
             col_map = get_col_map(header_row)

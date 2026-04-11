@@ -20,6 +20,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Global semaphore: cap concurrent LLM calls to avoid rate limits across parallel eval workers
+_LLM_SEMAPHORE = threading.Semaphore(4)
+
+_header_cache_lock = threading.Lock()
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 app = FastAPI()
@@ -592,22 +597,53 @@ def call_claude(client, prompt: str, content_blocks: list, max_tokens: int = 409
                 break
     return json.loads(raw)
 
-def call_claude_with_retry(client, prompt, content_blocks, max_tokens=4096, max_retries=4, log_fn=None, model="claude-sonnet-4-6"):
-    """Call Claude with exponential backoff on rate limit errors."""
+def call_claude_with_retry(client, prompt, content_blocks, max_tokens=4096, max_retries=6, log_fn=None, model="claude-haiku-4-5-20251001"):
+    """Call Claude with Gemini fallback on rate limit errors — alternates between models."""
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}" if gemini_key else None
+
     for attempt in range(max_retries):
+        use_gemini = (attempt % 2 == 1) and gemini_url  # alternate: Claude on even, Gemini on odd
         try:
-            return call_claude(client, prompt, content_blocks, max_tokens, model=model)
+            if not use_gemini:
+                return call_claude(client, prompt, content_blocks, max_tokens, model=model)
+            else:
+                # Reassemble text content for Gemini
+                text_parts = []
+                for block in content_blocks:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block["text"])
+                    elif hasattr(block, "type") and block.type == "text":
+                        text_parts.append(block.text)
+                combined = prompt + "\n\n" + "\n".join(text_parts)
+                payload = json.dumps({
+                    "contents": [{"parts": [{"text": combined}]}],
+                    "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0},
+                }).encode()
+                req = urllib.request.Request(gemini_url, data=payload, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read())
+                raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return _parse_llm_json(raw)
         except anthropic.RateLimitError:
-            wait = 30 * (2 ** attempt)  # 30, 60, 120, 240s
             if log_fn:
-                log_fn(f"  ⚠ Rate limit hit — waiting {wait}s (attempt {attempt+1}/{max_retries})...")
-            time.sleep(wait)
+                log_fn(f"  ⚠ Claude rate limit (attempt {attempt+1}) — switching to Gemini...")
+            time.sleep(5)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                if log_fn:
+                    log_fn(f"  ⚠ Gemini rate limit (attempt {attempt+1}) — switching to Claude...")
+                time.sleep(5)
+            elif attempt < max_retries - 1:
+                time.sleep(3)
+            else:
+                raise
         except Exception:
             if attempt < max_retries - 1:
                 time.sleep(3)
-                continue
-            raise
-    raise Exception("Max retries exceeded due to rate limits")
+            else:
+                raise
+    raise Exception("Max retries exceeded (both Claude and Gemini rate limited)")
 
 
 def call_gemini_image(prompt: str, b64_image: str, max_retries: int = 4, log_fn=None) -> dict:
@@ -833,46 +869,72 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
     return all_tables
 
 
-def call_gemini_text(prompt: str, text: str, max_retries: int = 4, log_fn=None) -> dict:
-    """Call Gemini Flash with a text-only prompt."""
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise Exception("GEMINI_API_KEY not set")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-    payload = json.dumps({
+def _parse_llm_json(raw: str) -> dict:
+    """Extract JSON from an LLM response that may be wrapped in markdown code fences."""
+    raw = raw.strip()
+    if "```" in raw:
+        for part in raw.split("```"):
+            if part.startswith("json"):
+                raw = part[4:].strip(); break
+            elif part.strip().startswith("{"):
+                raw = part.strip(); break
+    return json.loads(raw)
+
+
+def call_gemini_text(prompt: str, text: str, max_retries: int = 6, log_fn=None) -> dict:
+    """Call Gemini Flash, alternating to Claude Haiku when either hits rate limits."""
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+    gemini_payload = json.dumps({
         "contents": [{"parts": [{"text": prompt + "\n\n" + text}]}],
         "generationConfig": {"maxOutputTokens": 65536, "temperature": 0},
     }).encode()
-    for attempt in range(max_retries):
-        try:
-            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read())
-            raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            if "```" in raw:
-                for part in raw.split("```"):
-                    if part.startswith("json"):
-                        raw = part[4:].strip(); break
-                    elif part.strip().startswith("{"):
-                        raw = part.strip(); break
-            return json.loads(raw)
-        except urllib.error.HTTPError as e:
-            body = e.read().decode()
-            if e.code == 429:
-                wait = 30 * (2 ** attempt)
+
+    with _LLM_SEMAPHORE:
+        for attempt in range(max_retries):
+            use_claude = (attempt % 2 == 1)  # alternate: Gemini on even, Claude on odd attempts
+            try:
+                if not use_claude:
+                    if not gemini_key:
+                        use_claude = True
+                    else:
+                        req = urllib.request.Request(gemini_url, data=gemini_payload, headers={"Content-Type": "application/json"})
+                        with urllib.request.urlopen(req, timeout=60) as resp:
+                            data = json.loads(resp.read())
+                        raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        return _parse_llm_json(raw)
+
+                if use_claude:
+                    client = anthropic.Anthropic(api_key=anthropic_key)
+                    msg = client.messages.create(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=4096,
+                        temperature=0,
+                        messages=[{"role": "user", "content": prompt + "\n\n" + text}],
+                    )
+                    return _parse_llm_json(msg.content[0].text.strip())
+
+            except urllib.error.HTTPError as e:
+                body = e.read().decode()
+                if e.code == 429:
+                    if log_fn:
+                        log_fn(f"  ⚠ Gemini rate limit (attempt {attempt+1}) — switching to Claude...")
+                    time.sleep(5)
+                elif attempt < max_retries - 1:
+                    time.sleep(3)
+                else:
+                    raise Exception(f"Gemini HTTP {e.code}: {body[:200]}")
+            except anthropic.RateLimitError:
                 if log_fn:
-                    log_fn(f"  ⚠ Gemini rate limit — waiting {wait}s...")
-                time.sleep(wait)
-            elif attempt < max_retries - 1:
-                time.sleep(3)
-            else:
-                raise Exception(f"Gemini HTTP {e.code}: {body[:200]}")
-        except Exception:
-            if attempt < max_retries - 1:
-                time.sleep(3)
-            else:
-                raise
-    raise Exception("Gemini max retries exceeded")
+                    log_fn(f"  ⚠ Claude rate limit (attempt {attempt+1}) — switching to Gemini...")
+                time.sleep(5)
+            except Exception:
+                if attempt < max_retries - 1:
+                    time.sleep(3)
+                else:
+                    raise
+    raise Exception("LLM max retries exceeded (both Gemini and Claude rate limited)")
 
 
 @app.post("/upload")
@@ -1055,7 +1117,8 @@ Headers:"""
         log(f"  🔍 Mapping headers: {header_text}")
         try:
             result = call_gemini_text(HEADER_PROMPT_DOCAI, header_text, log_fn=log)
-            header_cache[key] = result
+            with _header_cache_lock:
+                header_cache[key] = result
             log(f"  📐 Column map: {result}")
             return result
         except Exception as e:
@@ -1232,13 +1295,14 @@ Do not invent names — only use the exact text from the merged cell."""
         split_from_to = False
         if fr_idx is not None and to_idx is None:
             sample = [row[fr_idx].strip() for row in rows[:5] if fr_idx < len(row) and row[fr_idx].strip()]
-            merged_count = sum(
+            to_keyword_count = sum(1 for cell in sample if " TO " in cell.upper())
+            suffix_count = sum(
                 1 for cell in sample
                 if sum(1 for w in cell.split() if w.upper() in STREET_SUFFIXES) >= 2
             )
-            if merged_count >= 2:
+            if to_keyword_count >= 2 or suffix_count >= 2:
                 split_from_to = True
-                log(f"  🔧 Detected merged from+to column at col {fr_idx} — will split on first suffix")
+                log(f"  🔧 Detected merged from+to column at col {fr_idx} — will split on ' TO ' or first suffix")
 
         for row in rows:
             # Triple-merged column: entire cell contains "Street Name Cross Street1 Cross Street2"
@@ -1267,7 +1331,8 @@ Do not invent names — only use the exact text from the merged cell."""
                 # handles "A1 VIA MIRALESTE" → "VIA MIRALESTE"
                 main = " ".join(_main_words[1:])
             # Strip asset ID prefixes like "SS-001459-PV1 63RD ST" → "63RD ST"
-            main = re.sub(r'^[A-Za-z]{1,4}-\d{4,8}-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\s+', '', main).strip()
+            import re as _re
+            main = _re.sub(r'^[A-Za-z]{1,4}-\d{4,8}-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\s+', '', main).strip()
             if not main:
                 continue
             # Reject junk rows: numbered/lettered list items ("1.", "2.", "a)", "b)"),
@@ -1311,12 +1376,19 @@ Do not invent names — only use the exact text from the merged cell."""
                 to_val = get(to_idx)
                 main, from_val = _split_begin_street_name(main_cell, to_val, page_num)
             elif split_from_to and from_val:
-                # Split "Perris Bl Lasselle St" → from="Perris Bl", to="Lasselle St"
-                words = from_val.split()
-                split_at = next((wi for wi, w in enumerate(words) if w.upper() in STREET_SUFFIXES), None)
-                if split_at is not None and split_at < len(words) - 1:
-                    to_val = " ".join(words[split_at + 1:])
-                    from_val = " ".join(words[:split_at + 1])
+                # Split "JAMBOREE RD TO CONSTRUCTION S" or "Perris Bl Lasselle St"
+                # Prefer explicit " TO " separator; fall back to suffix split
+                _fv = from_val
+                if " TO " in _fv.upper():
+                    _si = _fv.upper().index(" TO ")
+                    from_val = _fv[:_si].strip()
+                    to_val = _fv[_si + 4:].strip()
+                else:
+                    words = _fv.split()
+                    split_at = next((wi for wi, w in enumerate(words) if w.upper() in STREET_SUFFIXES), None)
+                    if split_at is not None and split_at < len(words) - 1:
+                        to_val = " ".join(words[split_at + 1:])
+                        from_val = " ".join(words[:split_at + 1])
             else:
                 to_val = get(to_idx)
             streets.append({
@@ -1430,8 +1502,40 @@ Do not invent names — only use the exact text from the merged cell."""
                         log(f"  ⚠️ Page {page_num}: main_street column not found in map {col_map}, skipping table")
                         continue
                 else:
-                    log(f"  ⚠️ Page {page_num}: main_street column not found in map {col_map}, skipping table")
-                    continue
+                    # ── Header-recovery: DocAI merged the column header row with the first data row ──
+                    # Pattern: body row cells like "STREET BARRANCA PKWY", "LIMITS JAMBOREE RD TO X"
+                    # Scan first 3 body rows for a cell whose first word is a column keyword (STREET/LIMITS/ZONE).
+                    _RECOVERY_KEYWORDS = {"STREET", "LIMITS", "ZONE", "LOCATION", "FROM", "TO", "NAME"}
+                    recovered = False
+                    for _ri, _row in enumerate(body_rows[:3]):
+                        if not _row:
+                            continue
+                        first_word = _row[0].strip().split()[0].upper() if _row[0].strip() else ""
+                        if first_word in _RECOVERY_KEYWORDS:
+                            # Split each cell into (header_keyword, data_value)
+                            _rec_headers = []
+                            _rec_data = []
+                            for _cell in _row:
+                                _words = _cell.strip().split()
+                                if _words and _words[0].upper() in _RECOVERY_KEYWORDS:
+                                    _rec_headers.append(_words[0])
+                                    _rec_data.append(" ".join(_words[1:]))
+                                else:
+                                    _rec_headers.append(_cell)
+                                    _rec_data.append(_cell)
+                            _new_map = get_col_map(_rec_headers)
+                            if _new_map and _new_map.get("main_street") is not None:
+                                col_map = _new_map
+                                # Rows before the merged header row are pure data; insert recovered data row too
+                                _prefix = body_rows[:_ri]
+                                _rec_data_row = _rec_data
+                                body_rows = _prefix + [_rec_data_row] + body_rows[_ri + 1:]
+                                log(f"  🔧 Page {page_num}: recovered headers from body row {_ri}: {_rec_headers}")
+                                recovered = True
+                                break
+                    if not recovered:
+                        log(f"  ⚠️ Page {page_num}: main_street column not found in map {col_map}, skipping table")
+                        continue
             # Detect "triple-merged" column: DocAI merged Street Name + Cross Street 1 + Cross Street 2
             # into a single column. Pattern: main_street is set, from/to are null, and the main_street
             # header cell mentions "Cross Street". Route each data cell to the LLM to split.

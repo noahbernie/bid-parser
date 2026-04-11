@@ -1169,23 +1169,15 @@ Cells:
                 ]
             else:
                 # No explicit header row from DocAI.
-                # Scan up to first 3 rows to find the real header — skip blank/title rows.
-                # A real header row has multiple non-empty cells, none of which look like data values.
-                header_idx = 0
-                for ri, row in enumerate(body_rows[:3]):
-                    non_empty = [c.strip() for c in row if c.strip()]
-                    # Skip if mostly blank or only one cell has content (section title row)
-                    if len(non_empty) <= 1:
-                        continue
-                    # Skip if cells contain digits (data row, not header)
-                    if any(any(ch.isdigit() for ch in c) for c in non_empty):
-                        continue
-                    header_idx = ri
-                    break
-                raw_first = body_rows[header_idx]
+                # Skip leading title rows (rows with <=1 non-empty cell, e.g. "SLURRY/CAPE SEAL LIST")
+                # then take the next row with multiple non-empty cells as the header.
+                while body_rows and sum(1 for c in body_rows[0] if c.strip()) <= 1:
+                    body_rows = body_rows[1:]
+                if not body_rows:
+                    continue
+                raw_first = body_rows[0]
                 header_row = [cell.split("\n")[0] for cell in raw_first]
-                # First data row is right after the header
-                body_rows = body_rows[header_idx + 1:]
+                body_rows = body_rows[1:]
 
             col_map = get_col_map(header_row)
             if not col_map:

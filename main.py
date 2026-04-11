@@ -1103,8 +1103,8 @@ Cells:
                 v = row[idx].strip()
                 return None if v.replace(",", "").replace(".", "").isdigit() else (v or None)
             main_cell = row[ms_idx] if ms_idx < len(row) else ""
-            # Detect merged multi-value cells — send to LLM to unscramble
-            if _looks_merged(main_cell, ms_idx, fr_idx, to_idx):
+            # Only unscramble if we have cross-street columns to split into
+            if _looks_merged(main_cell, ms_idx, fr_idx, to_idx) and (fr_idx is not None or to_idx is not None):
                 unscrambled = _unscramble_row_with_llm(row, col_map, page_num)
                 streets.extend(unscrambled)
                 continue
@@ -1155,6 +1155,24 @@ Cells:
             if col_map.get("main_street") is None:
                 log(f"  ⚠️ Page {page_num}: main_street column not found in map {col_map}, skipping table")
                 continue
+            # If we found main_street but no cross streets, check if header text mentions
+            # "Cross Street" — if so, try to infer positions from the joined header
+            if col_map.get("from_street") is None and col_map.get("to_street") is None:
+                joined = " | ".join(h.upper() for h in header_row)
+                if "CROSS STREET" in joined or "STREET NAME" in joined:
+                    # Find indices of cells containing "Street Name", "Cross Street 1/2"
+                    for ci, h in enumerate(header_row):
+                        hu = h.upper()
+                        if "STREET NAME" in hu and col_map.get("main_street") is None:
+                            col_map["main_street"] = ci
+                        elif "CROSS STREET 1" in hu or "CROSS ST 1" in hu:
+                            col_map["from_street"] = ci
+                        elif "CROSS STREET 2" in hu or "CROSS ST 2" in hu:
+                            col_map["to_street"] = ci
+                        elif "CROSS STREET" in hu and "1" not in hu and "2" not in hu:
+                            if col_map.get("from_street") is None:
+                                col_map["from_street"] = ci
+                    log(f"  🔧 Inferred cross-street columns: {col_map}")
             streets = apply_col_map(body_rows, col_map, page_num)
             all_streets.extend(streets)
             log(f"  ✓ Page {page_num} table: {len(body_rows)} rows → {len(streets)} streets extracted (map={col_map})")

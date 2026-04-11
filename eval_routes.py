@@ -29,6 +29,7 @@ PDF_DIR      = os.path.join(TESTS_DIR, "pdfs")
 CACHE_DIR    = os.environ.get("EVAL_CACHE_DIR", os.path.join(TESTS_DIR, "cache"))
 COL_MAP      = os.path.join(TESTS_DIR, "column_map.json")
 HISTORY_FILE = os.path.join(CACHE_DIR, "_history.json")
+LEDGER_FILE  = os.path.join(CACHE_DIR, "_ledger.json")
 
 sys.path.insert(0, TESTS_DIR)
 from eval import load_ground_truth, match_streets  # noqa: E402
@@ -540,3 +541,75 @@ async def serve_pdf(doc_key: str):
 @router.get("/history")
 async def get_history():
     return _load_history()
+
+
+def _load_ledger():
+    if os.path.exists(LEDGER_FILE):
+        try:
+            with open(LEDGER_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+@router.get("/ledger")
+async def get_ledger():
+    return _load_ledger()
+
+
+@router.post("/ledger/snapshot")
+async def save_ledger_snapshot(notes: str = ""):
+    """Save a snapshot of all current results to the ledger with optional notes."""
+    docs_run = {k: v for k, v in _results.items()}
+    if not docs_run:
+        return {"error": "No results to snapshot — run some evals first"}
+
+    all_keys = _doc_keys()
+    doc_entries = {}
+    for key in all_keys:
+        r = docs_run.get(key)
+        if r:
+            doc_entries[key] = {
+                "f1":        round(r["f1"], 4),
+                "precision": round(r["precision"], 4),
+                "recall":    round(r["recall"], 4),
+                "matched":   r["matched_count"],
+                "missed":    r["missed_count"],
+                "extra":     r["extra_count"],
+                "total_truth": r["total_truth"],
+                "timestamp": r["timestamp"],
+            }
+
+    run_docs = list(doc_entries.values())
+    tm = sum(d["matched"] for d in run_docs)
+    te = sum(d["extra"]   for d in run_docs)
+    tt = sum(d["total_truth"] for d in run_docs)
+    p  = tm / (tm + te) if (tm + te) else 0
+    r  = tm / tt if tt else 0
+    f1 = 2 * p * r / (p + r) if (p + r) else 0
+
+    sub50 = [k for k, v in doc_entries.items() if v["f1"] < 0.5]
+
+    snapshot = {
+        "timestamp":   datetime.now().isoformat(),
+        "notes":       notes,
+        "pipeline":    os.environ.get("MAIN_MODULE", "main"),
+        "aggregate": {
+            "docs_run":    len(run_docs),
+            "docs_total":  len(all_keys),
+            "avg_f1":      round(f1, 4),
+            "precision":   round(p, 4),
+            "recall":      round(r, 4),
+            "sub_50_count": len(sub50),
+            "sub_50_docs": sub50,
+        },
+        "docs": doc_entries,
+    }
+
+    ledger = _load_ledger()
+    ledger.append(snapshot)
+    with open(LEDGER_FILE, "w") as f:
+        json.dump(ledger, f, indent=2)
+
+    return {"saved": True, "snapshot_index": len(ledger) - 1, "aggregate": snapshot["aggregate"]}

@@ -282,6 +282,40 @@
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--s2); border-radius: 3px; }
     ::-webkit-scrollbar-thumb:hover { background: var(--dim); }
+
+    /* ── Ledger modal ── */
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,.6);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 200; display: none;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      background: var(--s1); border: 1px solid var(--border2); border-radius: 10px;
+      width: 520px; max-width: 95vw; padding: 20px; display: flex; flex-direction: column; gap: 14px;
+    }
+    .modal-title { font-size: 14px; font-weight: 600; color: var(--text); }
+    .modal-sub   { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .modal textarea {
+      width: 100%; height: 100px; background: var(--s0); border: 1px solid var(--border2);
+      border-radius: 6px; color: var(--text); padding: 10px; font-family: inherit;
+      font-size: 12px; resize: vertical; outline: none; line-height: 1.5;
+    }
+    .modal textarea:focus { border-color: var(--violet); }
+    .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+    /* ── Ledger history panel ── */
+    .ledger-entry {
+      border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden;
+    }
+    .ledger-hdr {
+      padding: 10px 14px; background: var(--s1); cursor: pointer;
+      display: flex; align-items: center; gap: 12px;
+    }
+    .ledger-ts   { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+    .ledger-f1   { font-size: 18px; font-weight: 800; letter-spacing: -.02em; }
+    .ledger-notes { font-size: 12px; color: var(--text); flex: 1; }
+    .ledger-body { padding: 12px 14px; background: var(--s0); display: none; }
   </style>
 </head>
 <body>
@@ -291,6 +325,8 @@
   <a class="back-link" href="/">← back</a>
   <div class="header-right">
     <span id="run-all-progress" style="display:none"></span>
+    <button class="btn" style="background:var(--s2);color:var(--muted);border:1px solid var(--border2)" onclick="openLedger()">📒 Ledger</button>
+    <button class="btn" style="background:var(--s2);color:var(--muted);border:1px solid var(--border2)" onclick="openSnapshotModal()">📸 Snapshot</button>
     <button class="btn" style="background:var(--s2);color:var(--muted);border:1px solid var(--border2)" onclick="clearAllCache()">🗑 Clear Cache</button>
     <button class="btn btn-primary" id="run-all-btn" onclick="runAll()">▶ Run All</button>
   </div>
@@ -432,6 +468,32 @@
 </div>
 
 <div class="toast" id="toast"></div>
+
+<!-- ── Snapshot modal ── -->
+<div class="modal-backdrop" id="snapshot-modal">
+  <div class="modal">
+    <div>
+      <div class="modal-title">📸 Save Ledger Snapshot</div>
+      <div class="modal-sub">Captures all current eval results + your notes about what's broken and what fix is being tried next.</div>
+    </div>
+    <textarea id="snapshot-notes" placeholder="e.g. Trying hyphen normalization fix + split_begin_street_name order fix. IFB 12-2816 still at 35% due to row merging. K-26-2431 needs from_main_to column order fix."></textarea>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeSnapshotModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveSnapshot()">Save Snapshot</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Ledger panel (full-screen overlay) ── -->
+<div class="modal-backdrop" id="ledger-modal">
+  <div class="modal" style="width:700px;max-height:80vh;overflow-y:auto">
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <div class="modal-title">📒 Run Ledger</div>
+      <button class="btn btn-ghost" onclick="closeLedger()">✕ Close</button>
+    </div>
+    <div id="ledger-body"><p style="color:var(--muted);font-size:12px">Loading…</p></div>
+  </div>
+</div>
 
 <script>
 let allDocs = [], selectedDoc = null, selectedResults = null;
@@ -1081,6 +1143,69 @@ function toast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg; t.classList.add('show');
   setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+// ── Snapshot / Ledger ────────────────────────────────────────────────────────
+function openSnapshotModal() {
+  document.getElementById('snapshot-modal').classList.add('open');
+  document.getElementById('snapshot-notes').focus();
+}
+function closeSnapshotModal() {
+  document.getElementById('snapshot-modal').classList.remove('open');
+}
+async function saveSnapshot() {
+  const notes = document.getElementById('snapshot-notes').value.trim();
+  const res = await fetch(`/eval/ledger/snapshot?notes=${encodeURIComponent(notes)}`, { method: 'POST' });
+  const data = await res.json();
+  if (data.error) { toast('Error: ' + data.error); return; }
+  closeSnapshotModal();
+  document.getElementById('snapshot-notes').value = '';
+  const agg = data.aggregate;
+  toast(`Snapshot saved — F1 ${Math.round(agg.avg_f1*100)}%  ·  ${agg.sub_50_count} docs below 50%`);
+}
+
+async function openLedger() {
+  document.getElementById('ledger-modal').classList.add('open');
+  const el = document.getElementById('ledger-body');
+  el.innerHTML = '<p style="color:var(--muted);font-size:12px">Loading…</p>';
+  try {
+    const res = await fetch('/eval/ledger');
+    const entries = await res.json();
+    if (!entries.length) { el.innerHTML = '<p style="color:var(--muted);font-size:12px">No snapshots yet — run a suite and hit 📸 Snapshot.</p>'; return; }
+    el.innerHTML = entries.slice().reverse().map((e, i) => {
+      const agg = e.aggregate || {};
+      const f1c = agg.avg_f1 >= .8 ? 'var(--green)' : agg.avg_f1 >= .5 ? 'var(--amber)' : 'var(--red)';
+      const sub50 = (agg.sub_50_docs || []).map(d => `<span style="background:rgba(242,96,96,.12);color:var(--red);padding:2px 7px;border-radius:4px;font-size:11px;margin:2px;display:inline-block">${esc(d)}</span>`).join('');
+      const docRows = Object.entries(e.docs || {}).sort((a,b)=>a[1].f1-b[1].f1).map(([k,v]) => {
+        const fc = v.f1 >= .8 ? 'var(--green)' : v.f1 >= .5 ? 'var(--amber)' : 'var(--red)';
+        return `<div style="display:flex;align-items:center;gap:10px;padding:4px 0;border-bottom:1px solid var(--border);font-size:11px">
+          <span style="color:${fc};font-weight:700;min-width:38px">${Math.round(v.f1*100)}%</span>
+          <span style="flex:1;color:var(--text)">${esc(k)}</span>
+          <span style="color:var(--muted)">${esc(v.matched)} ✓  ${esc(v.missed)} ✗  +${esc(v.extra)}</span>
+        </div>`;
+      }).join('');
+      return `<div class="ledger-entry">
+        <div class="ledger-hdr" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='block'?'none':'block'">
+          <span class="ledger-f1" style="color:${f1c}">${Math.round((agg.avg_f1||0)*100)}%</span>
+          <div style="flex:1;min-width:0">
+            <div class="ledger-notes">${e.notes ? esc(e.notes) : '<em style="color:var(--muted)">No notes</em>'}</div>
+            <div style="font-size:10px;color:var(--muted);margin-top:2px">${new Date(e.timestamp).toLocaleString()} · ${agg.docs_run}/${agg.docs_total} docs · pipeline: ${esc(e.pipeline||'main')}</div>
+          </div>
+          <span style="color:var(--muted);font-size:11px">▾</span>
+        </div>
+        <div class="ledger-body">
+          ${agg.sub_50_count ? `<div style="margin-bottom:10px"><span style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Sub-50%</span><div style="margin-top:4px">${sub50}</div></div>` : ''}
+          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">All Docs</div>
+          ${docRows}
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    el.innerHTML = `<p style="color:var(--red);font-size:12px">Error: ${e.message}</p>`;
+  }
+}
+function closeLedger() {
+  document.getElementById('ledger-modal').classList.remove('open');
 }
 
 init();

@@ -407,11 +407,12 @@
       </div>
       <div class="res-tabs">
         <div class="tabs-bar">
-          <button class="tab-btn active" id="tab-missed"  onclick="switchTab('missed')">Missed <span class="tab-ct" id="tab-missed-ct"></span></button>
-          <button class="tab-btn"        id="tab-extra"   onclick="switchTab('extra')">Extra <span class="tab-ct" id="tab-extra-ct"></span></button>
-          <button class="tab-btn"        id="tab-matched" onclick="switchTab('matched')">Matched <span class="tab-ct" id="tab-matched-ct"></span></button>
-          <button class="tab-btn"        id="tab-json"    onclick="switchTab('json')">Eval JSON</button>
-          <button class="tab-btn"        id="tab-truth"   onclick="switchTab('truth')">Truth JSON <span class="tab-ct" id="tab-truth-ct"></span></button>
+          <button class="tab-btn active" id="tab-missed"   onclick="switchTab('missed')">Missed <span class="tab-ct" id="tab-missed-ct"></span></button>
+          <button class="tab-btn"        id="tab-extra"    onclick="switchTab('extra')">Extra <span class="tab-ct" id="tab-extra-ct"></span></button>
+          <button class="tab-btn"        id="tab-matched"  onclick="switchTab('matched')">Matched <span class="tab-ct" id="tab-matched-ct"></span></button>
+          <button class="tab-btn"        id="tab-diagnose" onclick="switchTab('diagnose')">🔍 Diagnose <span class="tab-ct" id="tab-diagnose-ct"></span></button>
+          <button class="tab-btn"        id="tab-json"     onclick="switchTab('json')">Eval JSON</button>
+          <button class="tab-btn"        id="tab-truth"    onclick="switchTab('truth')">Truth JSON <span class="tab-ct" id="tab-truth-ct"></span></button>
         </div>
         <div class="street-table" id="street-table"></div>
         <div id="json-view" style="display:none;flex:1;overflow:auto;padding:14px 16px">
@@ -420,6 +421,7 @@
         <div id="truth-view" style="display:none;flex:1;overflow:auto;padding:14px 16px">
           <pre id="truth-pre-done" style="font-family:'SF Mono','Fira Code',monospace;font-size:11px;line-height:1.7;color:#a0a0b8;white-space:pre-wrap;word-break:break-word"></pre>
         </div>
+        <div id="diagnose-view" style="display:none;flex:1;overflow:auto;padding:14px 16px"></div>
       </div>
     </div>
 
@@ -624,6 +626,8 @@ function showDoneState(data) {
   set('tab-missed-ct',  data.missed_count  != null ? `(${data.missed_count})`  : '');
   set('tab-extra-ct',   data.extra_count   != null ? `(${data.extra_count})`   : '');
   set('tab-matched-ct', data.matched_count != null ? `(${data.matched_count})` : '');
+  set('tab-diagnose-ct', data.missed_count != null ? `(${data.missed_count})` : '');
+  delete _diagnoseCache[data.doc_key];  // clear stale diagnose cache on new result
 
   // Populate collapsed log
   if (data.logs && data.logs.length) {
@@ -636,7 +640,7 @@ function showDoneState(data) {
   const t = truthCache[data.doc_key];
   set('tab-truth-ct', t ? `(${t.count})` : '');
 
-  ['missed','extra','matched','json','truth'].forEach(tab => {
+  ['missed','extra','matched','diagnose','json','truth'].forEach(tab => {
     const el = document.getElementById('tab-'+tab);
     if (el) el.classList.toggle('active', tab === currentTab);
   });
@@ -647,9 +651,12 @@ function _applyTabView(data) {
   const tbl = document.getElementById('street-table');
   const jv  = document.getElementById('json-view');
   const tv  = document.getElementById('truth-view');
-  tbl.style.display = (currentTab === 'json' || currentTab === 'truth') ? 'none' : '';
-  jv.style.display  = currentTab === 'json'  ? 'block' : 'none';
-  tv.style.display  = currentTab === 'truth' ? 'block' : 'none';
+  const dv  = document.getElementById('diagnose-view');
+  const specialTab = currentTab === 'json' || currentTab === 'truth' || currentTab === 'diagnose';
+  tbl.style.display = specialTab ? 'none' : '';
+  jv.style.display  = currentTab === 'json'      ? 'block' : 'none';
+  tv.style.display  = currentTab === 'truth'     ? 'block' : 'none';
+  dv.style.display  = currentTab === 'diagnose'  ? 'flex'  : 'none';
   if (currentTab === 'json') {
     document.getElementById('json-pre').textContent = JSON.stringify(data || selectedResults, null, 2);
   } else if (currentTab === 'truth') {
@@ -657,6 +664,8 @@ function _applyTabView(data) {
     document.getElementById('truth-pre-done').textContent = t ? JSON.stringify(t.streets, null, 2) : 'Loading…';
     if (!t && selectedDoc) fetch(`/eval/truth/${encodeURIComponent(selectedDoc)}`)
       .then(r=>r.json()).then(d=>{ truthCache[selectedDoc]=d; document.getElementById('truth-pre-done').textContent=JSON.stringify(d.streets,null,2); });
+  } else if (currentTab === 'diagnose') {
+    loadDiagnose(selectedDoc);
   } else {
     renderStreetTable();
   }
@@ -684,11 +693,97 @@ function updateRunningHeader(p) {
 
 function switchTab(tab) {
   currentTab = tab;
-  ['missed','extra','matched','json','truth'].forEach(t => {
+  ['missed','extra','matched','diagnose','json','truth'].forEach(t => {
     const el = document.getElementById('tab-'+t);
     if (el) el.classList.toggle('active', t === tab);
   });
   _applyTabView(selectedResults);
+}
+
+// ── Diagnose ─────────────────────────────────────────────────────────────────
+const _diagnoseCache = {};
+
+async function loadDiagnose(docKey) {
+  const dv = document.getElementById('diagnose-view');
+  if (!docKey) { dv.innerHTML = '<p style="color:#666;padding:20px">Select a document first</p>'; return; }
+  if (_diagnoseCache[docKey]) { renderDiagnose(_diagnoseCache[docKey]); return; }
+  dv.innerHTML = '<p style="color:#666;padding:20px">Loading diagnoses…</p>';
+  try {
+    const res = await fetch(`/eval/diagnose/${encodeURIComponent(docKey)}`);
+    const data = await res.json();
+    if (data.error) {
+      dv.innerHTML = `<p style="color:var(--red);padding:20px">⚠ ${esc(data.error)}</p>`;
+      return;
+    }
+    _diagnoseCache[docKey] = data;
+    renderDiagnose(data);
+  } catch(e) {
+    dv.innerHTML = `<p style="color:var(--red);padding:20px">Error: ${e.message}</p>`;
+  }
+}
+
+const REASON_LABELS = {
+  not_found_in_docai:    { icon: '🚫', label: 'Not in DocAI output', color: '#ef4444' },
+  row_merged:            { icon: '🔀', label: 'Row merged by DocAI',  color: '#f59e0b' },
+  extracted_wrong_field: { icon: '↔️', label: 'Wrong field mapping',  color: '#8b5cf6' },
+  from_to_missing:       { icon: '❓', label: 'From/To missing',      color: '#6b7280' },
+  col_map_or_parse_error:{ icon: '⚙️', label: 'Parse/col-map error',  color: '#3b82f6' },
+};
+
+function renderDiagnose(data) {
+  const dv = document.getElementById('diagnose-view');
+
+  // Summary bar
+  const reasons = {};
+  data.diagnoses.forEach(d => { reasons[d.reason] = (reasons[d.reason]||0)+1; });
+  const summaryHtml = Object.entries(reasons).sort((a,b)=>b[1]-a[1]).map(([r,n])=>{
+    const m = REASON_LABELS[r] || {icon:'?', label:r, color:'#888'};
+    return `<span style="margin-right:16px;font-size:12px">${m.icon} <b>${n}</b> ${m.label}</span>`;
+  }).join('');
+
+  const rows = data.diagnoses.map((d,i) => {
+    const m = REASON_LABELS[d.reason] || {icon:'?', label:d.reason, color:'#888'};
+    const ms = d.missed;
+    const hits = d.raw_hits || [];
+    const hitsHtml = hits.length ? hits.map(h => {
+      const hdr = (h.headers||[]).join(' | ') || '(no header)';
+      const rowCells = (h.row||[]).map((c,ci) => {
+        const isMatch = ci === h.col_idx;
+        return `<span style="${isMatch?'background:#f59e0b22;color:#f59e0b;font-weight:600':'color:#a0a0b8'};padding:2px 6px;border-radius:3px;margin:1px;display:inline-block;font-size:11px">${esc(c||'—')}</span>`;
+      }).join('');
+      return `
+        <div style="background:#1a1a2e;border-radius:6px;padding:10px;margin:6px 0;font-size:11px">
+          <div style="color:#5a5a8a;margin-bottom:4px">p.${h.page} · table ${h.table_idx} · row ${h.row_idx} — <span style="color:#7a7aaa">${esc(hdr)}</span></div>
+          <div style="line-height:2">${rowCells}</div>
+          <div style="color:#5a5a8a;margin-top:4px">main=${Math.round(h.main_score*100)}% from=${Math.round(h.from_score*100)}% to=${Math.round(h.to_score*100)}%</div>
+        </div>`;
+    }).join('') : '<div style="color:#5a5a8a;font-size:11px;padding:6px 0">No matching cells found in raw DocAI output</div>';
+
+    return `
+      <div style="border:1px solid #2a2a3e;border-radius:8px;margin-bottom:10px;overflow:hidden">
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:#12121e;cursor:pointer"
+             onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
+          <span style="font-size:16px">${m.icon}</span>
+          <div style="flex:1;min-width:0">
+            <div style="font-weight:600;font-size:13px;color:#e0e0f0">${esc(ms.main_street||'—')}</div>
+            <div style="font-size:11px;color:#6a6a8a">${esc(ms.from_street||'')} ${ms.to_street?'→ '+esc(ms.to_street):''}</div>
+          </div>
+          <span style="font-size:11px;color:${m.color};font-weight:600;white-space:nowrap">${m.label}</span>
+          <span style="color:#5a5a8a;font-size:12px">${hits.length ? hits.length+' hit'+(hits.length>1?'s':'') : 'no hits'} ▾</span>
+        </div>
+        <div style="display:none;padding:10px 14px;background:#0e0e1a">${hitsHtml}</div>
+      </div>`;
+  }).join('');
+
+  dv.innerHTML = `
+    <div style="width:100%">
+      <div style="padding:12px 16px 6px;border-bottom:1px solid #1e1e2e;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span style="font-weight:600;color:#e0e0f0">${data.missed_count} missed streets</span>
+        <span style="color:#5a5a8a">·</span>
+        ${summaryHtml}
+      </div>
+      <div style="padding:12px 16px;overflow-y:auto;flex:1">${rows || '<div style="color:#5a5a8a;padding:20px">Nothing missed — perfect score!</div>'}</div>
+    </div>`;
 }
 
 function runFromPanel() {

@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pdfplumber
+import shutil
 from fastapi import APIRouter
 from fastapi.responses import FileResponse
 
@@ -222,6 +223,12 @@ def _run_eval(job_id: str, doc_key: str, force_reparse: bool):
             if doc_id in docs_store:
                 del docs_store[doc_id]
 
+            # Persist raw DocAI output keyed by doc_key for the diagnose endpoint
+            raw_src = os.path.join(BASE_DIR, f"docai_raw_{doc_id}.json")
+            raw_dst = os.path.join(CACHE_DIR, doc_key + "_docai_raw.json")
+            if os.path.exists(raw_src):
+                shutil.move(raw_src, raw_dst)
+
             with open(parser_cache, "w") as f:
                 json.dump(parsed, f, indent=2)
             log(f"✓ {len(parsed)} streets extracted", "success")
@@ -334,13 +341,137 @@ async def get_results(doc_key: str):
 @router.delete("/cache/{doc_key:path}")
 async def clear_cache(doc_key: str):
     cleared = []
-    for path in [_parser_cache_path(doc_key), _eval_cache_path(doc_key)]:
+    raw_path = os.path.join(CACHE_DIR, doc_key + "_docai_raw.json")
+    for path in [_parser_cache_path(doc_key), _eval_cache_path(doc_key), raw_path]:
         if os.path.exists(path):
             os.remove(path)
             cleared.append(os.path.basename(path))
     if doc_key in _results:
         del _results[doc_key]
     return {"cleared": cleared}
+
+
+def _docai_raw_path(doc_key):
+    return os.path.join(CACHE_DIR, doc_key + "_docai_raw.json")
+
+
+def _street_tokens(text: str) -> set:
+    """Normalize and tokenize a street name for fuzzy search."""
+    import re
+    s = re.sub(r"[^\w\s]", " ", str(text or "").upper())
+    return set(s.split()) - {"TO", "FROM", "THE", "AND", "OR", "AT", "OF"}
+
+
+def _cell_matches(cell: str, tokens: set) -> float:
+    """Return overlap ratio between cell tokens and query tokens."""
+    if not tokens or not cell:
+        return 0.0
+    cell_tokens = _street_tokens(cell)
+    if not cell_tokens:
+        return 0.0
+    overlap = len(tokens & cell_tokens)
+    return overlap / len(tokens)
+
+
+@router.get("/diagnose/{doc_key:path}")
+async def diagnose(doc_key: str):
+    """For each missed street, find the raw DocAI block that should contain it."""
+    raw_path = _docai_raw_path(doc_key)
+    eval_path = _eval_cache_path(doc_key)
+
+    if not os.path.exists(eval_path):
+        return {"error": "No eval results — run eval first"}
+    if not os.path.exists(raw_path):
+        return {"error": "No raw DocAI data — re-run eval with force_reparse to generate it"}
+
+    with open(eval_path) as f:
+        eval_data = json.load(f)
+    with open(raw_path) as f:
+        raw = json.load(f)  # { "104": [{"header_rows": [...], "body_rows": [...]}] }
+
+    missed = eval_data.get("missed", [])
+    extra = eval_data.get("extra", [])
+    parsed = eval_data.get("matched", [])
+
+    # Build a lookup: parsed main_street tokens → parsed record
+    extra_index = []
+    for s in extra:
+        ms = s.get("main_street") or ""
+        extra_index.append((_street_tokens(ms), s))
+
+    diagnoses = []
+    for missed_street in missed:
+        ms = missed_street.get("main_street", "")
+        fr = missed_street.get("from_street", "")
+        to = missed_street.get("to_street", "")
+        query_tokens = _street_tokens(ms)
+
+        # Search every raw DocAI cell for a match
+        found_in_raw = []
+        for page_str, tables in raw.items():
+            page_num = int(page_str)
+            for tbl_idx, tbl in enumerate(tables):
+                headers = tbl.get("header_rows", [])
+                header_flat = [" | ".join(h for h in row if h) for row in headers]
+                for row_idx, row in enumerate(tbl.get("body_rows", [])):
+                    for col_idx, cell in enumerate(row):
+                        score = _cell_matches(cell, query_tokens)
+                        if score >= 0.6:
+                            # Check if this row also contains from/to clues
+                            row_text = " ".join(row)
+                            from_score = _cell_matches(row_text, _street_tokens(fr)) if fr else 0
+                            to_score   = _cell_matches(row_text, _street_tokens(to)) if to else 0
+                            found_in_raw.append({
+                                "page": page_num,
+                                "table_idx": tbl_idx,
+                                "row_idx": row_idx,
+                                "col_idx": col_idx,
+                                "headers": header_flat,
+                                "row": row,
+                                "main_score": round(score, 2),
+                                "from_score": round(from_score, 2),
+                                "to_score":   round(to_score, 2),
+                            })
+
+        # Sort by combined relevance
+        found_in_raw.sort(key=lambda x: -(x["main_score"] + x["from_score"] + x["to_score"]))
+        found_in_raw = found_in_raw[:5]  # top 5 hits
+
+        # Determine miss reason
+        if not found_in_raw:
+            reason = "not_found_in_docai"
+        else:
+            best = found_in_raw[0]
+            best_row = " ".join(best["row"])
+            row_suffix_ct = sum(
+                1 for w in best_row.upper().split()
+                if w in {"ST", "AV", "AVE", "DR", "CT", "RD", "LN", "PL", "BL", "WY", "WAY", "CIR", "TER", "ML", "BLVD"}
+            )
+            # Check if it appeared as an extra (wrong field mapping)
+            in_extra = any(
+                len(et & query_tokens) / max(len(query_tokens), 1) >= 0.6
+                for et, _ in extra_index
+            )
+            if in_extra:
+                reason = "extracted_wrong_field"
+            elif row_suffix_ct >= 4:
+                reason = "row_merged"
+            elif best["main_score"] >= 0.8 and not found_in_raw[0]["from_score"]:
+                reason = "from_to_missing"
+            else:
+                reason = "col_map_or_parse_error"
+
+        diagnoses.append({
+            "missed": missed_street,
+            "reason": reason,
+            "raw_hits": found_in_raw,
+        })
+
+    return {
+        "doc_key": doc_key,
+        "missed_count": len(missed),
+        "diagnoses": diagnoses,
+    }
 
 
 @router.get("/truth/{doc_key:path}")

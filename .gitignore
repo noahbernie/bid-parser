@@ -6,3 +6,4 @@ venv/
 *.pdf
 bid-parser-*.json
 tests/cache/
+docai_raw_eval_*.json

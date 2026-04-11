@@ -704,6 +704,60 @@ def call_gemini_image(prompt: str, b64_image: str, max_retries: int = 4, log_fn=
     raise Exception("Gemini max retries exceeded")
 
 
+def call_vision_with_retry(prompt: str, b64_image: str, max_tokens: int = 512, max_retries: int = 6, log_fn=None) -> dict:
+    """Call Haiku Vision with Gemini Flash fallback on rate limits — alternates between models."""
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}" if gemini_key else None
+
+    with _LLM_SEMAPHORE:
+        for attempt in range(max_retries):
+            use_gemini = (attempt % 2 == 1) and gemini_url
+            try:
+                if not use_gemini:
+                    client = anthropic.Anthropic(api_key=anthropic_key)
+                    msg = client.messages.create(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=max_tokens,
+                        temperature=0,
+                        messages=[{"role": "user", "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64_image}},
+                            {"type": "text", "text": prompt},
+                        ]}],
+                    )
+                    return _parse_llm_json(msg.content[0].text.strip())
+                else:
+                    payload = json.dumps({
+                        "contents": [{"parts": [
+                            {"text": prompt},
+                            {"inline_data": {"mime_type": "image/png", "data": b64_image}},
+                        ]}],
+                        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0},
+                    }).encode()
+                    req = urllib.request.Request(gemini_url, data=payload, headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=120) as resp:
+                        data = json.loads(resp.read())
+                    raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    return _parse_llm_json(raw)
+            except anthropic.RateLimitError:
+                if log_fn:
+                    log_fn(f"  ⚠ Haiku Vision rate limit (attempt {attempt+1}) — switching to Gemini...")
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    if log_fn:
+                        log_fn(f"  ⚠ Gemini Vision rate limit (attempt {attempt+1}) — switching to Haiku...")
+                elif attempt < max_retries - 1:
+                    time.sleep(3)
+                else:
+                    raise
+            except Exception:
+                if attempt < max_retries - 1:
+                    time.sleep(3)
+                else:
+                    raise
+    raise Exception("Vision max retries exceeded (both Haiku and Gemini rate limited)")
+
+
 # ─── Document AI Layout Parser ───────────────────────────────────────────────
 DOCAI_PROJECT      = "bid-parser-492923"
 DOCAI_LOCATION     = "us"
@@ -1434,32 +1488,64 @@ Do not invent names — only use the exact text from the merged cell."""
     }
 
     def _heuristic_is_street_table(header_rows, body_rows):
-        """Free instant check — returns True if table looks street-related."""
+        """Free instant check — returns True if table looks street-related.
+        Checks headers for keywords AND scans body cells for street suffixes.
+        Very permissive — only rejects tables with zero street signals."""
+        # Check all header cells for street-related keywords
         header_text = " ".join(c.upper() for row in header_rows for c in row if c)
+        # Also include first body row (DocAI sometimes puts headers there)
+        if body_rows:
+            header_text += " " + " ".join(c.upper() for c in body_rows[0] if c)
         if any(kw in header_text for kw in _STREET_TABLE_HEADER_KW):
             return True
-        hits = 0
-        for row in body_rows[:10]:
+        # Scan ALL body rows for any street suffix — even one hit is enough
+        for row in body_rows:
             for cell in row:
-                hits += sum(1 for w in str(cell or "").upper().split() if w in _BODY_SUFFIXES)
-                if hits >= 3:
+                words = str(cell or "").upper().split()
+                if any(w in _BODY_SUFFIXES for w in words):
                     return True
         return False
 
     _HAIKU_IS_STREET_TABLE_PROMPT = (
-        "Look at this table (header + first few rows). "
-        "Is this a road/street construction work schedule table listing streets where work will be performed? "
+        "Look at this table from a road construction bid document (header + first few rows). "
+        "Does this table contain a list of streets, roads, or intersections where pavement work will be performed? "
+        "Answer YES if it lists street names, cross streets, or work locations — even if column headers are unusual or merged. "
+        "Answer NO only if it is clearly a cost estimate, test specification, materials table, legal boilerplate, or contains no street names at all. "
+        "When in doubt, answer YES. "
         'Reply with ONLY valid JSON: {"is_street_table": true} or {"is_street_table": false}'
     )
 
-    def _haiku_confirms_street_table(header_rows, body_rows):
-        """Cheap Haiku/Gemini call — returns True if confirmed street table."""
-        sample = {"header_rows": header_rows, "body_rows": body_rows[:5]}
+    def _haiku_confirms_street_table(header_rows, body_rows, page_num):
+        """Haiku Vision call — is this a street table? Fails open. Cached per header signature."""
+        # Include first body row in cache key — tables with empty headers need body content to distinguish
+        body_sample = tuple(tuple(r) for r in body_rows[:2])
+        header_key = ("street_check",) + tuple(tuple(r) for r in header_rows) + body_sample
+        with _header_cache_lock:
+            if header_key in _vision_header_cache:
+                return _vision_header_cache[header_key]
+
         try:
-            result = call_gemini_text(_HAIKU_IS_STREET_TABLE_PROMPT, json.dumps(sample, ensure_ascii=False), log_fn=log)
-            return bool(result.get("is_street_table", False))
+            b64_img = render_page_as_image(pdf_bytes, max(0, page_num - 1))
         except Exception as e:
-            log(f"  ⚠ Street-table check failed: {e} — assuming yes")
+            log(f"  ⚠ Could not render page {page_num} for street-table check: {e} — assuming yes")
+            return True
+
+        sample = {"header_rows": header_rows, "body_rows": body_rows[:5]}
+        text = json.dumps(sample, ensure_ascii=False)
+        try:
+            log(f"  🔎 Page {page_num}: Vision — is this a street table?")
+            result = call_vision_with_retry(
+                _HAIKU_IS_STREET_TABLE_PROMPT + "\n\n" + text,
+                b64_img, max_tokens=64, log_fn=log,
+            )
+            verdict = bool(result.get("is_street_table", True))
+            if not verdict:
+                log(f"  ⏭ Page {page_num}: Haiku says not a street table — headers={str(header_rows[:1])[:100]}")
+            with _header_cache_lock:
+                _vision_header_cache[header_key] = verdict
+            return verdict
+        except Exception as e:
+            log(f"  ⚠ Street-table check failed p.{page_num}: {e} — assuming yes")
             return True  # fail open
 
     # ── Call 1: Haiku Vision — confirm column mapping from image + sample rows ─
@@ -1491,7 +1577,7 @@ Return ONLY valid JSON:
                 return cached
 
         try:
-            b64_img = render_page_as_image(pdf_bytes, page_num)
+            b64_img = render_page_as_image(pdf_bytes, max(0, page_num - 1))
         except Exception as e:
             log(f"  ⚠ Could not render page {page_num} for vision: {e}")
             return {}
@@ -1500,18 +1586,8 @@ Return ONLY valid JSON:
         prompt = _HEADER_CONFIRM_PROMPT.replace("{table_sample}", json.dumps(sample, ensure_ascii=False, indent=2))
 
         try:
-            log(f"  👁 Page {page_num}: confirming headers with Haiku Vision...")
-            client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-            msg = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=256,
-                temperature=0,
-                messages=[{"role": "user", "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64_img}},
-                    {"type": "text", "text": prompt},
-                ]}],
-            )
-            result = _parse_llm_json(msg.content[0].text.strip())
+            log(f"  👁 Page {page_num}: confirming headers with Vision...")
+            result = call_vision_with_retry(prompt, b64_img, max_tokens=256, log_fn=log)
             log(f"  ✓ Vision: main={result.get('main_col')} from={result.get('from_col')} to={result.get('to_col')} — {result.get('notes','')}")
             with _header_cache_lock:
                 _vision_header_cache[header_key] = result
@@ -1539,10 +1615,12 @@ Rules:
 CRITICAL — STACKED ROWS: When a cell contains multiple street names merged together, extract EACH as a separate segment. Positions match across columns:
   Street cell: "ADAGIO ADELANTE"
   Limits cell: "SAN MARINO to MONTELEGRO LACONIA to PRIMAVERA"
-  → TWO segments: {ADAGIO, SAN MARINO, MONTELEGRO} and {ADELANTE, LACONIA, PRIMAVERA}
+  → TWO segments: {{ADAGIO, SAN MARINO, MONTELEGRO}} and {{ADELANTE, LACONIA, PRIMAVERA}}
+
+- If from_col and to_col are the same index, that column contains a merged LIMITS cell like "MAIN ST to BROADWAY" — split on " to " or " TO " to get from_street and to_street.
 
 Return ONLY valid JSON, no markdown:
-{"streets": [{"main_street": "...", "from_street": "...", "to_street": "..."}]}"""
+{{"streets": [{{"main_street": "...", "from_street": "...", "to_street": "..."}}]}}"""
 
     def _extract_chunks_with_opus(header_rows, body_rows, confirmed_cols, page_num):
         """Send body rows in chunks of 25 to Opus with confirmed col mapping."""
@@ -1597,6 +1675,13 @@ Return ONLY valid JSON, no markdown:
 
     # ── Main extraction loop ──────────────────────────────────────────────────
 
+    total_doc_pages  = doc["total_pages"]
+    total_tables     = sum(len(v) for v in all_page_tables.values())
+    skipped_heuristic = 0
+    skipped_haiku     = 0
+    sent_to_opus      = 0
+    opus_pages        = set()
+
     log("🤖 Extracting streets with new pipeline (filter → vision headers → Opus chunks)...")
     for page_num in sorted(all_page_tables.keys()):
         for table_tuple in all_page_tables[page_num]:
@@ -1604,27 +1689,30 @@ Return ONLY valid JSON, no markdown:
             if not body_rows:
                 continue
 
-            # Stage 1: free heuristic filter
-            if not _heuristic_is_street_table(header_rows, body_rows):
-                log(f"  ⏭ Page {page_num}: skipped (heuristic — not a street table)")
-                continue
-
-            # Stage 2: cheap LLM confirmation
-            if not _haiku_confirms_street_table(header_rows, body_rows):
-                log(f"  ⏭ Page {page_num}: skipped (Haiku confirmed not a street table)")
+            # Stage 1: Haiku Vision — is this a street table?
+            if not _haiku_confirms_street_table(header_rows, body_rows, page_num):
+                skipped_haiku += 1
                 continue
 
             # Stage 3: Haiku Vision confirms column mapping (cached per header signature)
             confirmed_cols = _confirm_headers_with_vision(header_rows, body_rows, page_num)
             if not confirmed_cols or confirmed_cols.get("main_col") is None:
                 log(f"  ⚠ Page {page_num}: vision could not confirm headers — falling back to full Opus")
-                # Fallback: send full table to Opus without col hints
                 confirmed_cols = {"main_col": 0, "from_col": 1, "to_col": 2}
 
             # Stage 4: Opus extracts streets in chunks
+            sent_to_opus += 1
+            opus_pages.add(page_num)
             extracted = _extract_chunks_with_opus(header_rows, body_rows, confirmed_cols, page_num)
             log(f"  ✓ Page {page_num}: {len(extracted)} total streets extracted")
             all_streets.extend(extracted)
+
+    log(
+        f"📊 Filter summary — doc pages: {total_doc_pages} | "
+        f"tables found by DocAI: {total_tables} | "
+        f"skipped (Haiku): {skipped_haiku} | "
+        f"sent to Opus: {sent_to_opus} tables on {len(opus_pages)} pages"
+    )
 
     # --- Step 4: Deduplication ---
     _SUFFIX_MAP = {

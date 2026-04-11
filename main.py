@@ -1065,21 +1065,15 @@ Headers:"""
     STREET_SUFFIXES = {"RD", "AV", "AVE", "DR", "LN", "CT", "PL", "ST", "BL", "BLVD", "WY", "WAY",
                         "TR", "TRL", "CIR", "TER", "ML", "HWY", "PKWY", "FWY"}
 
-    # Max suffixes before we consider a cell too large to reliably unscramble via LLM.
-    # Cells with >6 suffixes are typically DocAI stacking many rows — the LLM output is unreliable.
-    _MAX_UNSCRAMBLE_SUFFIXES = 6
+    # Max suffixes before we switch from positional unscramble to flexible LLM splitter.
+    # Cells with >10 suffixes are too large for "split into exactly N rows" prompting.
+    _MAX_UNSCRAMBLE_SUFFIXES = 10
 
     def _looks_merged(cell: str, ms_idx: int, fr_idx, to_idx) -> bool:
         """Return True if a cell looks like multiple street names jammed together."""
         words = cell.strip().split()
-        # Trigger 1: multiple street suffixes found
         suffix_count = sum(1 for w in words if w.upper() in STREET_SUFFIXES)
-        if suffix_count > 1:
-            return True
-        # Trigger 2: too many words to be a single street name (>5 words = almost certainly merged)
-        if len(words) > 5:
-            return True
-        return False
+        return suffix_count > 1
 
     def _unscramble_row_with_llm(row: list, col_map: dict, page_num: int) -> list:
         """Send a merged row to Claude Haiku to split it into individual street records."""
@@ -1253,16 +1247,36 @@ Cell: """
                 _main_stripped.upper() in {"STREET NAME", "STREET", "ROAD", "ROADWAY", "MAIN STREET"}
             ):
                 continue
-            # If the main cell has two streets merged (e.g. "COLUMBIA ST FORDHAM AV"),
-            # split at the first street suffix boundary. Skip merged-row detection for this case.
             from_val = get(fr_idx)
             to_val = None
+
+            # ── Row-merge detection (all column modes except triple_merged) ──────
+            # DocAI sometimes stacks multiple table rows into one body_row.
+            # Detect via multiple street suffixes in the main_street cell.
+            # split_from_main rows normally have 2 suffixes (main + from), so require 3+.
+            if not col_map.get("triple_merged"):
+                _merge_thresh = 3 if split_from_main else 2
+                main_suffix_ct = sum(1 for w in main_cell.split() if w.upper() in STREET_SUFFIXES)
+                if main_suffix_ct >= _merge_thresh:
+                    if main_suffix_ct <= _MAX_UNSCRAMBLE_SUFFIXES and (fr_idx is not None or to_idx is not None):
+                        streets.extend(_unscramble_row_with_llm(row, col_map, page_num))
+                    else:
+                        # Too many stacked rows for positional unscramble — use flexible splitter
+                        cell_parts = [main_cell]
+                        if fr_idx is not None and fr_idx < len(row) and row[fr_idx].strip():
+                            cell_parts.append(row[fr_idx])
+                        if to_idx is not None and to_idx < len(row) and row[to_idx].strip():
+                            cell_parts.append(row[to_idx])
+                        streets.extend(_split_triple_merged_cell(" | ".join(p for p in cell_parts if p), page_num))
+                    continue
+
             if split_from_main:
                 words = main.split()
                 split_at = next((wi for wi, w in enumerate(words) if w.upper() in STREET_SUFFIXES), None)
                 if split_at is not None and split_at < len(words) - 1:
                     from_val = " ".join(words[split_at + 1:])
                     main = " ".join(words[:split_at + 1])
+                to_val = get(to_idx)  # read END column (was missing before)
             elif split_from_to and from_val:
                 # Split "Perris Bl Lasselle St" → from="Perris Bl", to="Lasselle St"
                 words = from_val.split()
@@ -1272,16 +1286,6 @@ Cell: """
                     from_val = " ".join(words[:split_at + 1])
             else:
                 to_val = get(to_idx)
-                # Only unscramble if we have cross-street columns to split into.
-                # Skip if the cell has too many suffixes — DocAI stacking too many rows to reliably split.
-                if _looks_merged(main_cell, ms_idx, fr_idx, to_idx) and (fr_idx is not None or to_idx is not None):
-                    suffix_ct = sum(1 for w in main_cell.split() if w.upper() in STREET_SUFFIXES)
-                    if suffix_ct > _MAX_UNSCRAMBLE_SUFFIXES:
-                        log(f"  ⚠️ Page {page_num}: skipping over-stacked cell ({suffix_ct} suffixes) — too complex to unscramble")
-                        continue
-                    unscrambled = _unscramble_row_with_llm(row, col_map, page_num)
-                    streets.extend(unscrambled)
-                    continue
             streets.append({
                 "main_street": main,
                 "from_street": from_val,

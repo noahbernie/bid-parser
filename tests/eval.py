@@ -35,11 +35,31 @@ _SUFFIX_MAP = {
     "AVE": "AV",    "BLVD": "BL",   "PKWY": "PKWY",
 }
 
+# Cyrillic/Greek lookalikes that DocAI OCR sometimes emits instead of Latin chars
+# e.g. "ALMERIA СТ" (Cyrillic С+Т) instead of "ALMERIA CT", "CAM JONAΤΑ" (Greek τ)
+_UNICODE_CONFUSABLES = str.maketrans({
+    '\u0410': 'A',  # Cyrillic А → A
+    '\u0412': 'B',  # Cyrillic В → B
+    '\u0421': 'C',  # Cyrillic С → C
+    '\u0415': 'E',  # Cyrillic Е → E
+    '\u041a': 'K',  # Cyrillic К → K
+    '\u041c': 'M',  # Cyrillic М → M
+    '\u041d': 'H',  # Cyrillic Н → H
+    '\u041e': 'O',  # Cyrillic О → O
+    '\u0420': 'R',  # Cyrillic Р → R
+    '\u0422': 'T',  # Cyrillic Т → T
+    '\u0425': 'X',  # Cyrillic Х → X
+    '\u0441': 'c',  # Cyrillic с (lowercase) → c
+    '\u03c4': 't',  # Greek τ (tau) → t
+    '\u03b1': 'a',  # Greek α (alpha) → a
+})
+
 def norm(v) -> str:
     if not v:
         return ""
     s = re.sub(r"\s+", " ", str(v).strip().upper())
-    s = s.replace("-", " ")  # normalize hyphens to spaces so "CDS-WEST END" == "CDS - WEST END"
+    s = s.translate(_UNICODE_CONFUSABLES)  # replace Cyrillic/Greek lookalikes with Latin
+    s = s.replace("-", " ")  # normalize hyphens so "CDS-WEST END" == "CDS - WEST END"
     s = re.sub(r"[^\w\s]", "", s)
     parts = s.split()
     if parts and parts[-1] in _SUFFIX_MAP:

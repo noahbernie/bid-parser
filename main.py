@@ -1056,15 +1056,21 @@ Headers:"""
             val = row[idx] if idx < len(row) else ""
             cell_lines.append(f"{label}: {val}")
 
-        prompt = """These cells from a road construction bid table each contain multiple street names jammed together without delimiters.
-Split them back into individual rows. Each row = one street segment.
-Return ONLY valid JSON: {"rows": [{"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "..."}]}
-Use null for work_type if not present. Do not invent values — only use what is given.
-The values in each cell correspond positionally (1st street name goes with 1st cross street 1, etc).
+        # Count N by looking at suffix count in the main street cell
+        main_cell_val = row[ms_idx] if ms_idx < len(row) else ""
+        n = sum(1 for w in main_cell_val.split() if w.upper() in STREET_SUFFIXES)
+        n = max(n, 2)  # at least 2 if we got here
+
+        prompt = f"""This table row from a road construction bid document has {n} street segments stacked vertically inside each cell.
+The values in each cell are listed top-to-bottom and correspond positionally — the 1st value in Street Name goes with the 1st value in Cross Street 1 and Cross Street 2, etc.
+Split them into exactly {n} individual records.
+Return ONLY valid JSON: {{"rows": [{{"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "..."}}]}}
+Use null for work_type if not present. Do not invent values — only use what is given. Do not merge or skip any.
 
 Cells:
 """
         try:
+            log(f"  🔀 Unscrambling {n} stacked records on page {page_num}...")
             result = call_gemini_text(prompt, "\n".join(cell_lines), log_fn=log)
             rows_out = result.get("rows", [])
             streets = []

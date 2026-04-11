@@ -1169,17 +1169,23 @@ Cells:
                 ]
             else:
                 # No explicit header row from DocAI.
-                # First body row may have format "Column Label\nFirst Data Value" per cell —
-                # extract just the first line of each cell as the column label, then
-                # treat the remaining lines as data for that first row.
-                raw_first = body_rows[0]
+                # Scan up to first 3 rows to find the real header — skip blank/title rows.
+                # A real header row has multiple non-empty cells, none of which look like data values.
+                header_idx = 0
+                for ri, row in enumerate(body_rows[:3]):
+                    non_empty = [c.strip() for c in row if c.strip()]
+                    # Skip if mostly blank or only one cell has content (section title row)
+                    if len(non_empty) <= 1:
+                        continue
+                    # Skip if cells contain digits (data row, not header)
+                    if any(any(ch.isdigit() for ch in c) for c in non_empty):
+                        continue
+                    header_idx = ri
+                    break
+                raw_first = body_rows[header_idx]
                 header_row = [cell.split("\n")[0] for cell in raw_first]
-                # Rebuild first row with header labels stripped, keep only data lines
-                first_data_lines = ["\n".join(cell.split("\n")[1:]) for cell in raw_first]
-                if any(v.strip() for v in first_data_lines):
-                    body_rows = [first_data_lines] + body_rows[1:]
-                else:
-                    body_rows = body_rows[1:]
+                # First data row is right after the header
+                body_rows = body_rows[header_idx + 1:]
 
             col_map = get_col_map(header_row)
             if not col_map:

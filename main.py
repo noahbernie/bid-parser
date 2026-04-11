@@ -976,11 +976,15 @@ Return ONLY valid JSON: {"main_street": <col_index>, "from_street": <col_index>,
 Use 0-based column index. Use null if no matching column exists.
 
 Column roles:
-- main_street: THE STREET BEING WORKED ON (STREET NAME, ROADWAY, or similar)
-- from_street: where work BEGINS (START, FROM, BEGIN, LIMITS FROM, or similar)
-- to_street: where work ENDS (END, TO, TERMINUS, LIMITS TO, or similar)
-- work_type: type of work if present
-- location: location/zone/district number if present
+- main_street: THE STREET BEING WORKED ON. Typical headers: STREET NAME, STREET, ROADWAY, ROAD NAME, LOCATION, PRIMARY STREET
+- from_street: where work BEGINS or the first cross street. Typical headers: FROM, START, BEGIN, LIMITS FROM, CROSS STREET 1, CROSS ST 1, CROSS STREET FROM, INTERSECTING STREET 1, AT (if only one cross street column exists)
+- to_street: where work ENDS or the second cross street. Typical headers: TO, END, TERMINUS, LIMITS TO, CROSS STREET 2, CROSS ST 2, CROSS STREET TO, INTERSECTING STREET 2
+- work_type: type of work if present. Typical headers: WORK TYPE, WORK, TREATMENT, SCOPE, ACTIVITY, DESCRIPTION
+- location: location/zone/district/sequence number if present. Typical headers: LOCATION, LOC, ZONE, DISTRICT, NO, #, SEQ
+
+IMPORTANT: "CROSS STREET 1" always maps to from_street. "CROSS STREET 2" always maps to to_street.
+If there is only one cross-street column (e.g. "CROSS STREET" with no number), map it to from_street.
+If the table has a column that is clearly a street being intersected, even if labeled differently, map it to from_street or to_street.
 
 Headers:"""
 
@@ -992,6 +996,7 @@ Headers:"""
         if key in header_cache:
             return header_cache[key]
         header_text = " | ".join(header_row)
+        log(f"  🔍 Mapping headers: {header_text}")
         try:
             result = call_gemini_text(HEADER_PROMPT_DOCAI, header_text, log_fn=log)
             header_cache[key] = result
@@ -1009,8 +1014,8 @@ Headers:"""
         to_idx = col_map.get("to_street")
         wt_idx = col_map.get("work_type")
         lo_idx = col_map.get("location")
-        if ms_idx is None or (fr_idx is None and to_idx is None):
-            return streets  # can't extract without at least main + one cross street
+        if ms_idx is None:
+            return streets  # can't extract without main street column
         for row in rows:
             def get(idx):
                 if idx is None or idx >= len(row):
@@ -1039,19 +1044,23 @@ Headers:"""
                 continue
             # Find the header row — first row that has recognizable column names
             header_idx = 0
-            for i, row in enumerate(table_rows[:3]):
+            for i, row in enumerate(table_rows[:5]):
                 joined = " ".join(c.upper() for c in row)
-                if any(kw in joined for kw in ["STREET NAME", "STREET", "START", "FROM", "END", "TO"]):
+                if any(kw in joined for kw in ["STREET NAME", "STREET", "CROSS STREET", "ROADWAY", "START", "FROM", "END", "TO", "LIMITS"]):
                     header_idx = i
                     break
             header_row = table_rows[header_idx]
             data_rows = table_rows[header_idx + 1:]
             col_map = get_col_map(header_row)
             if not col_map:
+                log(f"  ⚠️ Page {page_num}: no column map returned, skipping table")
+                continue
+            if col_map.get("main_street") is None:
+                log(f"  ⚠️ Page {page_num}: main_street column not found in map {col_map}, skipping table")
                 continue
             streets = apply_col_map(data_rows, col_map, page_num)
             all_streets.extend(streets)
-            log(f"  ✓ Page {page_num} table: {len(streets)} streets extracted", all_streets[:])
+            log(f"  ✓ Page {page_num} table: {len(data_rows)} rows → {len(streets)} streets extracted (map={col_map})")
 
     # --- Step 4: Deduplication ---
     _SUFFIX_MAP = {

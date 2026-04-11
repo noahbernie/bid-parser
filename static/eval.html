@@ -820,20 +820,26 @@ async function runAll() {
   runAllTotal = toRun.length; runAllDone = 0;
   lbl.style.display = 'inline';
   document.getElementById('overall-bar-wrap').style.display = 'block';
-  for (const d of toRun) {
-    lbl.textContent = `${runAllDone}/${runAllTotal}`;
-    document.getElementById('overall-bar').style.width = Math.round(runAllDone/runAllTotal*100)+'%';
-    await new Promise(resolve => {
-      fetch(`/eval/run?doc_key=${encodeURIComponent(d.key)}`, { method: 'POST' })
-        .then(r => r.json())
-        .then(({ job_id }) => {
-          runningJobs[d.key] = job_id;
-          runningJobProgress[d.key] = {};
-          renderDocList();
-          pollJob(job_id, d.key, () => { runAllDone++; resolve(); });
+
+  // Fire all jobs in parallel, then wait for all to finish
+  await Promise.all(toRun.map(d =>
+    fetch(`/eval/run?doc_key=${encodeURIComponent(d.key)}`, { method: 'POST' })
+      .then(r => r.json())
+      .then(({ job_id }) => {
+        runningJobs[d.key] = job_id;
+        runningJobProgress[d.key] = {};
+        renderDocList();
+        return new Promise(resolve => {
+          pollJob(job_id, d.key, () => {
+            runAllDone++;
+            lbl.textContent = `${runAllDone}/${runAllTotal}`;
+            document.getElementById('overall-bar').style.width = Math.round(runAllDone/runAllTotal*100)+'%';
+            resolve();
+          });
         });
-    });
-  }
+      })
+  ));
+
   btn.disabled = false; lbl.style.display = 'none';
   document.getElementById('overall-bar-wrap').style.display = 'none';
   toast(`Done — ${runAllTotal} docs complete`);

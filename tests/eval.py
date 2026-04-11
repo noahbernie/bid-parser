@@ -39,6 +39,7 @@ def norm(v) -> str:
     if not v:
         return ""
     s = re.sub(r"\s+", " ", str(v).strip().upper())
+    s = s.replace("-", " ")  # normalize hyphens to spaces so "CDS-WEST END" == "CDS - WEST END"
     s = re.sub(r"[^\w\s]", "", s)
     parts = s.split()
     if parts and parts[-1] in _SUFFIX_MAP:
@@ -81,70 +82,77 @@ def load_ground_truth(doc_key: str, col_map: dict) -> list:
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
     all_rows = []
 
-    for tab_name, tab_cfg in cfg.get("tabs", {}).items():
-        if tab_cfg.get("skip"):
-            continue
+    for tab_name, tab_cfg_raw in cfg.get("tabs", {}).items():
+        # tab_cfg can be a single section dict or a list of section dicts
+        sections = tab_cfg_raw if isinstance(tab_cfg_raw, list) else [tab_cfg_raw]
+
         if tab_name not in wb.sheetnames:
             print(f"  ⚠  Tab '{tab_name}' not found in {doc_key}.xlsx")
             continue
 
         ws = wb[tab_name]
-        header_row_idx = tab_cfg.get("header_row", 2)
 
-        # Build column index map from header row
-        col_idx = {}
-        for cell in ws[header_row_idx]:
-            h = _norm_header(cell.value)
-            if h:
-                col_idx[h] = cell.column - 1  # 0-based
-
-        ms_col   = _norm_header(tab_cfg.get("main_street"))
-        from_col = _norm_header(tab_cfg.get("from_street")) if tab_cfg.get("from_street") else None
-        to_col   = _norm_header(tab_cfg.get("to_street"))   if tab_cfg.get("to_street")   else None
-        wt_col   = _norm_header(tab_cfg.get("work_type"))   if tab_cfg.get("work_type")   else None
-        lim_col  = _norm_header(tab_cfg.get("limits_col"))  if tab_cfg.get("limits_col")  else None
-
-        if ms_col not in col_idx:
-            print(f"  ⚠  main_street col '{ms_col}' not found in tab '{tab_name}' — skipping tab")
-            continue
-
-        data_start = tab_cfg.get("data_start_row", header_row_idx + 1)
-        for row in ws.iter_rows(min_row=data_start, values_only=True):
-            vals = list(row)
-
-            def get(col_name):
-                if not col_name or col_name not in col_idx:
-                    return ""
-                idx = col_idx[col_name]
-                return str(vals[idx]).strip() if idx < len(vals) and vals[idx] is not None else ""
-
-            main = get(ms_col)
-            if not main or main in ("None", ""):
-                continue
-            # Skip repeated header rows (second table within same tab)
-            if norm(main) == norm(ms_col) or norm(main) in ("STREET NAME", "STREET", "NAME"):
+        for tab_cfg in sections:
+            if tab_cfg.get("skip"):
                 continue
 
-            from_v, to_v = "", ""
-            if lim_col:
-                # "FROM to TO" or "FROM TO TO" combined column
-                limits = get(lim_col)
-                parts = re.split(r"\s+to\s+", limits, maxsplit=1, flags=re.IGNORECASE)
-                from_v = parts[0].strip() if len(parts) > 0 else ""
-                to_v   = parts[1].strip() if len(parts) > 1 else ""
-            else:
-                from_v = get(from_col) if from_col else ""
-                to_v   = get(to_col)   if to_col   else ""
+            header_row_idx = tab_cfg.get("header_row", 2)
 
-            wt = get(wt_col) if wt_col else ""
+            # Build column index map from header row
+            col_idx = {}
+            for cell in ws[header_row_idx]:
+                h = _norm_header(cell.value)
+                if h:
+                    col_idx[h] = cell.column - 1  # 0-based
 
-            all_rows.append({
-                "main_street": main,
-                "from_street": from_v,
-                "to_street":   to_v,
-                "work_type":   wt,
-                "_tab": tab_name,
-            })
+            ms_col   = _norm_header(tab_cfg.get("main_street"))
+            from_col = _norm_header(tab_cfg.get("from_street")) if tab_cfg.get("from_street") else None
+            to_col   = _norm_header(tab_cfg.get("to_street"))   if tab_cfg.get("to_street")   else None
+            wt_col   = _norm_header(tab_cfg.get("work_type"))   if tab_cfg.get("work_type")   else None
+            lim_col  = _norm_header(tab_cfg.get("limits_col"))  if tab_cfg.get("limits_col")  else None
+
+            if ms_col not in col_idx:
+                print(f"  ⚠  main_street col '{ms_col}' not found in tab '{tab_name}' — skipping section")
+                continue
+
+            data_start = tab_cfg.get("data_start_row", header_row_idx + 1)
+            data_end   = tab_cfg.get("data_end_row", None)
+            for row in ws.iter_rows(min_row=data_start, max_row=data_end, values_only=True):
+                vals = list(row)
+
+                def get(col_name):
+                    if not col_name or col_name not in col_idx:
+                        return ""
+                    idx = col_idx[col_name]
+                    return str(vals[idx]).strip() if idx < len(vals) and vals[idx] is not None else ""
+
+                main = get(ms_col)
+                if not main or main in ("None", ""):
+                    continue
+                # Skip repeated header rows (second table within same tab)
+                if norm(main) == norm(ms_col) or norm(main) in ("STREET NAME", "STREET", "NAME"):
+                    continue
+
+                from_v, to_v = "", ""
+                if lim_col:
+                    # "FROM to TO" or "FROM TO TO" combined column
+                    limits = get(lim_col)
+                    parts = re.split(r"\s+to\s+", limits, maxsplit=1, flags=re.IGNORECASE)
+                    from_v = parts[0].strip() if len(parts) > 0 else ""
+                    to_v   = parts[1].strip() if len(parts) > 1 else ""
+                else:
+                    from_v = get(from_col) if from_col else ""
+                    to_v   = get(to_col)   if to_col   else ""
+
+                wt = get(wt_col) if wt_col else ""
+
+                all_rows.append({
+                    "main_street": main,
+                    "from_street": from_v,
+                    "to_street":   to_v,
+                    "work_type":   wt,
+                    "_tab": tab_name,
+                })
 
     return all_rows
 

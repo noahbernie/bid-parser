@@ -11,6 +11,7 @@ import sys
 import threading
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pdfplumber
@@ -37,6 +38,9 @@ router = APIRouter(prefix="/eval")
 
 _jobs    = {}   # job_id  -> job dict
 _results = {}   # doc_key -> serialized result dict
+
+# Dedicated thread pool — one thread per parallel eval job
+_eval_executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="eval")
 
 def _load_cached_results():
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -299,8 +303,9 @@ async def start_eval(doc_key: str, force_reparse: bool = False):
         "progress": {"phase": "loading", "total_pages": 0,
                      "chunks_done": 0, "total_chunks": 0, "streets_found": 0},
     }
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _run_eval, job_id, doc_key, force_reparse)
+    asyncio.get_running_loop().run_in_executor(
+        _eval_executor, _run_eval, job_id, doc_key, force_reparse
+    )
     return {"job_id": job_id}
 
 

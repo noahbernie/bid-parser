@@ -730,7 +730,7 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
     total_pages = len(src)
     src.close()
 
-    CHUNK_SIZE = 15
+    CHUNK_SIZE = 10
     all_tables: dict = {}
 
     def _cell_text(cell) -> str:
@@ -751,11 +751,8 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
         body_rows   = [[_cell_text(cell) for cell in row.cells] for row in table_block.body_rows]
         return header_rows, body_rows
 
-    for chunk_start in range(0, total_pages, CHUNK_SIZE):
-        chunk_end = min(chunk_start + CHUNK_SIZE, total_pages)
-        if log_fn:
-            log_fn(f"  DocAI: pages {chunk_start+1}–{chunk_end} of {total_pages}...")
-
+    def _process_chunk(chunk_start: int, chunk_end: int):
+        """Send one chunk of pages to DocAI and add results to all_tables. Returns True on success."""
         src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         chunk_doc = fitz.open()
         chunk_doc.insert_pdf(src_doc, from_page=chunk_start, to_page=chunk_end - 1)
@@ -772,7 +769,6 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
         layout = doc_obj.document_layout
 
         def _recurse_blocks(blocks):
-            """Walk all blocks recursively, yielding (global_page, rows) for every table found."""
             for block in blocks:
                 has_table = block.table_block.body_rows or block.table_block.header_rows
                 if has_table:
@@ -781,7 +777,6 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
                     header_rows, body_rows = _parse_table_block(block.table_block, chunk_start)
                     if body_rows:
                         yield global_page, (header_rows, body_rows)
-                # recurse into text_block children
                 if block.text_block.text is not None:
                     children = list(block.text_block.blocks)
                     if children:
@@ -789,6 +784,27 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
 
         for global_page, table_tuple in _recurse_blocks(layout.blocks):
             all_tables.setdefault(global_page, []).append(table_tuple)
+
+    for chunk_start in range(0, total_pages, CHUNK_SIZE):
+        chunk_end = min(chunk_start + CHUNK_SIZE, total_pages)
+        if log_fn:
+            log_fn(f"  DocAI: pages {chunk_start+1}–{chunk_end} of {total_pages}...")
+
+        try:
+            _process_chunk(chunk_start, chunk_end)
+        except Exception as chunk_err:
+            # Chunk may be too large (DocAI has a ~40 MB limit per request).
+            # Retry by splitting into sub-chunks of 5 pages each.
+            sub_size = max(1, (chunk_end - chunk_start) // 3)
+            if log_fn:
+                log_fn(f"  ⚠️ DocAI chunk pages {chunk_start+1}–{chunk_end} failed — retrying in {sub_size}-page sub-chunks: {str(chunk_err)[:120]}")
+            for sub_start in range(chunk_start, chunk_end, sub_size):
+                sub_end = min(sub_start + sub_size, chunk_end)
+                try:
+                    _process_chunk(sub_start, sub_end)
+                except Exception as sub_err:
+                    if log_fn:
+                        log_fn(f"    ⚠️ Sub-chunk pages {sub_start+1}–{sub_end} also failed (skipping): {str(sub_err)[:120]}")
 
         # Log summary for this chunk
         chunk_pages = [p for p in all_tables if chunk_start < p <= chunk_end]
@@ -992,9 +1008,10 @@ Return ONLY valid JSON: {"main_street": <col_index>, "from_street": <col_index>,
 Use 0-based column index. Use null if no matching column exists.
 
 Column roles:
-- main_street: THE STREET BEING WORKED ON. Typical headers: STREET NAME, STREET, ROADWAY, ROAD NAME, LOCATION, PRIMARY STREET
-- from_street: where work BEGINS or the first cross street. Typical headers: FROM, START, BEGIN, LIMITS FROM, CROSS STREET 1, CROSS ST 1, CROSS STREET FROM, INTERSECTING STREET 1, AT (if only one cross street column exists)
-- to_street: where work ENDS or the second cross street. Typical headers: TO, END, TERMINUS, LIMITS TO, CROSS STREET 2, CROSS ST 2, CROSS STREET TO, INTERSECTING STREET 2
+- main_street: THE STREET BEING WORKED ON. Typical headers: STREET NAME, STREET, MAIN STREET, ROADWAY, ROAD NAME, ROAD, PRIMARY STREET, STREET/ROAD
+- from_street: where work BEGINS or the first cross street. Typical headers: FROM, START, BEGIN, LIMITS FROM, CROSS STREET 1, CROSS ST 1, CROSS STREET FROM, INTERSECTING STREET 1, AT (if only one cross street column exists), BEGIN LOCATION, START LOCATION
+- to_street: where work ENDS or the second cross street. Typical headers: TO, END, TERMINUS, LIMITS TO, CROSS STREET 2, CROSS ST 2, CROSS STREET TO, INTERSECTING STREET 2, END LOCATION
+- SPECIAL CASE: A column labeled "TO FROM", "FROM TO", or "LIMITS" that contains BOTH endpoints in a single cell should be mapped to from_street (the data will be split later). Do NOT map it to main_street or location.
 - work_type: type of work if present. Typical headers: WORK TYPE, WORK, TREATMENT, SCOPE, ACTIVITY, DESCRIPTION
 - location: location/zone/district/sequence number if present. Typical headers: LOCATION, LOC, ZONE, DISTRICT, NO, #, SEQ
 
@@ -1048,6 +1065,10 @@ Headers:"""
     STREET_SUFFIXES = {"RD", "AV", "AVE", "DR", "LN", "CT", "PL", "ST", "BL", "BLVD", "WY", "WAY",
                         "TR", "TRL", "CIR", "TER", "ML", "HWY", "PKWY", "FWY"}
 
+    # Max suffixes before we consider a cell too large to reliably unscramble via LLM.
+    # Cells with >6 suffixes are typically DocAI stacking many rows — the LLM output is unreliable.
+    _MAX_UNSCRAMBLE_SUFFIXES = 6
+
     def _looks_merged(cell: str, ms_idx: int, fr_idx, to_idx) -> bool:
         """Return True if a cell looks like multiple street names jammed together."""
         words = cell.strip().split()
@@ -1077,9 +1098,12 @@ Headers:"""
             val = row[idx] if idx < len(row) else ""
             cell_lines.append(f"{label}: {val}")
 
-        # Count N by looking at suffix count in the main street cell
+        # Count N by looking at suffix AND prefix markers in the main street cell.
+        # Streets like "PLAZA DOLORES" have no suffix — count PLAZA/VIA/PASEO etc. too.
+        STREET_PREFIXES = {"PLAZA", "VIA", "CALLE", "CAMINO", "PASEO", "AVENIDA", "AVNDA", "CAM"}
         main_cell_val = row[ms_idx] if ms_idx < len(row) else ""
-        n = sum(1 for w in main_cell_val.split() if w.upper() in STREET_SUFFIXES)
+        words_upper = [w.upper() for w in main_cell_val.split()]
+        n = sum(1 for w in words_upper if w in STREET_SUFFIXES or w in STREET_PREFIXES)
         n = max(n, 2)  # at least 2 if we got here
 
         prompt = f"""This table row from a road construction bid document has {n} street segments stacked vertically inside each cell.
@@ -1117,6 +1141,48 @@ Cells:
             log(f"  ✗ Unscramble failed for page {page_num}: {e}")
             return []
 
+    def _split_triple_merged_cell(cell_val: str, page_num: int) -> list:
+        """Split a single merged cell that contains Street Name + Cross Street 1 + Cross Street 2.
+        Also strips work order / asset ID noise (e.g. 'S2624', 'SS-XXXXXX-PV1' tokens).
+        Returns a list of street dicts."""
+        prompt = """This cell from a road construction bid document has one or more road segments merged together.
+Each segment has: main_street (primary road being worked on), from_street (start/first cross street), to_street (end/second cross street).
+
+Rules:
+- Street prefixes like AVNDA, CTE, CAM, VIA, CALLE, CAMINO, PASEO mark the start of a street name.
+- Street suffixes like BL, ST, AV, DR, CT, RD, LN, PL, WY mark the end of a street name.
+- Ignore non-street tokens: work order numbers (like "S2624", "52624", "2624"), and asset IDs (like "SS-XXXXXX-PV1", hyphenated codes starting with SS-).
+- Use "" for missing from_street or to_street.
+- If multiple segments are present, return all of them.
+
+Return ONLY valid JSON: {"records": [{"main_street": "...", "from_street": "...", "to_street": "..."}]}
+Cell: """
+        try:
+            log(f"  🔀 Splitting triple-merged cell on page {page_num}: {cell_val[:60]}...")
+            content_blocks = [{"type": "text", "text": cell_val}]
+            result = call_claude_with_retry(
+                anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY")),
+                prompt, content_blocks, max_tokens=1024,
+                model="claude-haiku-4-5-20251001", log_fn=log
+            )
+            streets = []
+            for r in result.get("records", []):
+                main = (r.get("main_street") or "").strip()
+                if not main:
+                    continue
+                streets.append({
+                    "main_street": main,
+                    "from_street": r.get("from_street") or None,
+                    "to_street":   r.get("to_street") or None,
+                    "work_type":   None,
+                    "source": "docai+llm",
+                    "page": page_num,
+                })
+            return streets
+        except Exception as e:
+            log(f"  ✗ Triple-merge split failed for page {page_num}: {e}")
+            return []
+
     def apply_col_map(rows: list, col_map: dict, page_num: int) -> list:
         """Apply a column index map to data rows, returning street dicts.
         Detects merged multi-value cells and unscrambles them via LLM."""
@@ -1126,27 +1192,100 @@ Cells:
         to_idx = col_map.get("to_street")
         wt_idx = col_map.get("work_type")
         lo_idx = col_map.get("location")
+        split_from_main = (fr_idx == "_SPLIT_FROM_MAIN")
+        if split_from_main:
+            fr_idx = None  # will be derived by splitting the main cell
         if ms_idx is None:
             return streets  # can't extract without main street column
+
+        # Detect if from_street column contains merged FROM+TO values (e.g. "Perris Bl Lasselle St").
+        # This happens with "To From" / "LIMITS" headers where DocAI collapses two columns into one.
+        split_from_to = False
+        if fr_idx is not None and to_idx is None:
+            sample = [row[fr_idx].strip() for row in rows[:5] if fr_idx < len(row) and row[fr_idx].strip()]
+            merged_count = sum(
+                1 for cell in sample
+                if sum(1 for w in cell.split() if w.upper() in STREET_SUFFIXES) >= 2
+            )
+            if merged_count >= 2:
+                split_from_to = True
+                log(f"  🔧 Detected merged from+to column at col {fr_idx} — will split on first suffix")
+
         for row in rows:
+            # Triple-merged column: entire cell contains "Street Name Cross Street1 Cross Street2"
+            # Send straight to LLM to split — no further column-map processing needed.
+            if col_map.get("triple_merged") and ms_idx is not None:
+                cell_val = row[ms_idx].strip() if ms_idx < len(row) else ""
+                if cell_val:
+                    streets.extend(_split_triple_merged_cell(cell_val, page_num))
+                continue
+
             def get(idx):
-                if idx is None or idx >= len(row):
+                if idx is None or not isinstance(idx, int) or idx >= len(row):
                     return None
                 v = row[idx].strip()
                 return None if v.replace(",", "").replace(".", "").isdigit() else (v or None)
             main_cell = row[ms_idx] if ms_idx < len(row) else ""
-            # Only unscramble if we have cross-street columns to split into
-            if _looks_merged(main_cell, ms_idx, fr_idx, to_idx) and (fr_idx is not None or to_idx is not None):
-                unscrambled = _unscramble_row_with_llm(row, col_map, page_num)
-                streets.extend(unscrambled)
-                continue
             main = get(ms_idx)
             if not main:
                 continue
+            # Strip leading sequence number from main_street: "1 COLUMBIA ST" → "COLUMBIA ST"
+            # Handles plan-sheet tables where location# is concatenated with street name.
+            _main_words = main.split()
+            if len(_main_words) >= 2 and _main_words[0].rstrip('.').isdigit():
+                main = " ".join(_main_words[1:])
+            elif len(_main_words) >= 2 and len(_main_words[0]) <= 3 and _main_words[0][0].isalpha() and _main_words[0][1:].isdigit():
+                # handles "A1 VIA MIRALESTE" → "VIA MIRALESTE"
+                main = " ".join(_main_words[1:])
+            if not main:
+                continue
+            # Reject junk rows: numbered/lettered list items ("1.", "2.", "a)", "b)"),
+            # totals/subtotals, and repeated header text.
+            _main_stripped = main.strip()
+            if (
+                # Numbered list: "1." "2." "1)" etc.
+                (_main_stripped[:2].rstrip(').').isdigit()) or
+                # Lettered list: "a)" "b)" "a." etc.
+                (len(_main_stripped) >= 2 and _main_stripped[0].isalpha() and _main_stripped[1] in ').' and _main_stripped[0].islower()) or
+                # Totals/subtotals
+                _main_stripped.upper() in {"TOTAL", "SUBTOTAL", "SUB-TOTAL", "GRAND TOTAL", "TOTAL:", "AVERAGE"} or
+                # Repeated header keywords
+                _main_stripped.upper() in {"STREET NAME", "STREET", "ROAD", "ROADWAY", "MAIN STREET"}
+            ):
+                continue
+            # If the main cell has two streets merged (e.g. "COLUMBIA ST FORDHAM AV"),
+            # split at the first street suffix boundary. Skip merged-row detection for this case.
+            from_val = get(fr_idx)
+            to_val = None
+            if split_from_main:
+                words = main.split()
+                split_at = next((wi for wi, w in enumerate(words) if w.upper() in STREET_SUFFIXES), None)
+                if split_at is not None and split_at < len(words) - 1:
+                    from_val = " ".join(words[split_at + 1:])
+                    main = " ".join(words[:split_at + 1])
+            elif split_from_to and from_val:
+                # Split "Perris Bl Lasselle St" → from="Perris Bl", to="Lasselle St"
+                words = from_val.split()
+                split_at = next((wi for wi, w in enumerate(words) if w.upper() in STREET_SUFFIXES), None)
+                if split_at is not None and split_at < len(words) - 1:
+                    to_val = " ".join(words[split_at + 1:])
+                    from_val = " ".join(words[:split_at + 1])
+            else:
+                to_val = get(to_idx)
+                # Only unscramble if we have cross-street columns to split into.
+                # Skip if the cell has too many suffixes — DocAI stacking too many rows to reliably split.
+                if _looks_merged(main_cell, ms_idx, fr_idx, to_idx) and (fr_idx is not None or to_idx is not None):
+                    suffix_ct = sum(1 for w in main_cell.split() if w.upper() in STREET_SUFFIXES)
+                    if suffix_ct > _MAX_UNSCRAMBLE_SUFFIXES:
+                        log(f"  ⚠️ Page {page_num}: skipping over-stacked cell ({suffix_ct} suffixes) — too complex to unscramble")
+                        continue
+                    unscrambled = _unscramble_row_with_llm(row, col_map, page_num)
+                    streets.extend(unscrambled)
+                    continue
             streets.append({
                 "main_street": main,
-                "from_street": get(fr_idx),
-                "to_street":   get(to_idx),
+                "from_street": from_val,
+                "to_street":   to_val,
                 "work_type":   row[wt_idx].strip() if wt_idx is not None and wt_idx < len(row) else None,
                 "location":    row[lo_idx].strip() if lo_idx is not None and lo_idx < len(row) else None,
                 "source": "docai",
@@ -1169,9 +1308,61 @@ Cells:
                 ]
             else:
                 # No explicit header row from DocAI.
-                # Skip leading title rows (rows with <=1 non-empty cell, e.g. "SLURRY/CAPE SEAL LIST")
-                # then take the next row with multiple non-empty cells as the header.
-                while body_rows and sum(1 for c in body_rows[0] if c.strip()) <= 1:
+                # Skip leading title/section rows and find the first row that looks like a real header.
+                # A real header row contains at least one cell matching a known column keyword.
+                _HEADER_KEYWORDS = {
+                    "STREET", "NAME", "ROAD", "ROADWAY", "FROM", "TO", "BEGIN", "END",
+                    "START", "TERMINUS", "LIMITS", "LOCATION", "CROSS", "WORK", "TREATMENT",
+                    "SCOPE", "ACTIVITY", "TYPE", "DESCRIPTION", "ZONE", "DISTRICT", "WARD",
+                    "SUBZONE", "AT", "SECTION",
+                }
+                def _looks_like_header(row):
+                    if sum(1 for c in row if c.strip()) <= 1:
+                        return False
+                    # A header row has at least one SHORT cell (≤2 words) that IS a keyword,
+                    # OR a cell that exactly matches a known multi-word header phrase.
+                    # This rejects title rows like "SEAL STREET DATA" where "STREET" appears
+                    # inside a descriptive phrase — those are section titles, not column labels.
+                    _EXACT_HEADERS = {
+                        "STREET NAME", "STREET", "ROAD", "ROADWAY", "MAIN STREET",
+                        "FROM", "TO", "BEGIN", "END", "START", "LIMITS", "AT",
+                        "LOCATION", "LOC", "ZONE", "DISTRICT", "WARD", "SUBZONE",
+                        "WORK TYPE", "WORK", "TREATMENT", "SCOPE", "TYPE",
+                        "CROSS STREET", "CROSS STREET 1", "CROSS STREET 2",
+                        "BEGIN LOCATION", "END LOCATION", "NO", "NO.", "#", "SEQ",
+                    }
+                    _HEADER_KW_EXTENDED = _HEADER_KEYWORDS | {
+                        "NAME", "NUMBER", "STREET", "LOC", "ADDR", "ADDRESS",
+                    }
+                    for cell in row:
+                        cu = cell.strip().upper()
+                        # Exact match to known header phrase
+                        if cu in _EXACT_HEADERS:
+                            return True
+                        words = cu.split()
+                        # Single-word keyword
+                        if len(words) == 1 and words[0].strip("().,:#") in _HEADER_KEYWORDS:
+                            return True
+                        # Short cell (≤4 words) where ≥2 are header keywords
+                        # catches "Name Location Street", "Street Name Begin", etc.
+                        if len(words) <= 4:
+                            kw_count = sum(1 for w in words if w.strip("().,:#") in _HEADER_KW_EXTENDED)
+                            if kw_count >= 2:
+                                return True
+                        # Long merged cell (>4 words) with ≥4 keyword matches
+                        # catches "Street Name Cross Street 2 Cross Street 1" (DocAI-merged header)
+                        elif len(words) > 4:
+                            kw_count = sum(1 for w in words if w.strip("().,:#") in _HEADER_KW_EXTENDED)
+                            if kw_count >= 4:
+                                return True
+                    return False
+
+                # Skip up to 10 non-header rows (plan-sheet tables can have many garbage header rows)
+                for _ in range(10):
+                    if not body_rows:
+                        break
+                    if _looks_like_header(body_rows[0]):
+                        break
                     body_rows = body_rows[1:]
                 if not body_rows:
                     continue
@@ -1184,11 +1375,42 @@ Cells:
                 log(f"  ⚠️ Page {page_num}: no column map returned, skipping table")
                 continue
             if col_map.get("main_street") is None:
-                log(f"  ⚠️ Page {page_num}: main_street column not found in map {col_map}, skipping table")
-                continue
-            # If we found main_street but no cross streets, check if header text mentions
-            # "Cross Street" — if so, try to infer positions from the joined header
-            if col_map.get("from_street") is None and col_map.get("to_street") is None:
+                # Check if from_street col has cells with 2 streets merged (e.g. "COLUMBIA ST FORDHAM AV")
+                # This happens when a "BEGIN STREET NAME" column contains both main + from street.
+                fr_col = col_map.get("from_street")
+                if fr_col is not None:
+                    sample = [row[fr_col].strip() for row in body_rows[:5] if fr_col < len(row) and row[fr_col].strip()]
+                    merged_cols = sum(
+                        1 for cell in sample
+                        if sum(1 for w in cell.split() if w.upper() in STREET_SUFFIXES) >= 2
+                    )
+                    if merged_cols >= 2:
+                        # from_street col actually contains "MAIN_STREET FROM_STREET" — split on first suffix
+                        col_map["main_street"] = fr_col
+                        col_map["from_street"] = "_SPLIT_FROM_MAIN"
+                        log(f"  🔧 Detected merged main+from column at col {fr_col} — will split on suffix")
+                    else:
+                        log(f"  ⚠️ Page {page_num}: main_street column not found in map {col_map}, skipping table")
+                        continue
+                else:
+                    log(f"  ⚠️ Page {page_num}: main_street column not found in map {col_map}, skipping table")
+                    continue
+            # Detect "triple-merged" column: DocAI merged Street Name + Cross Street 1 + Cross Street 2
+            # into a single column. Pattern: main_street is set, from/to are null, and the main_street
+            # header cell mentions "Cross Street". Route each data cell to the LLM to split.
+            if (col_map.get("main_street") is not None and
+                    col_map.get("from_street") is None and
+                    col_map.get("to_street") is None):
+                ms_col_idx = col_map["main_street"]
+                if ms_col_idx < len(header_row):
+                    ms_hdr_upper = header_row[ms_col_idx].upper()
+                    if "CROSS STREET" in ms_hdr_upper or "CROSS ST " in ms_hdr_upper:
+                        col_map["triple_merged"] = True
+                        log(f"  🔀 Triple-merged column detected at col {ms_col_idx}: '{header_row[ms_col_idx]}'")
+
+            # If we found main_street but no cross streets (and it's not triple-merged),
+            # check if header text mentions "Cross Street" — try to infer separate column positions.
+            if not col_map.get("triple_merged") and col_map.get("from_street") is None and col_map.get("to_street") is None:
                 joined = " | ".join(h.upper() for h in header_row)
                 if "CROSS STREET" in joined or "STREET NAME" in joined:
                     # Find indices of cells containing "Street Name", "Cross Street 1/2"
@@ -1226,7 +1448,6 @@ Cells:
         return not v or str(v).strip() in ("?", "null", "None", "")
 
     before = len(all_streets)
-    all_streets = [s for s in all_streets if not (is_empty(s.get("from_street")) and is_empty(s.get("to_street")))]
 
     seen = {}
     for s in all_streets:

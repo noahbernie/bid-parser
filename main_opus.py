@@ -24,7 +24,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Global semaphore: cap concurrent LLM calls to avoid rate limits across parallel eval workers
 _LLM_SEMAPHORE = threading.Semaphore(4)
 
-_header_cache_lock = threading.Lock()
+_header_cache_lock   = threading.Lock()
+_vision_header_cache = {}  # header_key → confirmed col mapping from Haiku Vision
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 app = FastAPI()
@@ -1420,280 +1421,210 @@ Do not invent names — only use the exact text from the merged cell."""
             })
         return streets
 
-    OPUS_PROMPT = """You are extracting street work segments from a road construction bid document table.
+    # ── Pre-filter helpers ────────────────────────────────────────────────────
 
-Given raw Document AI table data (header_rows + body_rows as JSON), extract EVERY street work segment.
+    _STREET_TABLE_HEADER_KW = {
+        "STREET", "ROAD", "ROADWAY", "FROM", "TO", "BEGIN", "END",
+        "LIMITS", "CROSS", "INTERSECTION", "LOCATION", "WORK", "TREATMENT",
+        "SCOPE", "ACTIVITY", "OVERLAY", "SLURRY", "SEAL", "RESURFAC",
+    }
+    _BODY_SUFFIXES = {
+        "ST", "AV", "AVE", "BL", "BLVD", "RD", "DR", "LN", "CT", "PL",
+        "WY", "WAY", "CIR", "TER", "HWY", "PKWY", "FWY",
+    }
+
+    def _heuristic_is_street_table(header_rows, body_rows):
+        """Free instant check — returns True if table looks street-related."""
+        header_text = " ".join(c.upper() for row in header_rows for c in row if c)
+        if any(kw in header_text for kw in _STREET_TABLE_HEADER_KW):
+            return True
+        hits = 0
+        for row in body_rows[:10]:
+            for cell in row:
+                hits += sum(1 for w in str(cell or "").upper().split() if w in _BODY_SUFFIXES)
+                if hits >= 3:
+                    return True
+        return False
+
+    _HAIKU_IS_STREET_TABLE_PROMPT = (
+        "Look at this table (header + first few rows). "
+        "Is this a road/street construction work schedule table listing streets where work will be performed? "
+        'Reply with ONLY valid JSON: {"is_street_table": true} or {"is_street_table": false}'
+    )
+
+    def _haiku_confirms_street_table(header_rows, body_rows):
+        """Cheap Haiku/Gemini call — returns True if confirmed street table."""
+        sample = {"header_rows": header_rows, "body_rows": body_rows[:5]}
+        try:
+            result = call_gemini_text(_HAIKU_IS_STREET_TABLE_PROMPT, json.dumps(sample, ensure_ascii=False), log_fn=log)
+            return bool(result.get("is_street_table", False))
+        except Exception as e:
+            log(f"  ⚠ Street-table check failed: {e} — assuming yes")
+            return True  # fail open
+
+    # ── Call 1: Haiku Vision — confirm column mapping from image + sample rows ─
+
+    _HEADER_CONFIRM_PROMPT = """You are analyzing a table from a road construction bid document.
+
+Raw table data (headers + first 3 data rows):
+{table_sample}
+
+The page image above shows how this table looks visually.
+
+Identify (using 0-based column index):
+1. main_col: column containing the PRIMARY STREET being worked on
+2. from_col: column for where work BEGINS / first cross-street (FROM, BEGIN, CROSS STREET 1, etc.)
+3. to_col: column for where work ENDS / second cross-street (TO, END, CROSS STREET 2, etc.)
+
+IMPORTANT: Look at the actual DATA ROWS, not just the header text. Sometimes the data is in a different order than the header label implies (e.g. "BEGIN STREET NAME" may have the main street first, then the cross street). Trust what you see in the data.
+
+Return ONLY valid JSON:
+{"main_col": <int or null>, "from_col": <int or null>, "to_col": <int or null>, "notes": "..."}"""
+
+    def _confirm_headers_with_vision(header_rows, body_rows, page_num):
+        """Haiku Vision: confirm column mapping. Cached per unique header signature."""
+        header_key = tuple(tuple(r) for r in header_rows)
+        with _header_cache_lock:
+            if header_key in _vision_header_cache:
+                cached = _vision_header_cache[header_key]
+                log(f"  👁 Page {page_num}: using cached vision header map: {cached}")
+                return cached
+
+        try:
+            b64_img = render_page_as_image(pdf_bytes, page_num)
+        except Exception as e:
+            log(f"  ⚠ Could not render page {page_num} for vision: {e}")
+            return {}
+
+        sample = {"header_rows": header_rows, "sample_body_rows": body_rows[:3]}
+        prompt = _HEADER_CONFIRM_PROMPT.replace("{table_sample}", json.dumps(sample, ensure_ascii=False, indent=2))
+
+        try:
+            log(f"  👁 Page {page_num}: confirming headers with Haiku Vision...")
+            client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=256,
+                temperature=0,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64_img}},
+                    {"type": "text", "text": prompt},
+                ]}],
+            )
+            result = _parse_llm_json(msg.content[0].text.strip())
+            log(f"  ✓ Vision: main={result.get('main_col')} from={result.get('from_col')} to={result.get('to_col')} — {result.get('notes','')}")
+            with _header_cache_lock:
+                _vision_header_cache[header_key] = result
+            return result
+        except Exception as e:
+            log(f"  ✗ Vision header confirmation failed p.{page_num}: {e}")
+            return {}
+
+    # ── Call 2: Opus — extract streets from chunked rows + confirmed col map ───
+
+    _OPUS_CHUNK_PROMPT = """You are extracting street work segments from a road construction bid document table.
+
+Column mapping (0-based indices):
+- main_street: column {main_col} — the PRIMARY street being worked on
+- from_street: column {from_col} — where work BEGINS / first cross-street
+- to_street:   column {to_col}   — where work ENDS / second cross-street
 
 Rules:
-- Each segment: main_street (primary road being worked on), from_street (start cross-street), to_street (end cross-street)
-- "to" or "TO" between street names in the LIMITS column separates from/to. e.g. "MAIN ST to BROADWAY" means from=MAIN ST, to=BROADWAY
-- If column order is Cross Street 1 -> Street Name -> Cross Street 2, the MIDDLE value is main_street
-- Strip asset IDs and work order numbers (SS-001459-PV1, S2624, etc) - not street names
-- Skip header rows, totals, subtotals, non-street data rows
+- Copy street names EXACTLY as they appear — do not rename or substitute
+- "TO" (uppercase, surrounded by spaces) between street names separates from_street and to_street
+- Strip asset IDs and work order numbers (SS-001459-PV1, S2624, etc.) — not street names
+- Skip header rows, totals, subtotals, and non-street data rows
 - Use "" for missing from_street or to_street
 
-CRITICAL — STACKED ROWS: Document AI often merges multiple rows into one cell. When a cell contains multiple street names or multiple limits stacked together, extract EACH ONE as a separate segment. The streets and their limits appear in the same positional order across columns. For example:
+CRITICAL — STACKED ROWS: When a cell contains multiple street names merged together, extract EACH as a separate segment. Positions match across columns:
   Street cell: "ADAGIO ADELANTE"
   Limits cell: "SAN MARINO to MONTELEGRO LACONIA to PRIMAVERA"
-  → Extract TWO segments: {ADAGIO, SAN MARINO, MONTELEGRO} and {ADELANTE, LACONIA, PRIMAVERA}
-
-Another example:
-  Street cell: "BATES ST BAYLOR ST"
-  Limits cell: "HASTINGS AVE to END WEBSTER AVE to CARROL AVE"
-  → Extract TWO segments: {BATES ST, HASTINGS AVE, END} and {BAYLOR ST, WEBSTER AVE, CARROL AVE}
-
-The number of street names in the street cell always matches the number of limit ranges in the limits cell. Extract all of them.
+  → TWO segments: {ADAGIO, SAN MARINO, MONTELEGRO} and {ADELANTE, LACONIA, PRIMAVERA}
 
 Return ONLY valid JSON, no markdown:
 {"streets": [{"main_street": "...", "from_street": "...", "to_street": "..."}]}"""
 
-    def _extract_with_opus(header_rows, body_rows, page_num):
-        table_data = {"page": page_num, "header_rows": header_rows, "body_rows": body_rows}
-        try:
-            log(f"  🤖 Page {page_num}: sending {len(body_rows)} rows to Opus...")
-            content_blocks = [{"type": "text", "text": json.dumps(table_data, ensure_ascii=False)}]
-            result = call_claude_with_retry(
-                anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY")),
-                OPUS_PROMPT, content_blocks, max_tokens=8192,
-                model="claude-opus-4-6", log_fn=log
-            )
-            streets = []
-            for s in result.get("streets", []):
-                main = (s.get("main_street") or "").strip()
-                if not main:
-                    continue
-                streets.append({
-                    "main_street": main,
-                    "from_street": s.get("from_street") or None,
-                    "to_street":   s.get("to_street") or None,
-                    "work_type":   None,
-                    "source": "opus",
-                    "page": page_num,
-                })
-            log(f"  ✓ Page {page_num}: Opus extracted {len(streets)} streets")
-            return streets
-        except Exception as e:
-            log(f"  ✗ Opus failed page {page_num}: {e}")
+    def _extract_chunks_with_opus(header_rows, body_rows, confirmed_cols, page_num):
+        """Send body rows in chunks of 25 to Opus with confirmed col mapping."""
+        CHUNK_SIZE = 25
+        main_col = confirmed_cols.get("main_col")
+        from_col = confirmed_cols.get("from_col")
+        to_col   = confirmed_cols.get("to_col")
+
+        if main_col is None:
+            log(f"  ⚠ Page {page_num}: no main_col confirmed — skipping")
             return []
 
-    log("🤖 Sending tables to Claude Opus for street extraction...")
+        prompt = _OPUS_CHUNK_PROMPT.format(
+            main_col=main_col,
+            from_col=from_col if from_col is not None else "N/A",
+            to_col=to_col   if to_col   is not None else "N/A",
+        )
+
+        all_streets = []
+        chunks = [body_rows[i:i + CHUNK_SIZE] for i in range(0, len(body_rows), CHUNK_SIZE)]
+
+        for ci, chunk in enumerate(chunks):
+            chunk_data = {"header_rows": header_rows, "body_rows": chunk}
+            chunk_json = json.dumps(chunk_data, ensure_ascii=False, indent=2)
+            try:
+                log(f"  🤖 Page {page_num} chunk {ci+1}/{len(chunks)} ({len(chunk)} rows) → Opus...")
+                content_blocks = [{"type": "text", "text": chunk_json}]
+                result = call_claude_with_retry(
+                    anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY")),
+                    prompt, content_blocks, max_tokens=8192,
+                    model="claude-opus-4-6", log_fn=log,
+                )
+                chunk_streets = []
+                for s in result.get("streets", []):
+                    main = (s.get("main_street") or "").strip()
+                    if not main:
+                        continue
+                    chunk_streets.append({
+                        "main_street": main,
+                        "from_street": s.get("from_street") or None,
+                        "to_street":   s.get("to_street") or None,
+                        "work_type":   None,
+                        "source": "opus",
+                        "page": page_num,
+                    })
+                log(f"  ✓ Chunk {ci+1}: {len(chunk_streets)} streets")
+                all_streets.extend(chunk_streets)
+            except Exception as e:
+                log(f"  ✗ Opus chunk {ci+1} failed p.{page_num}: {e}")
+
+        return all_streets
+
+    # ── Main extraction loop ──────────────────────────────────────────────────
+
+    log("🤖 Extracting streets with new pipeline (filter → vision headers → Opus chunks)...")
     for page_num in sorted(all_page_tables.keys()):
         for table_tuple in all_page_tables[page_num]:
             header_rows, body_rows = table_tuple
             if not body_rows:
                 continue
-            all_streets.extend(_extract_with_opus(header_rows, body_rows, page_num))
-            continue
-            # OLD PIPELINE BELOW (unreachable)
-            if False:
-                pass
-            # Use Document AI's native header rows — combine all header rows into one flat header
-            # (some tables have 2-row headers; join them with space)
-            if header_rows:
-                header_row = [
-                    " ".join(filter(None, [header_rows[i][col] if i < len(header_rows) and col < len(header_rows[i]) else "" for i in range(len(header_rows))]))
-                    for col in range(max(len(r) for r in header_rows))
-                ]
-            else:
-                # No explicit header row from DocAI.
-                # Skip leading title/section rows and find the first row that looks like a real header.
-                # A real header row contains at least one cell matching a known column keyword.
-                _HEADER_KEYWORDS = {
-                    "STREET", "NAME", "ROAD", "ROADWAY", "FROM", "TO", "BEGIN", "END",
-                    "START", "TERMINUS", "LIMITS", "LOCATION", "CROSS", "WORK", "TREATMENT",
-                    "SCOPE", "ACTIVITY", "TYPE", "DESCRIPTION", "ZONE", "DISTRICT", "WARD",
-                    "SUBZONE", "AT", "SECTION",
-                }
-                def _looks_like_header(row):
-                    if sum(1 for c in row if c.strip()) <= 1:
-                        return False
-                    # A header row has at least one SHORT cell (≤2 words) that IS a keyword,
-                    # OR a cell that exactly matches a known multi-word header phrase.
-                    # This rejects title rows like "SEAL STREET DATA" where "STREET" appears
-                    # inside a descriptive phrase — those are section titles, not column labels.
-                    _EXACT_HEADERS = {
-                        "STREET NAME", "STREET", "ROAD", "ROADWAY", "MAIN STREET",
-                        "FROM", "TO", "BEGIN", "END", "START", "LIMITS", "AT",
-                        "LOCATION", "LOC", "ZONE", "DISTRICT", "WARD", "SUBZONE",
-                        "WORK TYPE", "WORK", "TREATMENT", "SCOPE", "TYPE",
-                        "CROSS STREET", "CROSS STREET 1", "CROSS STREET 2",
-                        "BEGIN LOCATION", "END LOCATION", "NO", "NO.", "#", "SEQ",
-                    }
-                    _HEADER_KW_EXTENDED = _HEADER_KEYWORDS | {
-                        "NAME", "NUMBER", "STREET", "LOC", "ADDR", "ADDRESS",
-                    }
-                    for cell in row:
-                        cu = cell.strip().upper()
-                        # Exact match to known header phrase
-                        if cu in _EXACT_HEADERS:
-                            return True
-                        words = cu.split()
-                        # Single-word keyword
-                        if len(words) == 1 and words[0].strip("().,:#") in _HEADER_KEYWORDS:
-                            return True
-                        # Short cell (≤4 words) where ≥2 are header keywords
-                        # catches "Name Location Street", "Street Name Begin", etc.
-                        if len(words) <= 4:
-                            kw_count = sum(1 for w in words if w.strip("().,:#") in _HEADER_KW_EXTENDED)
-                            if kw_count >= 2:
-                                return True
-                        # Long merged cell (>4 words) with ≥4 keyword matches
-                        # catches "Street Name Cross Street 2 Cross Street 1" (DocAI-merged header)
-                        elif len(words) > 4:
-                            kw_count = sum(1 for w in words if w.strip("().,:#") in _HEADER_KW_EXTENDED)
-                            if kw_count >= 4:
-                                return True
-                    return False
 
-                # Skip up to 10 non-header rows (plan-sheet tables can have many garbage header rows)
-                for _ in range(10):
-                    if not body_rows:
-                        break
-                    if _looks_like_header(body_rows[0]):
-                        break
-                    body_rows = body_rows[1:]
-                if not body_rows:
-                    continue
-                raw_first = body_rows[0]
-                header_row = [cell.split("\n")[0] for cell in raw_first]
-                body_rows = body_rows[1:]
-
-            col_map = get_col_map(header_row)
-            if not col_map:
-                log(f"  ⚠️ Page {page_num}: no column map returned, skipping table")
+            # Stage 1: free heuristic filter
+            if not _heuristic_is_street_table(header_rows, body_rows):
+                log(f"  ⏭ Page {page_num}: skipped (heuristic — not a street table)")
                 continue
-            if col_map.get("main_street") is None:
-                # Check if from_street col has cells with 2 streets merged (e.g. "COLUMBIA ST FORDHAM AV")
-                # This happens when a "BEGIN STREET NAME" column contains both main + from street.
-                fr_col = col_map.get("from_street")
-                if fr_col is not None:
-                    sample = [row[fr_col].strip() for row in body_rows[:5] if fr_col < len(row) and row[fr_col].strip()]
-                    merged_cols = sum(
-                        1 for cell in sample
-                        if sum(1 for w in cell.split() if w.upper() in STREET_SUFFIXES) >= 2
-                    )
-                    if merged_cols >= 2:
-                        # from_street col actually contains "MAIN_STREET FROM_STREET" — split on first suffix
-                        col_map["main_street"] = fr_col
-                        col_map["from_street"] = "_SPLIT_FROM_MAIN"
-                        log(f"  🔧 Detected merged main+from column at col {fr_col} — will split on suffix")
-                    else:
-                        log(f"  ⚠️ Page {page_num}: main_street column not found in map {col_map}, skipping table")
-                        continue
-                else:
-                    # ── Header-recovery: DocAI merged the column header row with the first data row ──
-                    # Pattern: body row cells like "STREET BARRANCA PKWY", "LIMITS JAMBOREE RD TO X"
-                    # Scan first 3 body rows for a cell whose first word is a column keyword (STREET/LIMITS/ZONE).
-                    # ── Header-recovery: DocAI merged the column header row with the first data row ──
-                    # Handles two patterns:
-                    # A) First cell starts with keyword: "STREET BARRANCA PKWY", "LIMITS JAMBOREE RD TO X"
-                    # B) Any cell contains a keyword prefix: "Street Name VIA NASCA", "Cross Street 1 AVNDA X"
-                    _RECOVERY_KEYWORDS = {"STREET", "LIMITS", "ZONE", "LOCATION", "FROM", "TO", "NAME",
-                                          "PROJECT", "SEGMENT", "WORK", "ASSET", "COUNCIL", "CROSS"}
-                    _HEADER_PHRASES = {"STREET NAME", "CROSS STREET", "WORK ORDER", "ASSET ID",
-                                       "PROJECT TITLE", "SEGMENT ID", "COUNCIL DISTRICT"}
-                    recovered = False
-                    for _ri, _row in enumerate(body_rows[:3]):
-                        if not _row:
-                            continue
-                        # Check if ANY cell starts with a known header keyword or phrase
-                        _has_header_cell = False
-                        for _cell in _row:
-                            _cwords = _cell.strip().split()
-                            if not _cwords:
-                                continue
-                            _first = _cwords[0].upper()
-                            _first_two = (_cwords[0] + " " + _cwords[1]).upper() if len(_cwords) > 1 else ""
-                            if _first in _RECOVERY_KEYWORDS or _first_two in _HEADER_PHRASES:
-                                _has_header_cell = True
-                                break
-                        if _has_header_cell:
-                            # Split each cell: greedily consume ALL leading header phrases → header, rest → data
-                            # Handles cells like "Cross Street 1 Street Name Cross Street 2 CTE DE CANDILEJAS..."
-                            _rec_headers = []
-                            _rec_data = []
-                            for _cell in _row:
-                                _cwords = _cell.strip().split()
-                                if not _cwords:
-                                    _rec_headers.append("")
-                                    _rec_data.append("")
-                                    continue
-                                _hi = 0  # header word index
-                                _header_parts = []
-                                while _hi < len(_cwords):
-                                    _w1 = _cwords[_hi].upper()
-                                    _w2 = (_cwords[_hi] + " " + _cwords[_hi+1]).upper() if _hi+1 < len(_cwords) else ""
-                                    if _w2 in _HEADER_PHRASES:
-                                        _hlen = 2
-                                        if _hi+2 < len(_cwords) and _cwords[_hi+2] in ("1", "2"):
-                                            _hlen = 3
-                                        _header_parts.append(" ".join(_cwords[_hi:_hi+_hlen]))
-                                        _hi += _hlen
-                                    elif _w1 in _RECOVERY_KEYWORDS and not any(c.isdigit() for c in _cwords[_hi]):
-                                        _header_parts.append(_cwords[_hi])
-                                        _hi += 1
-                                    else:
-                                        break
-                                if _header_parts:
-                                    _rec_headers.append(" ".join(_header_parts))
-                                    _rec_data.append(" ".join(_cwords[_hi:]))
-                                else:
-                                    _rec_headers.append(_cell)
-                                    _rec_data.append(_cell)
-                            _new_map = get_col_map(_rec_headers)
-                            if _new_map and _new_map.get("main_street") is not None:
-                                col_map = _new_map
-                                _prefix = body_rows[:_ri]
-                                body_rows = _prefix + [_rec_data] + body_rows[_ri + 1:]
-                                log(f"  🔧 Page {page_num}: recovered headers from body row {_ri}: {_rec_headers}")
-                                recovered = True
-                                break
-                    if not recovered:
-                        log(f"  ⚠️ Page {page_num}: main_street column not found in map {col_map}, skipping table")
-                        continue
-            # Detect "triple-merged" column: DocAI merged Street Name + Cross Street 1 + Cross Street 2
-            # into a single column. Pattern: main_street is set, from/to are null, and the main_street
-            # header cell mentions "Cross Street". Route each data cell to the LLM to split.
-            if (col_map.get("main_street") is not None and
-                    col_map.get("from_street") is None and
-                    col_map.get("to_street") is None):
-                ms_col_idx = col_map["main_street"]
-                if ms_col_idx < len(header_row):
-                    ms_hdr_upper = header_row[ms_col_idx].upper()
-                    if "CROSS STREET" in ms_hdr_upper or "CROSS ST " in ms_hdr_upper:
-                        col_map["triple_merged"] = True
-                        # Detect column order: if "Cross Street 1" appears before "Street Name" in the header,
-                        # the data order is from_street first, then main_street, then to_street.
-                        cs1_pos = ms_hdr_upper.find("CROSS STREET 1")
-                        sn_pos  = ms_hdr_upper.find("STREET NAME")
-                        if cs1_pos != -1 and sn_pos != -1 and cs1_pos < sn_pos:
-                            col_map["triple_merged_order"] = "from_main_to"
-                            log(f"  🔀 Triple-merged column (from→main→to order) at col {ms_col_idx}: '{header_row[ms_col_idx]}'")
-                        else:
-                            col_map["triple_merged_order"] = "main_from_to"
-                            log(f"  🔀 Triple-merged column detected at col {ms_col_idx}: '{header_row[ms_col_idx]}'")
 
-            # If we found main_street but no cross streets (and it's not triple-merged),
-            # check if header text mentions "Cross Street" — try to infer separate column positions.
-            if not col_map.get("triple_merged") and col_map.get("from_street") is None and col_map.get("to_street") is None:
-                joined = " | ".join(h.upper() for h in header_row)
-                if "CROSS STREET" in joined or "STREET NAME" in joined:
-                    # Find indices of cells containing "Street Name", "Cross Street 1/2"
-                    for ci, h in enumerate(header_row):
-                        hu = h.upper()
-                        if "STREET NAME" in hu and col_map.get("main_street") is None:
-                            col_map["main_street"] = ci
-                        elif "CROSS STREET 1" in hu or "CROSS ST 1" in hu:
-                            col_map["from_street"] = ci
-                        elif "CROSS STREET 2" in hu or "CROSS ST 2" in hu:
-                            col_map["to_street"] = ci
-                        elif "CROSS STREET" in hu and "1" not in hu and "2" not in hu:
-                            if col_map.get("from_street") is None:
-                                col_map["from_street"] = ci
-                    log(f"  🔧 Inferred cross-street columns: {col_map}")
-            streets = apply_col_map(body_rows, col_map, page_num)
-            all_streets.extend(streets)
-            log(f"  ✓ Page {page_num} table: {len(body_rows)} rows → {len(streets)} streets extracted (map={col_map})")
+            # Stage 2: cheap LLM confirmation
+            if not _haiku_confirms_street_table(header_rows, body_rows):
+                log(f"  ⏭ Page {page_num}: skipped (Haiku confirmed not a street table)")
+                continue
+
+            # Stage 3: Haiku Vision confirms column mapping (cached per header signature)
+            confirmed_cols = _confirm_headers_with_vision(header_rows, body_rows, page_num)
+            if not confirmed_cols or confirmed_cols.get("main_col") is None:
+                log(f"  ⚠ Page {page_num}: vision could not confirm headers — falling back to full Opus")
+                # Fallback: send full table to Opus without col hints
+                confirmed_cols = {"main_col": 0, "from_col": 1, "to_col": 2}
+
+            # Stage 4: Opus extracts streets in chunks
+            extracted = _extract_chunks_with_opus(header_rows, body_rows, confirmed_cols, page_num)
+            log(f"  ✓ Page {page_num}: {len(extracted)} total streets extracted")
+            all_streets.extend(extracted)
 
     # --- Step 4: Deduplication ---
     _SUFFIX_MAP = {

@@ -59,6 +59,8 @@ def norm(v) -> str:
         return ""
     s = re.sub(r"\s+", " ", str(v).strip().upper())
     s = s.translate(_UNICODE_CONFUSABLES)  # replace Cyrillic/Greek lookalikes with Latin
+    # Strip asset ID prefixes like "SS-001459-PV1 " before further normalization
+    s = re.sub(r'^[A-Z]{1,4}-\d{4,8}-[A-Z0-9]+(?:-[A-Z0-9]+)*\s+', '', s)
     s = s.replace("-", " ")  # normalize hyphens so "CDS-WEST END" == "CDS - WEST END"
     s = re.sub(r"[^\w\s]", "", s)
     parts = s.split()
@@ -79,6 +81,13 @@ def norm(v) -> str:
     parts = merged
     if parts and parts[-1] in _SUFFIX_MAP:
         parts[-1] = _SUFFIX_MAP[parts[-1]]
+    # Strip leading/trailing 1-2 digit noise tokens (row numbers, zone IDs, etc.)
+    # Ordinals like "44TH", "21ST" are not pure digits — they stay.
+    # Route numbers like 101, 405 are 3+ digits — they stay.
+    while parts and parts[0].isdigit() and len(parts[0]) <= 2:
+        parts.pop(0)
+    while parts and parts[-1].isdigit() and len(parts[-1]) <= 2:
+        parts.pop()
     return " ".join(parts)
 
 def similarity(a: str, b: str) -> float:

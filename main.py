@@ -1266,6 +1266,8 @@ Do not invent names — only use the exact text from the merged cell."""
             elif len(_main_words) >= 2 and len(_main_words[0]) <= 3 and _main_words[0][0].isalpha() and _main_words[0][1:].isdigit():
                 # handles "A1 VIA MIRALESTE" → "VIA MIRALESTE"
                 main = " ".join(_main_words[1:])
+            # Strip asset ID prefixes like "SS-001459-PV1 63RD ST" → "63RD ST"
+            main = re.sub(r'^[A-Za-z]{1,4}-\d{4,8}-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\s+', '', main).strip()
             if not main:
                 continue
             # Reject junk rows: numbered/lettered list items ("1.", "2.", "a)", "b)"),

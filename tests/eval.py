@@ -176,6 +176,9 @@ def load_ground_truth(doc_key: str, col_map: dict) -> list:
                 # Skip repeated header rows (second table within same tab)
                 if norm(main) == norm(ms_col) or norm(main) in ("STREET NAME", "STREET", "NAME"):
                     continue
+                # Skip section-header rows like "Fiscal Year 2021-22"
+                if main.strip().lower().startswith("fiscal year"):
+                    continue
 
                 from_v, to_v = "", ""
                 if lim_col:

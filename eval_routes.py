@@ -338,6 +338,23 @@ async def get_results(doc_key: str):
     return _results[doc_key]
 
 
+@router.delete("/cache-all")
+async def clear_all_cache():
+    """Delete all cached eval results, parser outputs, and raw DocAI files."""
+    cleared = 0
+    for fn in os.listdir(CACHE_DIR):
+        if fn.startswith("_"):
+            continue  # keep _history.json etc
+        path = os.path.join(CACHE_DIR, fn)
+        try:
+            os.remove(path)
+            cleared += 1
+        except Exception:
+            pass
+    _results.clear()
+    return {"cleared": cleared}
+
+
 @router.delete("/cache/{doc_key:path}")
 async def clear_cache(doc_key: str):
     cleared = []
@@ -472,6 +489,28 @@ async def diagnose(doc_key: str):
         "missed_count": len(missed),
         "diagnoses": diagnoses,
     }
+
+
+@router.get("/docai-raw/{doc_key:path}")
+async def get_docai_raw(doc_key: str):
+    """Return the raw DocAI table extraction output for a document."""
+    raw_path = _docai_raw_path(doc_key)
+    if not os.path.exists(raw_path):
+        return {"error": "No raw DocAI data — run eval first"}
+    with open(raw_path) as f:
+        raw = json.load(f)
+    # Summarize: for each page, show page num, row counts, and first header/body row
+    pages = []
+    for page_num, tables in sorted(raw.items(), key=lambda x: int(x[0])):
+        table_list = tables if isinstance(tables, list) else [tables]
+        for ti, t in enumerate(table_list):
+            pages.append({
+                "page": int(page_num),
+                "table": ti,
+                "header_rows": t.get("header_rows", []),
+                "body_rows": t.get("body_rows", []),
+            })
+    return {"doc_key": doc_key, "page_count": len(pages), "pages": pages}
 
 
 @router.get("/truth/{doc_key:path}")

@@ -291,6 +291,7 @@
   <a class="back-link" href="/">← back</a>
   <div class="header-right">
     <span id="run-all-progress" style="display:none"></span>
+    <button class="btn" style="background:var(--s2);color:var(--muted);border:1px solid var(--border2)" onclick="clearAllCache()">🗑 Clear Cache</button>
     <button class="btn btn-primary" id="run-all-btn" onclick="runAll()">▶ Run All</button>
   </div>
 </header>
@@ -413,6 +414,7 @@
           <button class="tab-btn"        id="tab-diagnose" onclick="switchTab('diagnose')">🔍 Diagnose <span class="tab-ct" id="tab-diagnose-ct"></span></button>
           <button class="tab-btn"        id="tab-json"     onclick="switchTab('json')">Eval JSON</button>
           <button class="tab-btn"        id="tab-truth"    onclick="switchTab('truth')">Truth JSON <span class="tab-ct" id="tab-truth-ct"></span></button>
+          <button class="tab-btn"        id="tab-docai"    onclick="switchTab('docai')">DocAI Raw <span class="tab-ct" id="tab-docai-ct"></span></button>
         </div>
         <div class="street-table" id="street-table"></div>
         <div id="json-view" style="display:none;flex:1;overflow:auto;padding:14px 16px">
@@ -422,6 +424,7 @@
           <pre id="truth-pre-done" style="font-family:'SF Mono','Fira Code',monospace;font-size:11px;line-height:1.7;color:#a0a0b8;white-space:pre-wrap;word-break:break-word"></pre>
         </div>
         <div id="diagnose-view" style="display:none;flex:1;overflow:auto;padding:14px 16px"></div>
+        <div id="docai-view" style="display:none;flex:1;overflow:auto;padding:14px 16px"></div>
       </div>
     </div>
 
@@ -640,7 +643,7 @@ function showDoneState(data) {
   const t = truthCache[data.doc_key];
   set('tab-truth-ct', t ? `(${t.count})` : '');
 
-  ['missed','extra','matched','diagnose','json','truth'].forEach(tab => {
+  ['missed','extra','matched','diagnose','json','truth','docai'].forEach(tab => {
     const el = document.getElementById('tab-'+tab);
     if (el) el.classList.toggle('active', tab === currentTab);
   });
@@ -652,11 +655,13 @@ function _applyTabView(data) {
   const jv  = document.getElementById('json-view');
   const tv  = document.getElementById('truth-view');
   const dv  = document.getElementById('diagnose-view');
-  const specialTab = currentTab === 'json' || currentTab === 'truth' || currentTab === 'diagnose';
+  const rv  = document.getElementById('docai-view');
+  const specialTab = currentTab === 'json' || currentTab === 'truth' || currentTab === 'diagnose' || currentTab === 'docai';
   tbl.style.display = specialTab ? 'none' : '';
   jv.style.display  = currentTab === 'json'      ? 'block' : 'none';
   tv.style.display  = currentTab === 'truth'     ? 'block' : 'none';
   dv.style.display  = currentTab === 'diagnose'  ? 'flex'  : 'none';
+  rv.style.display  = currentTab === 'docai'     ? 'block' : 'none';
   if (currentTab === 'json') {
     document.getElementById('json-pre').textContent = JSON.stringify(data || selectedResults, null, 2);
   } else if (currentTab === 'truth') {
@@ -666,6 +671,8 @@ function _applyTabView(data) {
       .then(r=>r.json()).then(d=>{ truthCache[selectedDoc]=d; document.getElementById('truth-pre-done').textContent=JSON.stringify(d.streets,null,2); });
   } else if (currentTab === 'diagnose') {
     loadDiagnose(selectedDoc);
+  } else if (currentTab === 'docai') {
+    loadDocAIRaw(selectedDoc);
   } else {
     renderStreetTable();
   }
@@ -693,11 +700,65 @@ function updateRunningHeader(p) {
 
 function switchTab(tab) {
   currentTab = tab;
-  ['missed','extra','matched','diagnose','json','truth'].forEach(t => {
+  ['missed','extra','matched','diagnose','json','truth','docai'].forEach(t => {
     const el = document.getElementById('tab-'+t);
     if (el) el.classList.toggle('active', t === tab);
   });
   _applyTabView(selectedResults);
+}
+
+// ── DocAI Raw ─────────────────────────────────────────────────────────────────
+const _docaiCache = {};
+
+async function loadDocAIRaw(docKey) {
+  if (!docKey) return;
+  const rv = document.getElementById('docai-view');
+  if (_docaiCache[docKey]) { renderDocAIRaw(_docaiCache[docKey]); return; }
+  rv.innerHTML = '<p style="color:#666;padding:20px">Loading DocAI output…</p>';
+  try {
+    const res = await fetch(`/eval/docai-raw/${encodeURIComponent(docKey)}`);
+    const data = await res.json();
+    if (data.error) { rv.innerHTML = `<p style="color:var(--red);padding:20px">${data.error}</p>`; return; }
+    _docaiCache[docKey] = data;
+    renderDocAIRaw(data);
+  } catch(e) {
+    rv.innerHTML = `<p style="color:var(--red);padding:20px">Error: ${e}</p>`;
+  }
+}
+
+function renderDocAIRaw(data) {
+  const rv = document.getElementById('docai-view');
+  set('tab-docai-ct', `(${data.page_count})`);
+  let html = `<div style="font-family:'SF Mono','Fira Code',monospace;font-size:11px;line-height:1.7;">`;
+  for (const p of data.pages) {
+    const pageLabel = `Page ${p.page}${data.pages.filter(x=>x.page===p.page).length>1 ? ` table ${p.table}` : ''}`;
+    html += `<details style="margin-bottom:8px;border:1px solid var(--border2);border-radius:6px;overflow:hidden">
+      <summary style="padding:8px 12px;background:var(--s1);cursor:pointer;color:var(--text);list-style:none;display:flex;gap:10px;align-items:center">
+        <span style="color:var(--violet);font-weight:600">${pageLabel}</span>
+        <span style="color:var(--muted)">${p.header_rows.length} header row${p.header_rows.length!==1?'s':''}, ${p.body_rows.length} body row${p.body_rows.length!==1?'s':''}</span>
+      </summary>
+      <div style="padding:12px;background:var(--s0)">`;
+
+    if (p.header_rows.length) {
+      html += `<div style="color:var(--amber);margin-bottom:6px;font-size:10px;letter-spacing:.05em">HEADERS</div>`;
+      for (const row of p.header_rows) {
+        html += `<div style="margin-bottom:4px;padding:6px 8px;background:var(--s2);border-radius:4px;color:var(--amber)">${escHtml(JSON.stringify(row))}</div>`;
+      }
+    }
+
+    html += `<div style="color:var(--blue);margin:8px 0 6px;font-size:10px;letter-spacing:.05em">BODY ROWS</div>`;
+    for (const row of p.body_rows) {
+      html += `<div style="margin-bottom:3px;padding:6px 8px;background:var(--s2);border-radius:4px;color:var(--text);word-break:break-word">${escHtml(JSON.stringify(row))}</div>`;
+    }
+
+    html += `</div></details>`;
+  }
+  html += '</div>';
+  rv.innerHTML = html;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 // ── Diagnose ─────────────────────────────────────────────────────────────────
@@ -904,6 +965,20 @@ async function clearCache(evt, key) {
   });
   if (selectedDoc === key) showResEmpty();
   renderDocList(); updateSummary(); toast('Cache cleared');
+}
+
+async function clearAllCache() {
+  if (!confirm('Clear all cached results for all documents?')) return;
+  const res = await fetch('/eval/cache-all', { method: 'DELETE' });
+  const data = await res.json();
+  // Reset UI state
+  Object.keys(_docaiCache).forEach(k => delete _docaiCache[k]);
+  Object.keys(_diagnoseCache).forEach(k => delete _diagnoseCache[k]);
+  Object.keys(truthCache || {}).forEach(k => delete truthCache[k]);
+  selectedResults = null;
+  selectedDoc = null;
+  await loadDocs();
+  alert(`Cleared ${data.cleared} cached files.`);
 }
 
 async function runAll() {

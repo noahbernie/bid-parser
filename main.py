@@ -1093,15 +1093,18 @@ Headers:"""
         first_line = cell.split("\n")[0].strip()
         words = first_line.split()
         label_words = []
-        for w in words:
+        for i, w in enumerate(words):
             wu = w.upper().strip("().,:")
+            # Allow a trailing ordinal digit (1 or 2) that disambiguates a column label
+            # e.g. "Cross Street 1" → keep "1" so Gemini can distinguish from "Cross Street 2"
+            if w in ("1", "2") and label_words:
+                label_words.append(w)
+                break  # stop after the number — anything after is data
             # Stop if we hit a digit-containing token (measurements, IDs, dates)
             if any(c.isdigit() for c in w):
                 break
             # Stop if we hit an all-caps word that looks like a street name value
-            # (i.e. is a street suffix or is 2+ caps letters that aren't a known label word)
             if wu in STREET_SUFFIXES:
-                # If we already have label words, this suffix is part of a street name value
                 if label_words:
                     break
             label_words.append(w)
@@ -1198,21 +1201,30 @@ Cells:
             log(f"  ✗ Unscramble failed for page {page_num}: {e}")
             return []
 
-    def _split_triple_merged_cell(cell_val: str, page_num: int) -> list:
+    def _split_triple_merged_cell(cell_val: str, page_num: int, col_order: str = "main_from_to") -> list:
         """Split a single merged cell that contains Street Name + Cross Street 1 + Cross Street 2.
+        col_order: 'main_from_to' (default) or 'from_main_to' (Cross Street 1 comes before Street Name).
         Also strips work order / asset ID noise (e.g. 'S2624', 'SS-XXXXXX-PV1' tokens).
         Returns a list of street dicts."""
-        prompt = """This cell from a road construction bid document has one or more road segments merged together.
+        if col_order == "from_main_to":
+            order_hint = """- IMPORTANT: In this document, values appear in this fixed order within the cell: Cross Street 1 (from_street), then Street Name (main_street), then Cross Street 2 (to_street). So the FIRST street name is from_street, the MIDDLE street name is main_street, and the LAST is to_street for each segment."""
+        else:
+            order_hint = """- The first street name in each segment is main_street, followed by from_street, then to_street."""
+
+        prompt = f"""This cell from a road construction bid document has one or more road segments merged together.
 Each segment has: main_street (primary road being worked on), from_street (start/first cross street), to_street (end/second cross street).
 
 Rules:
+{order_hint}
+- The word "TO" (uppercase, surrounded by spaces) is a separator between from_street and to_street within a limits description. e.g. "CAMPUS DR TO HARVARD AVE" means from_street=CAMPUS DR, to_street=HARVARD AVE.
+- When a cell has a pattern like "MAIN_STREET FROM_STREET TO TO_STREET", e.g. "TELLER AVE CAMPUS DR TO DUPONT DR", parse it as main_street=TELLER AVE, from_street=CAMPUS DR, to_street=DUPONT DR.
 - Street prefixes like AVNDA, CTE, CAM, VIA, CALLE, CAMINO, PASEO mark the start of a street name.
-- Street suffixes like BL, ST, AV, DR, CT, RD, LN, PL, WY mark the end of a street name.
-- Ignore non-street tokens: work order numbers (like "S2624", "52624", "2624"), and asset IDs (like "SS-XXXXXX-PV1", hyphenated codes starting with SS-).
+- Street suffixes like BL, ST, AV, DR, CT, RD, LN, PL, WY, BLVD, PKWY, FWY, HWY mark the end of a street name.
+- Ignore non-street tokens: work order numbers (like "S2624", "52624", "2624"), asset IDs (like "SS-XXXXXX-PV1"), and measurement data.
 - Use "" for missing from_street or to_street.
 - If multiple segments are present, return all of them.
 
-Return ONLY valid JSON: {"records": [{"main_street": "...", "from_street": "...", "to_street": "..."}]}
+Return ONLY valid JSON: {{"records": [{{"main_street": "...", "from_street": "...", "to_street": "..."}}]}}
 Cell: """
         try:
             log(f"  🔀 Splitting triple-merged cell on page {page_num}: {cell_val[:60]}...")
@@ -1310,7 +1322,7 @@ Do not invent names — only use the exact text from the merged cell."""
             if col_map.get("triple_merged") and ms_idx is not None:
                 cell_val = row[ms_idx].strip() if ms_idx < len(row) else ""
                 if cell_val:
-                    streets.extend(_split_triple_merged_cell(cell_val, page_num))
+                    streets.extend(_split_triple_merged_cell(cell_val, page_num, col_order=col_map.get("triple_merged_order", "main_from_to")))
                 continue
 
             def get(idx):
@@ -1359,8 +1371,14 @@ Do not invent names — only use the exact text from the merged cell."""
             if not col_map.get("triple_merged"):
                 _merge_thresh = 3 if split_from_main else 2
                 main_suffix_ct = sum(1 for w in main_cell.split() if w.upper() in STREET_SUFFIXES)
-                if main_suffix_ct >= _merge_thresh:
-                    if main_suffix_ct <= _MAX_UNSCRAMBLE_SUFFIXES and (fr_idx is not None or to_idx is not None):
+                # Also treat main cell as merged when it contains " TO " and multiple suffixes
+                # (split_from_to rows where all data is in the main cell, limits column empty)
+                _main_has_to = " TO " in main_cell.upper() and main_suffix_ct >= 2
+                if main_suffix_ct >= _merge_thresh or (split_from_to and _main_has_to and not from_val):
+                    # For split_from_to with TO in main cell and no separate from column — use flexible splitter
+                    if split_from_to and _main_has_to and not from_val:
+                        streets.extend(_split_triple_merged_cell(main_cell, page_num))
+                    elif main_suffix_ct <= _MAX_UNSCRAMBLE_SUFFIXES and (fr_idx is not None or to_idx is not None):
                         streets.extend(_unscramble_row_with_llm(row, col_map, page_num))
                     else:
                         # Too many stacked rows for positional unscramble — use flexible splitter
@@ -1505,31 +1523,67 @@ Do not invent names — only use the exact text from the merged cell."""
                     # ── Header-recovery: DocAI merged the column header row with the first data row ──
                     # Pattern: body row cells like "STREET BARRANCA PKWY", "LIMITS JAMBOREE RD TO X"
                     # Scan first 3 body rows for a cell whose first word is a column keyword (STREET/LIMITS/ZONE).
-                    _RECOVERY_KEYWORDS = {"STREET", "LIMITS", "ZONE", "LOCATION", "FROM", "TO", "NAME"}
+                    # ── Header-recovery: DocAI merged the column header row with the first data row ──
+                    # Handles two patterns:
+                    # A) First cell starts with keyword: "STREET BARRANCA PKWY", "LIMITS JAMBOREE RD TO X"
+                    # B) Any cell contains a keyword prefix: "Street Name VIA NASCA", "Cross Street 1 AVNDA X"
+                    _RECOVERY_KEYWORDS = {"STREET", "LIMITS", "ZONE", "LOCATION", "FROM", "TO", "NAME",
+                                          "PROJECT", "SEGMENT", "WORK", "ASSET", "COUNCIL", "CROSS"}
+                    _HEADER_PHRASES = {"STREET NAME", "CROSS STREET", "WORK ORDER", "ASSET ID",
+                                       "PROJECT TITLE", "SEGMENT ID", "COUNCIL DISTRICT"}
                     recovered = False
                     for _ri, _row in enumerate(body_rows[:3]):
                         if not _row:
                             continue
-                        first_word = _row[0].strip().split()[0].upper() if _row[0].strip() else ""
-                        if first_word in _RECOVERY_KEYWORDS:
-                            # Split each cell into (header_keyword, data_value)
+                        # Check if ANY cell starts with a known header keyword or phrase
+                        _has_header_cell = False
+                        for _cell in _row:
+                            _cwords = _cell.strip().split()
+                            if not _cwords:
+                                continue
+                            _first = _cwords[0].upper()
+                            _first_two = (_cwords[0] + " " + _cwords[1]).upper() if len(_cwords) > 1 else ""
+                            if _first in _RECOVERY_KEYWORDS or _first_two in _HEADER_PHRASES:
+                                _has_header_cell = True
+                                break
+                        if _has_header_cell:
+                            # Split each cell: greedily consume ALL leading header phrases → header, rest → data
+                            # Handles cells like "Cross Street 1 Street Name Cross Street 2 CTE DE CANDILEJAS..."
                             _rec_headers = []
                             _rec_data = []
                             for _cell in _row:
-                                _words = _cell.strip().split()
-                                if _words and _words[0].upper() in _RECOVERY_KEYWORDS:
-                                    _rec_headers.append(_words[0])
-                                    _rec_data.append(" ".join(_words[1:]))
+                                _cwords = _cell.strip().split()
+                                if not _cwords:
+                                    _rec_headers.append("")
+                                    _rec_data.append("")
+                                    continue
+                                _hi = 0  # header word index
+                                _header_parts = []
+                                while _hi < len(_cwords):
+                                    _w1 = _cwords[_hi].upper()
+                                    _w2 = (_cwords[_hi] + " " + _cwords[_hi+1]).upper() if _hi+1 < len(_cwords) else ""
+                                    if _w2 in _HEADER_PHRASES:
+                                        _hlen = 2
+                                        if _hi+2 < len(_cwords) and _cwords[_hi+2] in ("1", "2"):
+                                            _hlen = 3
+                                        _header_parts.append(" ".join(_cwords[_hi:_hi+_hlen]))
+                                        _hi += _hlen
+                                    elif _w1 in _RECOVERY_KEYWORDS and not any(c.isdigit() for c in _cwords[_hi]):
+                                        _header_parts.append(_cwords[_hi])
+                                        _hi += 1
+                                    else:
+                                        break
+                                if _header_parts:
+                                    _rec_headers.append(" ".join(_header_parts))
+                                    _rec_data.append(" ".join(_cwords[_hi:]))
                                 else:
                                     _rec_headers.append(_cell)
                                     _rec_data.append(_cell)
                             _new_map = get_col_map(_rec_headers)
                             if _new_map and _new_map.get("main_street") is not None:
                                 col_map = _new_map
-                                # Rows before the merged header row are pure data; insert recovered data row too
                                 _prefix = body_rows[:_ri]
-                                _rec_data_row = _rec_data
-                                body_rows = _prefix + [_rec_data_row] + body_rows[_ri + 1:]
+                                body_rows = _prefix + [_rec_data] + body_rows[_ri + 1:]
                                 log(f"  🔧 Page {page_num}: recovered headers from body row {_ri}: {_rec_headers}")
                                 recovered = True
                                 break
@@ -1547,7 +1601,16 @@ Do not invent names — only use the exact text from the merged cell."""
                     ms_hdr_upper = header_row[ms_col_idx].upper()
                     if "CROSS STREET" in ms_hdr_upper or "CROSS ST " in ms_hdr_upper:
                         col_map["triple_merged"] = True
-                        log(f"  🔀 Triple-merged column detected at col {ms_col_idx}: '{header_row[ms_col_idx]}'")
+                        # Detect column order: if "Cross Street 1" appears before "Street Name" in the header,
+                        # the data order is from_street first, then main_street, then to_street.
+                        cs1_pos = ms_hdr_upper.find("CROSS STREET 1")
+                        sn_pos  = ms_hdr_upper.find("STREET NAME")
+                        if cs1_pos != -1 and sn_pos != -1 and cs1_pos < sn_pos:
+                            col_map["triple_merged_order"] = "from_main_to"
+                            log(f"  🔀 Triple-merged column (from→main→to order) at col {ms_col_idx}: '{header_row[ms_col_idx]}'")
+                        else:
+                            col_map["triple_merged_order"] = "main_from_to"
+                            log(f"  🔀 Triple-merged column detected at col {ms_col_idx}: '{header_row[ms_col_idx]}'")
 
             # If we found main_street but no cross streets (and it's not triple-merged),
             # check if header text mentions "Cross Street" — try to infer separate column positions.

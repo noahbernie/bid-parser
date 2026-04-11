@@ -1040,7 +1040,7 @@ Headers:"""
         return False
 
     def _unscramble_row_with_llm(row: list, col_map: dict, page_num: int) -> list:
-        """Send a merged row to Gemini to split it into individual street records."""
+        """Send a merged row to Claude Haiku to split it into individual street records."""
         ms_idx = col_map.get("main_street")
         fr_idx = col_map.get("from_street")
         to_idx = col_map.get("to_street")
@@ -1071,7 +1071,12 @@ Cells:
 """
         try:
             log(f"  🔀 Unscrambling {n} stacked records on page {page_num}...")
-            result = call_gemini_text(prompt, "\n".join(cell_lines), log_fn=log)
+            content_blocks = [{"type": "text", "text": "\n".join(cell_lines)}]
+            result = call_claude_with_retry(
+                anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY")),
+                prompt, content_blocks, max_tokens=2048,
+                model="claude-haiku-4-5-20251001", log_fn=log
+            )
             rows_out = result.get("rows", [])
             streets = []
             for r in rows_out:

@@ -949,7 +949,7 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
     for chunk_start in range(0, total_pages, CHUNK_SIZE):
         chunk_end = min(chunk_start + CHUNK_SIZE, total_pages)
         if log_fn:
-            log_fn(f"  DocAI: pages {chunk_start+1}–{chunk_end} of {total_pages}...")
+            log_fn(f"  🔷 Form Parser: pages {chunk_start+1}–{chunk_end} of {total_pages}...")
 
         try:
             _process_chunk(chunk_start, chunk_end)
@@ -1216,12 +1216,17 @@ def run_extraction(doc_id: str, api_key: str):
     schema["streets"] = []
     all_streets = []
 
-    # --- Step 2: Extract all tables via Document AI Layout Parser ---
-    log("📄 Sending to Document AI Layout Parser...")
+    # --- Step 2: Extract all tables via Document AI Form Parser ---
+    log("📄 Sending to Document AI Form Parser (processor: 8e7372377435d1ba)...")
     try:
         raw_save_path = os.path.join(BASE_DIR, f"docai_raw_{doc_id}.json")
         all_page_tables = docai_extract_all_tables(pdf_bytes, log_fn=log, save_raw_path=raw_save_path)
-        log(f"✓ Document AI complete — {len(all_page_tables)} pages with tables found")
+        total_tables = sum(len(v) for v in all_page_tables.values())
+        total_rows   = sum(len(t[1]) for v in all_page_tables.values() for t in v)
+        log(f"✓ Form Parser complete — {len(all_page_tables)} pages, {total_tables} tables, {total_rows} body rows")
+        for pg in sorted(all_page_tables):
+            for i, (hdr, body) in enumerate(all_page_tables[pg]):
+                log(f"  📋 Page {pg} table {i+1}: {len(hdr)} header row(s), {len(body)} body rows | headers={[r[:4] for r in hdr[:1]]}")
     except Exception as e:
         log(f"✗ Document AI failed: {e}")
         doc["extracted_schema"] = schema

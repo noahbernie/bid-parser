@@ -748,51 +748,50 @@ def call_vision_with_retry(prompt: str, b64_image: str, max_tokens: int = 512, m
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
     gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}" if gemini_key else None
 
-    with _LLM_SEMAPHORE:
-        for attempt in range(max_retries):
-            use_gemini = (attempt % 2 == 1) and gemini_url
-            try:
-                if not use_gemini:
-                    client = anthropic.Anthropic(api_key=anthropic_key)
-                    msg = client.messages.create(
-                        model="claude-haiku-4-5-20251001",
-                        max_tokens=max_tokens,
-                        temperature=0,
-                        messages=[{"role": "user", "content": [
-                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64_image}},
-                            {"type": "text", "text": prompt},
-                        ]}],
-                    )
-                    return _parse_llm_json(msg.content[0].text.strip())
-                else:
-                    payload = json.dumps({
-                        "contents": [{"parts": [
-                            {"text": prompt},
-                            {"inline_data": {"mime_type": "image/png", "data": b64_image}},
-                        ]}],
-                        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0},
-                    }).encode()
-                    req = urllib.request.Request(gemini_url, data=payload, headers={"Content-Type": "application/json"})
-                    with urllib.request.urlopen(req, timeout=120) as resp:
-                        data = json.loads(resp.read())
-                    raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    return _parse_llm_json(raw)
-            except anthropic.RateLimitError:
+    for attempt in range(max_retries):
+        use_gemini = (attempt % 2 == 1) and gemini_url
+        try:
+            if not use_gemini:
+                client = anthropic.Anthropic(api_key=anthropic_key)
+                msg = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=max_tokens,
+                    temperature=0,
+                    messages=[{"role": "user", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64_image}},
+                        {"type": "text", "text": prompt},
+                    ]}],
+                )
+                return _parse_llm_json(msg.content[0].text.strip())
+            else:
+                payload = json.dumps({
+                    "contents": [{"parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": "image/png", "data": b64_image}},
+                    ]}],
+                    "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0},
+                }).encode()
+                req = urllib.request.Request(gemini_url, data=payload, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = json.loads(resp.read())
+                raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return _parse_llm_json(raw)
+        except anthropic.RateLimitError:
+            if log_fn:
+                log_fn(f"  ⚠ Haiku Vision rate limit (attempt {attempt+1}) — switching to Gemini...")
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
                 if log_fn:
-                    log_fn(f"  ⚠ Haiku Vision rate limit (attempt {attempt+1}) — switching to Gemini...")
-            except urllib.error.HTTPError as e:
-                if e.code == 429:
-                    if log_fn:
-                        log_fn(f"  ⚠ Gemini Vision rate limit (attempt {attempt+1}) — switching to Haiku...")
-                elif attempt < max_retries - 1:
-                    time.sleep(3)
-                else:
-                    raise
-            except Exception:
-                if attempt < max_retries - 1:
-                    time.sleep(3)
-                else:
-                    raise
+                    log_fn(f"  ⚠ Gemini Vision rate limit (attempt {attempt+1}) — switching to Haiku...")
+            elif attempt < max_retries - 1:
+                time.sleep(3)
+            else:
+                raise
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(3)
+            else:
+                raise
     raise Exception("Vision max retries exceeded (both Haiku and Gemini rate limited)")
 
 

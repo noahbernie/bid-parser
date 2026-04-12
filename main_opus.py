@@ -1853,25 +1853,26 @@ Return ONLY valid JSON, no markdown:
 
         try:
             log(f"  🤖 Page {page_num} ({len(body_rows)} rows) → Gemini 2.5 Pro...")
-            if gemini_pro_url:
-                result = None
-                for attempt in range(4):
-                    try:
-                        result = _call_gemini_pro()
-                        break
-                    except urllib.error.HTTPError as e:
-                        if e.code == 429:
-                            log(f"  ⚠ Gemini 2.5 Pro rate limit (attempt {attempt+1}) — retrying...")
-                        elif e.code >= 500:
-                            log(f"  ⚠ Gemini 2.5 Pro server error {e.code} (attempt {attempt+1}) — retrying...")
-                        else:
-                            raise
-                        time.sleep(3 * (attempt + 1))
-                if result is None:
-                    raise Exception("Gemini 2.5 Pro failed after 4 attempts")
-            else:
-                log(f"  ⚠ No Gemini key — falling back to Opus...")
-                result = _call_opus_fallback()
+            with _LLM_SEMAPHORE:
+                if gemini_pro_url:
+                    result = None
+                    for attempt in range(4):
+                        try:
+                            result = _call_gemini_pro()
+                            break
+                        except urllib.error.HTTPError as e:
+                            if e.code == 429:
+                                log(f"  ⚠ Gemini 2.5 Pro rate limit (attempt {attempt+1}) — retrying...")
+                            elif e.code >= 500:
+                                log(f"  ⚠ Gemini 2.5 Pro server error {e.code} (attempt {attempt+1}) — retrying...")
+                            else:
+                                raise
+                            time.sleep(3 * (attempt + 1))
+                    if result is None:
+                        raise Exception("Gemini 2.5 Pro failed after 4 attempts")
+                else:
+                    log(f"  ⚠ No Gemini key — falling back to Opus...")
+                    result = _call_opus_fallback()
 
             streets = []
             for s in result.get("streets", []):

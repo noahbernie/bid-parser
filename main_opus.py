@@ -1859,7 +1859,13 @@ Return ONLY valid JSON, no markdown:
                     log(f"  ⚠ Gemini 2.5 Pro error (attempt {attempt+1}): {str(e)[:80]} — retrying...")
                     time.sleep(3 * (attempt + 1))
             if result is None:
-                raise Exception("Gemini 2.5 Pro failed after 6 attempts")
+                log(f"  ⚠ Gemini 2.5 Pro failed after 6 attempts — falling back to Opus...")
+                content_blocks = [{"type": "text", "text": table_json}]
+                result = call_claude_with_retry(
+                    anthropic.Anthropic(api_key=anthropic_key),
+                    prompt, content_blocks, max_tokens=8192,
+                    model="claude-opus-4-6", log_fn=log,
+                )
 
             streets = []
             for s in result.get("streets", []):

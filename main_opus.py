@@ -1896,6 +1896,17 @@ Return ONLY valid JSON, no markdown:
             if not body_rows:
                 continue
 
+            # Pre-filter: skip DocAI artifact tables where the header cell contains
+            # a column keyword (STREET/LIMITS/ZONE) followed by stacked data rows.
+            # These are duplicate fragments of the clean table that follows on the same page.
+            if header_rows and len(body_rows) <= 2:
+                first_cell = str(header_rows[0][0]) if header_rows[0] else ""
+                _COL_KEYWORDS = ("STREET\n", "LIMITS\n", "ZONE\n", "STREET NAME\n", "BEGIN\n", "END\n")
+                if any(first_cell.startswith(kw) for kw in _COL_KEYWORDS):
+                    log(f"  ⏩ p.{page_num}: skipping DocAI artifact table (column header + stacked data in header cell)")
+                    skipped_text += 1
+                    continue
+
             # Stage 0: Text keyword filter — free, instant
             if not _text_header_filter(header_rows, body_rows):
                 skipped_text += 1

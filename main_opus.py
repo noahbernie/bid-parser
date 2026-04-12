@@ -28,7 +28,7 @@ VISION_CACHE_FILE = os.path.join(BASE_DIR, "vision_cache.json")
 os.makedirs(DOCAI_CACHE_DIR, exist_ok=True)
 
 # Global semaphore: cap concurrent LLM calls to avoid rate limits across parallel eval workers
-_LLM_SEMAPHORE = threading.Semaphore(4)
+_LLM_SEMAPHORE = threading.Semaphore(8)
 
 _header_cache_lock   = threading.Lock()
 
@@ -1842,40 +1842,27 @@ Return ONLY valid JSON, no markdown:
             raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
             return _parse_llm_json(raw)
 
-        def _call_opus_fallback():
-            content_blocks = [{"type": "text", "text": table_json}]
-            return call_claude_with_retry(
-                anthropic.Anthropic(api_key=anthropic_key),
-                prompt, content_blocks, max_tokens=8192,
-                model="claude-opus-4-6", log_fn=log,
-            )
-
         try:
             log(f"  🤖 Page {page_num} ({len(body_rows)} rows) → Gemini 2.5 Pro...")
             with _LLM_SEMAPHORE:
-                if gemini_pro_url:
-                    result = None
-                    for attempt in range(4):
-                        try:
-                            result = _call_gemini_pro()
-                            break
-                        except urllib.error.HTTPError as e:
-                            if e.code == 429:
-                                log(f"  ⚠ Gemini 2.5 Pro rate limit (attempt {attempt+1}) — retrying...")
-                            elif e.code >= 500:
-                                log(f"  ⚠ Gemini 2.5 Pro server error {e.code} (attempt {attempt+1}) — retrying...")
-                            else:
-                                log(f"  ⚠ Gemini 2.5 Pro HTTP error {e.code} (attempt {attempt+1}) — retrying...")
-                            time.sleep(3 * (attempt + 1))
-                        except Exception as e:
-                            log(f"  ⚠ Gemini 2.5 Pro error (attempt {attempt+1}): {str(e)[:80]} — retrying...")
-                            time.sleep(3 * (attempt + 1))
-                    if result is None:
-                        log(f"  ⚠ Gemini 2.5 Pro failed after 4 attempts — falling back to Opus...")
-                        result = _call_opus_fallback()
-                else:
-                    log(f"  ⚠ No Gemini key — falling back to Opus...")
-                    result = _call_opus_fallback()
+                result = None
+                for attempt in range(6):
+                    try:
+                        result = _call_gemini_pro()
+                        break
+                    except urllib.error.HTTPError as e:
+                        if e.code == 429:
+                            log(f"  ⚠ Gemini 2.5 Pro rate limit (attempt {attempt+1}) — retrying...")
+                        elif e.code >= 500:
+                            log(f"  ⚠ Gemini 2.5 Pro server error {e.code} (attempt {attempt+1}) — retrying...")
+                        else:
+                            log(f"  ⚠ Gemini 2.5 Pro HTTP error {e.code} (attempt {attempt+1}) — retrying...")
+                        time.sleep(3 * (attempt + 1))
+                    except Exception as e:
+                        log(f"  ⚠ Gemini 2.5 Pro error (attempt {attempt+1}): {str(e)[:80]} — retrying...")
+                        time.sleep(3 * (attempt + 1))
+                if result is None:
+                    raise Exception("Gemini 2.5 Pro failed after 6 attempts")
 
             streets = []
             for s in result.get("streets", []):

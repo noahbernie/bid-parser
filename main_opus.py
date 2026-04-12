@@ -1809,15 +1809,26 @@ Return ONLY valid JSON, no markdown:
             log(f"  ⚠ Page {page_num}: no main_col confirmed — skipping")
             return []
 
+        # Slice to only the relevant columns so Gemini doesn't hallucinate from
+        # quantity/striping columns (LIMIT LINE, STOP EA, TYPE I ARROW, etc.)
+        relevant_cols = sorted({c for c in [main_col, from_col, to_col] if c is not None})
+        def _slice_rows(rows):
+            return [[row[c] if c < len(row) else "" for c in relevant_cols] for row in rows]
+        # Remap confirmed col indices to their new positions in the sliced table
+        col_remap = {orig: new for new, orig in enumerate(relevant_cols)}
+        sliced_header = _slice_rows(header_rows)
+        sliced_body   = _slice_rows(body_rows)
+        sliced_main = col_remap.get(main_col)
+        sliced_from = col_remap.get(from_col) if from_col is not None else None
+        sliced_to   = col_remap.get(to_col)   if to_col   is not None else None
         prompt = _OPUS_CHUNK_PROMPT.format(
-            main_col=main_col,
-            from_col=from_col if from_col is not None else "N/A",
-            to_col=to_col   if to_col   is not None else "N/A",
+            main_col=sliced_main,
+            from_col=sliced_from if sliced_from is not None else "N/A",
+            to_col=sliced_to     if sliced_to   is not None else "N/A",
         )
         if vision_notes:
             prompt += f"\n\nAdditional context from visual inspection: {vision_notes}"
-
-        table_data = {"header_rows": header_rows, "body_rows": body_rows}
+        table_data = {"header_rows": sliced_header, "body_rows": sliced_body}
         table_json = json.dumps(table_data, ensure_ascii=False, indent=2)
         full_prompt = prompt + "\n\n" + table_json
 

@@ -1707,16 +1707,14 @@ Return ONLY valid JSON:
 
     _OPUS_CHUNK_PROMPT = """You are extracting street work segments from a road construction bid document table.
 
-COLUMN MAPPING (confirmed by visual inspection — ABSOLUTE, DO NOT DEVIATE):
-- main_street → column index {main_col}
-- from_street → column index {from_col}
-- to_street   → column index {to_col}
+Column mapping (0-based indices):
+- main_street: column {main_col} — the PRIMARY street being worked on
+- from_street: column {from_col} — where work BEGINS / first cross-street
+- to_street:   column {to_col}   — where work ENDS / second cross-street
 
-STRICT COLUMN RULE — THE HIGHEST PRIORITY RULE:
-Read each field ONLY from its assigned column index. Never swap columns. Never put a value from column {from_col} or {to_col} into main_street. Never put a value from column {main_col} into from_street or to_street. The mapping was confirmed visually — obey it unconditionally, even if the data looks ambiguous. One unique main_street value per output row — no permutations.
-
-Other rules:
+Rules:
 - Copy street names EXACTLY as they appear — do not rename or substitute
+- "TO" (uppercase, surrounded by spaces) between street names separates from_street and to_street
 - Strip asset IDs and work order numbers (SS-001459-PV1, S2624, etc.) — not street names
 - Skip header rows, totals, subtotals, and non-street data rows
 - Use "" for missing from_street or to_street
@@ -1728,12 +1726,14 @@ CRITICAL — STACKED ROWS: When a cell contains multiple street names merged tog
   Limits cell: "SAN MARINO to MONTELEGRO LACONIA to PRIMAVERA"
   → TWO segments: {{ADAGIO, SAN MARINO, MONTELEGRO}} and {{ADELANTE, LACONIA, PRIMAVERA}}
 
-CRITICAL — CONCATENATED CELLS: DocAI sometimes dumps multiple rows into a single cell, often separated by asset IDs like SS-001459-PV1. Pattern: "SS-XXXX MAIN_STREET CROSS1 CROSS2 SS-XXXX MAIN_STREET2 CROSS1 CROSS2". Strip the asset IDs and extract each street+cross-street pair as its own segment. main_street comes ONLY from column {main_col} — never from column {from_col} or {to_col}.
+CRITICAL — CONCATENATED CELLS: DocAI sometimes dumps multiple rows into a single cell, often separated by asset IDs like SS-001459-PV1. Pattern: "SS-XXXX MAIN_STREET CROSS1 CROSS2 SS-XXXX MAIN_STREET2 CROSS1 CROSS2". Strip the asset IDs and extract each street+cross-street pair as its own segment. The main_street is always the PRIMARY street being worked on — do NOT promote cross-streets to main_street. If you are unsure which is the main street, use the column index confirmed by the vision mapping.
 
 - If from_col and to_col are the same index, that column contains a merged LIMITS/PORTION/SEGMENT cell like "MAIN ST to BROADWAY" or "JAMBOREE RD TO ALTON PKWY" — split on " to " or " TO " to get from_street and to_street. Column headers like LIMITS, PORTION, PORTION DESIGNATED, SEGMENT, LOCATION LIMITS all mean the same thing.
 
 Return ONLY valid JSON, no markdown:
-{{"streets": [{{"main_street": "...", "from_street": "...", "to_street": "..."}}]}}}"""
+{{"streets": [{{"main_street": "...", "from_street": "...", "to_street": "..."}}]}}"""
+
+
     def _extract_chunks_with_opus(header_rows, body_rows, confirmed_cols, page_num):
         """Send all body rows to Gemini 2.5 Pro in a single call with confirmed col mapping."""
         gemini_key = os.environ.get("GEMINI_API_KEY")

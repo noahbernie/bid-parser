@@ -856,6 +856,13 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
                 result[int(page_str)] = [(t["header_rows"], t["body_rows"]) for t in tables]
             if log_fn:
                 log_fn(f"  💾 DocAI cache hit ({pdf_hash[:8]}…) — {sum(len(v) for v in result.values())} tables across {len(result)} pages")
+            # Write raw data to save_raw_path even on cache hit so the DocAI Raw tab works
+            if save_raw_path:
+                try:
+                    with open(save_raw_path, "w") as f:
+                        json.dump(raw, f)
+                except Exception:
+                    pass
             return result
         except Exception as e:
             if log_fn:

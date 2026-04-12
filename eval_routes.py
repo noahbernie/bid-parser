@@ -162,6 +162,24 @@ def _run_eval(job_id: str, doc_key: str, force_reparse: bool):
                 parsed = json.load(f)
             log(f"✓ {len(parsed)} streets from cache", "success")
             job["progress"]["phase"] = "matching"
+
+            # Populate docai_raw in eval cache from persistent docai_cache if not already there
+            raw_dst = os.path.join(CACHE_DIR, doc_key + "_docai_raw.json")
+            if not os.path.exists(raw_dst):
+                pdf_path = os.path.join(PDF_DIR, doc_key + ".pdf")
+                if os.path.exists(pdf_path):
+                    try:
+                        import hashlib as _hl
+                        with open(pdf_path, "rb") as _f:
+                            _pdf_hash = _hl.sha256(_f.read()).hexdigest()
+                        _main_module = os.environ.get("MAIN_MODULE", "main")
+                        import importlib as _il
+                        _m = _il.import_module(_main_module)
+                        _docai_src = os.path.join(_m.DOCAI_CACHE_DIR, f"{_pdf_hash}.json")
+                        if os.path.exists(_docai_src):
+                            shutil.copy(_docai_src, raw_dst)
+                    except Exception:
+                        pass
         else:
             pdf_path = os.path.join(PDF_DIR, doc_key + ".pdf")
             if not os.path.exists(pdf_path):

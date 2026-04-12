@@ -36,7 +36,7 @@
       "Page 194":        { "header_row": 2, "main_street": "Street Name",  "from_street": "Begin Location",  "to_street": "End Location",  "work_type": "Treatment" },
       "Page 195":        { "header_row": 2, "main_street": "Street Name",  "from_street": "Begin Location",  "to_street": "End Location",  "work_type": "Treatment" },
       "Page 196":        { "header_row": 2, "main_street": "Street Name",  "from_street": "Begin Location",  "to_street": "End Location",  "work_type": "Treatment" },
-      "Page 211-214  ":  { "skip": true },
+      "Page 211-214  ":  { "header_row": 3, "main_street": "STREET NAME", "from_street": "BEGIN LOCATION", "to_street": "END LOCATION" },
       "Page 244-248":    { "skip": true }
     }
   },
@@ -73,8 +73,8 @@
       "Page 189-190": { "header_row": 2, "main_street": "Street Name", "from_street": "Begin Location", "to_street": "End Location", "work_type": "Treatment Type" },
       "Page 191":     { "header_row": 2, "main_street": "Street Name", "from_street": "Begin Location", "to_street": "End Location", "work_type": "Treatment Type" },
       "Page 192":     { "header_row": 2, "main_street": "Street Name", "from_street": "Begin Location", "to_street": "End Location", "work_type": "Treatment Type" },
-      "Page 207-212": { "skip": true },
-      "Page 213-216": { "skip": true }
+      "Page 207-212": { "header_row": 2, "main_street": "STREET NAME", "from_street": "BEGIN LOCATION", "to_street": "END LOCATION" },
+      "Page 213-216": { "header_row": 2, "main_street": "STREET NAME", "from_street": "BEGIN LOCATION", "to_street": "END LOCATION" }
     }
   },
 

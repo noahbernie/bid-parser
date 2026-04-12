@@ -14,6 +14,7 @@ import asyncio
 import base64
 import urllib.request
 import threading
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
@@ -21,11 +22,48 @@ load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Persistent cache paths
+DOCAI_CACHE_DIR  = os.path.join(BASE_DIR, "docai_cache")
+VISION_CACHE_FILE = os.path.join(BASE_DIR, "vision_cache.json")
+os.makedirs(DOCAI_CACHE_DIR, exist_ok=True)
+
 # Global semaphore: cap concurrent LLM calls to avoid rate limits across parallel eval workers
 _LLM_SEMAPHORE = threading.Semaphore(4)
 
 _header_cache_lock   = threading.Lock()
-_vision_header_cache = {}  # header_key → confirmed col mapping from Haiku Vision
+
+# Load vision header cache from disk on startup (persists across server restarts)
+def _key_to_json(k):
+    """Recursively convert a nested tuple key to a JSON-serializable list."""
+    if isinstance(k, (tuple, list)):
+        return [_key_to_json(x) for x in k]
+    return k
+
+def _json_to_key(v):
+    """Recursively convert a nested list back to tuples for use as dict keys."""
+    if isinstance(v, list):
+        return tuple(_json_to_key(x) for x in v)
+    return v
+
+def _load_vision_cache() -> dict:
+    if os.path.exists(VISION_CACHE_FILE):
+        try:
+            with open(VISION_CACHE_FILE, "r") as f:
+                raw = json.load(f)
+            return {_json_to_key(json.loads(k)): v for k, v in raw.items()}
+        except Exception:
+            pass
+    return {}
+
+def _save_vision_cache(cache: dict):
+    try:
+        serializable = {json.dumps(_key_to_json(k)): v for k, v in cache.items()}
+        with open(VISION_CACHE_FILE, "w") as f:
+            json.dump(serializable, f)
+    except Exception:
+        pass
+
+_vision_header_cache = _load_vision_cache()  # header_key → confirmed col mapping from Haiku Vision
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 app = FastAPI()
@@ -805,6 +843,24 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
     Layout Parser returns data in document_layout.blocks (not document.pages).
     Each block has table_block / text_block / list_block and a page_span.
     """
+    # Check persistent DocAI cache first
+    pdf_hash = hashlib.sha256(pdf_bytes).hexdigest()
+    cache_path = os.path.join(DOCAI_CACHE_DIR, f"{pdf_hash}.json")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                raw = json.load(f)
+            # Deserialize: keys are string page numbers, values are list of {header_rows, body_rows}
+            result = {}
+            for page_str, tables in raw.items():
+                result[int(page_str)] = [(t["header_rows"], t["body_rows"]) for t in tables]
+            if log_fn:
+                log_fn(f"  💾 DocAI cache hit ({pdf_hash[:8]}…) — {sum(len(v) for v in result.values())} tables across {len(result)} pages")
+            return result
+        except Exception as e:
+            if log_fn:
+                log_fn(f"  ⚠️ DocAI cache load failed: {e} — re-running DocAI")
+
     from google.cloud import documentai
 
     credentials = _get_docai_credentials()
@@ -904,6 +960,22 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
                 total_rows = sum(len(t[1]) for t in all_tables[p])
                 log_fn(f"    Page {p}: {len(all_tables[p])} table(s), {total_rows} rows")
 
+    # Save DocAI result to persistent cache
+    try:
+        serializable_cache = {}
+        for page_num, tables in all_tables.items():
+            serializable_cache[str(page_num)] = [
+                {"header_rows": hdr, "body_rows": body}
+                for hdr, body in tables
+            ]
+        with open(cache_path, "w") as f:
+            json.dump(serializable_cache, f)
+        if log_fn:
+            log_fn(f"  💾 DocAI result cached ({pdf_hash[:8]}…)")
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  ⚠️ Could not save DocAI cache: {e}")
+
     # Optionally save raw parsed table data for debugging
     if save_raw_path:
         try:
@@ -925,15 +997,43 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
 
 
 def _parse_llm_json(raw: str) -> dict:
-    """Extract JSON from an LLM response that may be wrapped in markdown code fences."""
+    """Extract JSON from an LLM response — handles markdown fences, trailing text, and extra commentary."""
+    import re
     raw = raw.strip()
+    # Strip markdown fences first
     if "```" in raw:
         for part in raw.split("```"):
             if part.startswith("json"):
                 raw = part[4:].strip(); break
             elif part.strip().startswith("{"):
                 raw = part.strip(); break
-    return json.loads(raw)
+    # Try direct parse first
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    # Extract the first top-level {...} block — handles trailing text/comments after JSON
+    match = re.search(r'\{[\s\S]*\}', raw)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+    # Last resort: find the outermost balanced braces manually
+    start = raw.find('{')
+    if start != -1:
+        depth = 0
+        for i, ch in enumerate(raw[start:], start):
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(raw[start:i+1])
+                    except json.JSONDecodeError:
+                        break
+    raise json.JSONDecodeError("Could not extract valid JSON from LLM response", raw, 0)
 
 
 def call_gemini_text(prompt: str, text: str, max_retries: int = 6, log_fn=None) -> dict:
@@ -1507,11 +1607,15 @@ Do not invent names — only use the exact text from the merged cell."""
         return False
 
     _HAIKU_IS_STREET_TABLE_PROMPT = (
-        "Look at this table from a road construction bid document (header + first few rows). "
-        "Does this table contain a list of streets, roads, or intersections where pavement work will be performed? "
-        "Answer YES if it lists street names, cross streets, or work locations — even if column headers are unusual or merged. "
-        "Answer NO only if it is clearly a cost estimate, test specification, materials table, legal boilerplate, or contains no street names at all. "
-        "When in doubt, answer YES. "
+        "Look at this page image and table data from a road construction bid document. "
+        "Does this table contain a LIST of streets where pavement work will be performed? "
+        "Answer YES if the table is a street work schedule listing street names with from/to cross-streets or limits. "
+        "Answer NO if any of these are true: "
+        "(1) The page is a map, schematic, or striping plan and the table is a small reference/detail callout (e.g. SNS details, panel numbers, sign locations, quantities by item). "
+        "(2) The table columns are PANEL NO, SIGN NO, QUANTITY, ITEM, UNIT, DESCRIPTION — not FROM/TO/BEGIN/END. "
+        "(3) The table has fewer than 4 rows and is clearly a legend, key, or detail table on a plan sheet. "
+        "(4) The table contains ZERO street names and is purely numerical/specification data. "
+        "Default to YES when the table is a proper street list. "
         'Reply with ONLY valid JSON: {"is_street_table": true} or {"is_street_table": false}'
     )
 
@@ -1525,12 +1629,12 @@ Do not invent names — only use the exact text from the merged cell."""
                 return _vision_header_cache[header_key]
 
         try:
-            b64_img = render_page_as_image(pdf_bytes, max(0, page_num - 1))
+            b64_img = render_page_as_image(pdf_bytes, max(0, page_num - 1), dpi=120)
         except Exception as e:
             log(f"  ⚠ Could not render page {page_num} for street-table check: {e} — assuming yes")
             return True
 
-        sample = {"header_rows": header_rows, "body_rows": body_rows[:5]}
+        sample = {"header_rows": header_rows, "body_rows": body_rows[:6]}
         text = json.dumps(sample, ensure_ascii=False)
         try:
             log(f"  🔎 Page {page_num}: Vision — is this a street table?")
@@ -1543,6 +1647,7 @@ Do not invent names — only use the exact text from the merged cell."""
                 log(f"  ⏭ Page {page_num}: Haiku says not a street table — headers={str(header_rows[:1])[:100]}")
             with _header_cache_lock:
                 _vision_header_cache[header_key] = verdict
+                _save_vision_cache(_vision_header_cache)
             return verdict
         except Exception as e:
             log(f"  ⚠ Street-table check failed p.{page_num}: {e} — assuming yes")
@@ -1568,8 +1673,9 @@ Return ONLY valid JSON:
 {"main_col": <int or null>, "from_col": <int or null>, "to_col": <int or null>, "notes": "..."}"""
 
     def _confirm_headers_with_vision(header_rows, body_rows, page_num):
-        """Haiku Vision: confirm column mapping. Cached per unique header signature."""
-        header_key = tuple(tuple(r) for r in header_rows)
+        """Haiku Vision: confirm column mapping. Cached per unique header+body signature."""
+        body_sample = tuple(tuple(r) for r in body_rows[:2])
+        header_key = tuple(tuple(r) for r in header_rows) + body_sample
         with _header_cache_lock:
             if header_key in _vision_header_cache:
                 cached = _vision_header_cache[header_key]
@@ -1577,12 +1683,12 @@ Return ONLY valid JSON:
                 return cached
 
         try:
-            b64_img = render_page_as_image(pdf_bytes, max(0, page_num - 1))
+            b64_img = render_page_as_image(pdf_bytes, max(0, page_num - 1), dpi=120)
         except Exception as e:
             log(f"  ⚠ Could not render page {page_num} for vision: {e}")
             return {}
 
-        sample = {"header_rows": header_rows, "sample_body_rows": body_rows[:3]}
+        sample = {"header_rows": header_rows, "sample_body_rows": body_rows[:6]}
         prompt = _HEADER_CONFIRM_PROMPT.replace("{table_sample}", json.dumps(sample, ensure_ascii=False, indent=2))
 
         try:
@@ -1591,12 +1697,13 @@ Return ONLY valid JSON:
             log(f"  ✓ Vision: main={result.get('main_col')} from={result.get('from_col')} to={result.get('to_col')} — {result.get('notes','')}")
             with _header_cache_lock:
                 _vision_header_cache[header_key] = result
+                _save_vision_cache(_vision_header_cache)
             return result
         except Exception as e:
             log(f"  ✗ Vision header confirmation failed p.{page_num}: {e}")
             return {}
 
-    # ── Call 2: Opus — extract streets from chunked rows + confirmed col map ───
+    # ── Call 2: Gemini 2.5 Pro — extract streets from rows + confirmed col map ──
 
     _OPUS_CHUNK_PROMPT = """You are extracting street work segments from a road construction bid document table.
 
@@ -1611,23 +1718,31 @@ Rules:
 - Strip asset IDs and work order numbers (SS-001459-PV1, S2624, etc.) — not street names
 - Skip header rows, totals, subtotals, and non-street data rows
 - Use "" for missing from_street or to_street
+- HEADER PREFIX: Some cells have the column header word merged into the value (e.g. "STREET BARRANCA PKWY", "LIMITS JAMBOREE RD TO MAIN ST"). Strip the leading column-type keyword (STREET, LIMITS, ROAD, LOCATION, FROM, TO, ZONE) before extracting the actual value.
+- INVERTED SUFFIX: DocAI sometimes reads multi-line cells with the street type first (e.g. "RD JAMBOREE", "AVE KELVIN", "BLVD ARTHUR"). If a cell starts with a street suffix (RD, AVE, ST, BLVD, DR, LN, CT, WY, PKWY, HWY, CIR) followed by a name, reorder it (e.g. "RD JAMBOREE" → "JAMBOREE RD").
 
 CRITICAL — STACKED ROWS: When a cell contains multiple street names merged together, extract EACH as a separate segment. Positions match across columns:
   Street cell: "ADAGIO ADELANTE"
   Limits cell: "SAN MARINO to MONTELEGRO LACONIA to PRIMAVERA"
   → TWO segments: {{ADAGIO, SAN MARINO, MONTELEGRO}} and {{ADELANTE, LACONIA, PRIMAVERA}}
 
-- If from_col and to_col are the same index, that column contains a merged LIMITS cell like "MAIN ST to BROADWAY" — split on " to " or " TO " to get from_street and to_street.
+CRITICAL — CONCATENATED CELLS: DocAI sometimes dumps multiple rows into a single cell, often separated by asset IDs like SS-001459-PV1. Pattern: "SS-XXXX MAIN_STREET CROSS1 CROSS2 SS-XXXX MAIN_STREET2 CROSS1 CROSS2". Strip the asset IDs and extract each street+cross-street pair as its own segment. The main_street is always the PRIMARY street being worked on — do NOT promote cross-streets to main_street. If you are unsure which is the main street, use the column index confirmed by the vision mapping.
+
+- If from_col and to_col are the same index, that column contains a merged LIMITS/PORTION/SEGMENT cell like "MAIN ST to BROADWAY" or "JAMBOREE RD TO ALTON PKWY" — split on " to " or " TO " to get from_street and to_street. Column headers like LIMITS, PORTION, PORTION DESIGNATED, SEGMENT, LOCATION LIMITS all mean the same thing.
 
 Return ONLY valid JSON, no markdown:
 {{"streets": [{{"main_street": "...", "from_street": "...", "to_street": "..."}}]}}"""
 
     def _extract_chunks_with_opus(header_rows, body_rows, confirmed_cols, page_num):
-        """Send body rows in chunks of 25 to Opus with confirmed col mapping."""
-        CHUNK_SIZE = 25
+        """Send all body rows to Gemini 2.5 Pro in a single call with confirmed col mapping."""
+        gemini_key = os.environ.get("GEMINI_API_KEY")
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        gemini_pro_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={gemini_key}" if gemini_key else None
+
         main_col = confirmed_cols.get("main_col")
         from_col = confirmed_cols.get("from_col")
         to_col   = confirmed_cols.get("to_col")
+        vision_notes = confirmed_cols.get("notes", "")
 
         if main_col is None:
             log(f"  ⚠ Page {page_num}: no main_col confirmed — skipping")
@@ -1638,40 +1753,72 @@ Return ONLY valid JSON, no markdown:
             from_col=from_col if from_col is not None else "N/A",
             to_col=to_col   if to_col   is not None else "N/A",
         )
+        if vision_notes:
+            prompt += f"\n\nAdditional context from visual inspection: {vision_notes}"
 
-        all_streets = []
-        chunks = [body_rows[i:i + CHUNK_SIZE] for i in range(0, len(body_rows), CHUNK_SIZE)]
+        table_data = {"header_rows": header_rows, "body_rows": body_rows}
+        table_json = json.dumps(table_data, ensure_ascii=False, indent=2)
+        full_prompt = prompt + "\n\n" + table_json
 
-        for ci, chunk in enumerate(chunks):
-            chunk_data = {"header_rows": header_rows, "body_rows": chunk}
-            chunk_json = json.dumps(chunk_data, ensure_ascii=False, indent=2)
-            try:
-                log(f"  🤖 Page {page_num} chunk {ci+1}/{len(chunks)} ({len(chunk)} rows) → Opus...")
-                content_blocks = [{"type": "text", "text": chunk_json}]
-                result = call_claude_with_retry(
-                    anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY")),
-                    prompt, content_blocks, max_tokens=8192,
-                    model="claude-opus-4-6", log_fn=log,
-                )
-                chunk_streets = []
-                for s in result.get("streets", []):
-                    main = (s.get("main_street") or "").strip()
-                    if not main:
-                        continue
-                    chunk_streets.append({
-                        "main_street": main,
-                        "from_street": s.get("from_street") or None,
-                        "to_street":   s.get("to_street") or None,
-                        "work_type":   None,
-                        "source": "opus",
-                        "page": page_num,
-                    })
-                log(f"  ✓ Chunk {ci+1}: {len(chunk_streets)} streets")
-                all_streets.extend(chunk_streets)
-            except Exception as e:
-                log(f"  ✗ Opus chunk {ci+1} failed p.{page_num}: {e}")
+        def _call_gemini_pro():
+            payload = json.dumps({
+                "contents": [{"parts": [{"text": full_prompt}]}],
+                "generationConfig": {"maxOutputTokens": 65536, "temperature": 0},
+            }).encode()
+            req = urllib.request.Request(gemini_pro_url, data=payload, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                data = json.loads(resp.read())
+            raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            return _parse_llm_json(raw)
 
-        return all_streets
+        def _call_opus_fallback():
+            content_blocks = [{"type": "text", "text": table_json}]
+            return call_claude_with_retry(
+                anthropic.Anthropic(api_key=anthropic_key),
+                prompt, content_blocks, max_tokens=8192,
+                model="claude-opus-4-6", log_fn=log,
+            )
+
+        try:
+            log(f"  🤖 Page {page_num} ({len(body_rows)} rows) → Gemini 2.5 Pro...")
+            if gemini_pro_url:
+                result = None
+                for attempt in range(4):
+                    try:
+                        result = _call_gemini_pro()
+                        break
+                    except urllib.error.HTTPError as e:
+                        if e.code == 429:
+                            log(f"  ⚠ Gemini 2.5 Pro rate limit (attempt {attempt+1}) — retrying...")
+                        elif e.code >= 500:
+                            log(f"  ⚠ Gemini 2.5 Pro server error {e.code} (attempt {attempt+1}) — retrying...")
+                        else:
+                            raise
+                        time.sleep(3 * (attempt + 1))
+                if result is None:
+                    raise Exception("Gemini 2.5 Pro failed after 4 attempts")
+            else:
+                log(f"  ⚠ No Gemini key — falling back to Opus...")
+                result = _call_opus_fallback()
+
+            streets = []
+            for s in result.get("streets", []):
+                main = (s.get("main_street") or "").strip()
+                if not main:
+                    continue
+                streets.append({
+                    "main_street": main,
+                    "from_street": s.get("from_street") or None,
+                    "to_street":   s.get("to_street") or None,
+                    "work_type":   None,
+                    "source": "gemini-pro",
+                    "page": page_num,
+                })
+            log(f"  ✓ Page {page_num}: {len(streets)} streets")
+            return streets
+        except Exception as e:
+            log(f"  ✗ Extraction failed p.{page_num}: {e}")
+            return []
 
     # ── Main extraction loop ──────────────────────────────────────────────────
 
@@ -1682,7 +1829,7 @@ Return ONLY valid JSON, no markdown:
     sent_to_opus      = 0
     opus_pages        = set()
 
-    log("🤖 Extracting streets with new pipeline (filter → vision headers → Opus chunks)...")
+    log("🤖 Extracting streets with new pipeline (filter → vision headers → Gemini 2.5 Pro)...")
     for page_num in sorted(all_page_tables.keys()):
         for table_tuple in all_page_tables[page_num]:
             header_rows, body_rows = table_tuple

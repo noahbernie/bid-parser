@@ -6,4 +6,11 @@ venv/
 *.pdf
 bid-parser-*.json
 tests/cache/
+tests/cache_opus/
+tests/eval_cache/
 docai_raw_eval_*.json
+opus_prompt_dump_*.json
+docai_cache/
+vision_cache.json
+server.log
+server_opus.log

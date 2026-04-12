@@ -32,7 +32,7 @@ _SUFFIX_MAP = {
     "STREET": "ST", "AVENUE": "AV", "DRIVE": "DR", "BOULEVARD": "BL",
     "ROAD": "RD",   "COURT": "CT",  "LANE": "LN",  "PLACE": "PL",
     "WAY": "WY",    "CIRCLE": "CIR","TERRACE": "TER","TRAIL": "TRL",
-    "AVE": "AV",    "BLVD": "BL",   "PKWY": "PKWY",
+    "AVE": "AV",    "BLVD": "BL",   "PKWY": "PKWY",  "BI": "BL",
 }
 
 # Cyrillic/Greek lookalikes that DocAI OCR sometimes emits instead of Latin chars
@@ -61,6 +61,9 @@ def norm(v) -> str:
     s = s.translate(_UNICODE_CONFUSABLES)  # replace Cyrillic/Greek lookalikes with Latin
     # Strip asset ID prefixes like "SS-001459-PV1 " before further normalization
     s = re.sub(r'^[A-Z]{1,4}-\d{4,8}-[A-Z0-9]+(?:-[A-Z0-9]+)*\s+', '', s)
+    # Normalize all Unicode dash/hyphen variants to ASCII hyphen, then to space
+    import unicodedata
+    s = "".join("-" if unicodedata.category(c) in ("Pd",) or c in ('\u2010','\u2011','\u2012','\u2013','\u2014','\u2015','\u2212') else c for c in s)
     s = s.replace("-", " ")  # normalize hyphens so "CDS-WEST END" == "CDS - WEST END"
     s = re.sub(r"[^\w\s]", "", s)
     parts = s.split()
@@ -79,6 +82,24 @@ def norm(v) -> str:
             merged.append(parts[i])
         i += 1
     parts = merged
+    # Split tokens like "EJST" → ["EJ", "ST"] to match norm("E J ST") → "EJ ST"
+    # Only splits 2-char alpha prefix + known suffix (avoids splitting real words)
+    _SPLIT_SUFFIXES = {"ST", "AV", "BL", "RD", "DR", "LN", "CT", "PL", "WY"}
+    _NO_SPLIT_2 = {"WE", "IN", "ON", "AT", "BE", "DO", "GO", "NO", "SO", "TO", "UP", "US", "IS"}
+    split_parts = []
+    for p in parts:
+        split = False
+        for suf in _SPLIT_SUFFIXES:
+            if p.endswith(suf) and len(p) == len(suf) + 2:
+                prefix = p[:-len(suf)]
+                if prefix.isalpha() and prefix not in _NO_SPLIT_2:
+                    split_parts.extend([prefix, suf])
+                    split = True
+                    break
+        if not split:
+            split_parts.append(p)
+    parts = split_parts
+
     if parts and parts[-1] in _SUFFIX_MAP:
         parts[-1] = _SUFFIX_MAP[parts[-1]]
     # Strip leading/trailing 1-2 digit noise tokens (row numbers, zone IDs, etc.)
@@ -243,11 +264,24 @@ def match_streets(truth: list, parsed: list) -> dict:
     matched, missed, extra = [], [], []
     used = set()
 
-    # Deduplicate parsed streets — strip exact (main, from, to) duplicates
+    # Deduplicate ground truth — same street can appear in multiple tabs/pages
+    seen_keys, deduped_truth = set(), []
+    for t in truth:
+        k = (norm(t.get("main_street","")), norm(t.get("from_street","")), norm(t.get("to_street","")))
+        if k not in seen_keys:
+            seen_keys.add(k)
+            deduped_truth.append(t)
+    truth = deduped_truth
+
+    # Deduplicate parsed streets — strip exact and swapped (main, from, to) duplicates
     seen_keys, deduped = set(), []
     for p in parsed:
-        k = (norm(p.get("main_street","")), norm(p.get("from_street","")), norm(p.get("to_street","")))
-        if k not in seen_keys:
+        mn = norm(p.get("main_street",""))
+        fr = norm(p.get("from_street",""))
+        to = norm(p.get("to_street",""))
+        k        = (mn, fr, to)
+        k_swapped = (mn, to, fr)
+        if k not in seen_keys and k_swapped not in seen_keys:
             seen_keys.add(k)
             deduped.append(p)
     parsed = deduped
@@ -261,11 +295,11 @@ def match_streets(truth: list, parsed: list) -> dict:
             pk = street_key(p)
             ms_score = similarity(tk[0], pk[0])
             # Check normal orientation and swapped FROM/TO (limits can be written either direction)
-            from_ok  = (not tk[1] or not pk[1] or similarity(tk[1], pk[1]) > 0.5)
-            to_ok    = (not tk[2] or not pk[2] or similarity(tk[2], pk[2]) > 0.5)
-            swap_ok  = ((not tk[1] or not pk[2] or similarity(tk[1], pk[2]) > 0.5) and
-                        (not tk[2] or not pk[1] or similarity(tk[2], pk[1]) > 0.5))
-            if ms_score > best_score and (from_ok and to_ok or swap_ok):
+            from_ok  = (not tk[1] or not pk[1] or similarity(tk[1], pk[1]) >= 0.6)
+            to_ok    = (not tk[2] or not pk[2] or similarity(tk[2], pk[2]) >= 0.6)
+            swap_ok  = ((not tk[1] or not pk[2] or similarity(tk[1], pk[2]) >= 0.6) and
+                        (not tk[2] or not pk[1] or similarity(tk[2], pk[1]) >= 0.6))
+            if ms_score > best_score and ((from_ok and to_ok) or swap_ok):
                 best_score, best_idx = ms_score, i
         if best_score >= FUZZY_THRESHOLD and best_idx >= 0:
             matched.append({"truth": t, "parsed": parsed[best_idx], "score": round(best_score, 2)})

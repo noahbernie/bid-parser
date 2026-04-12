@@ -1655,14 +1655,18 @@ Do not invent names — only use the exact text from the merged cell."""
 
     _HAIKU_IS_STREET_TABLE_PROMPT = (
         "Look at this page image and table data from a road construction bid document. "
-        "Does this table contain a LIST of streets where pavement work will be performed? "
-        "Answer YES if the table is a street work schedule listing street names with from/to cross-streets or limits. "
+        "Does this table contain a LIST of streets where pavement WORK WILL BE PERFORMED (repaved, slurry sealed, rehabilitated, etc.)? "
+        "Answer YES only if ALL of these are true: "
+        "(A) The content is presented as a proper STRUCTURED TABLE with clear rows and columns (not just text paragraphs or prose that mentions street names). "
+        "(B) The table is a street WORK SCHEDULE listing streets with from/to cross-streets or limits for construction work. "
         "Answer NO if any of these are true: "
-        "(1) The page is a map, schematic, or striping plan and the table is a small reference/detail callout (e.g. SNS details, panel numbers, sign locations, quantities by item). "
-        "(2) The table columns are PANEL NO, SIGN NO, QUANTITY, ITEM, UNIT, DESCRIPTION — not FROM/TO/BEGIN/END. "
-        "(3) The table has fewer than 4 rows and is clearly a legend, key, or detail table on a plan sheet. "
-        "(4) The table contains ZERO street names and is purely numerical/specification data. "
-        "Default to YES when the table is a proper street list. "
+        "(1) The table is a DESIGNATED TRUCK ROUTES, PERMIT ROUTES, HAULING ROUTES, or TRAFFIC ORDINANCE list — these list streets for regulatory/legal purposes, not construction work. "
+        "(2) The page is a map, schematic, or striping plan with a small reference/detail callout (SNS details, panel numbers, sign locations, quantities). "
+        "(3) The table columns are PANEL NO, SIGN NO, QUANTITY, ITEM, UNIT, DESCRIPTION — not FROM/TO/BEGIN/END. "
+        "(4) The table has fewer than 4 rows and is clearly a legend, key, or detail table. "
+        "(5) The table contains ZERO street names and is purely numerical/specification data. "
+        "(6) Street names only appear in running text/paragraphs, not in a structured table grid with labeled columns. "
+        "Default to YES only when the table is clearly a structured pavement work schedule grid. "
         'Reply with ONLY valid JSON: {"is_street_table": true} or {"is_street_table": false}'
     )
 
@@ -1684,14 +1688,14 @@ Do not invent names — only use the exact text from the merged cell."""
         sample = {"header_rows": header_rows, "body_rows": body_rows[:6]}
         text = json.dumps(sample, ensure_ascii=False)
         try:
-            log(f"  🔎 Page {page_num}: Vision — is this a street table?")
+            headers_preview = str(header_rows[:1])[:120] if header_rows else str(body_rows[:1])[:120]
+            log(f"  🔎 Page {page_num}: Haiku (claude-haiku-4-5-20251001) — is this a street table? headers={headers_preview}")
             result = call_vision_with_retry(
                 _HAIKU_IS_STREET_TABLE_PROMPT + "\n\n" + text,
                 b64_img, max_tokens=64, log_fn=log,
             )
             verdict = bool(result.get("is_street_table", True))
-            if not verdict:
-                log(f"  ⏭ Page {page_num}: Haiku says not a street table — headers={str(header_rows[:1])[:100]}")
+            log(f"  {'✅' if verdict else '⏭'} Page {page_num}: Haiku street-table={verdict} — headers={headers_preview}")
             with _header_cache_lock:
                 _vision_header_cache[header_key] = verdict
                 _save_vision_cache(_vision_header_cache)

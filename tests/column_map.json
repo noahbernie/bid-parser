@@ -9,7 +9,11 @@
 
   "20230307115819832 FY 22-23 Street Rehab and Slurry Seal Specification Final 2": {
     "tabs": {
-      "Page 218-241": { "header_row": 2, "main_street": "STREET", "limits_col": "LIMITS", "work_type": null }
+      "Page 218-241": [
+        { "header_row": 2,   "data_start_row": 4,   "data_end_row": 459, "main_street": "STREET",      "limits_col": "LIMITS", "work_type": null },
+        { "header_row": 460, "data_start_row": 462,  "data_end_row": 910, "main_street": "STREET",      "limits_col": "LIMITS", "work_type": null },
+        { "header_row": 916, "data_start_row": 917,                       "main_street": "Street Name", "from_street": "From",  "to_street": "To", "work_type": null }
+      ]
     }
   },
 

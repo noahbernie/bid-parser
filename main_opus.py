@@ -796,10 +796,10 @@ def call_vision_with_retry(prompt: str, b64_image: str, max_tokens: int = 512, m
     raise Exception("Vision max retries exceeded (both Haiku and Gemini rate limited)")
 
 
-# ─── Document AI Layout Parser ───────────────────────────────────────────────
-DOCAI_PROJECT      = "bid-parser-492923"
+# ─── Document AI Form Parser ─────────────────────────────────────────────────
+DOCAI_PROJECT      = "284828153354"
 DOCAI_LOCATION     = "us"
-DOCAI_PROCESSOR_ID = "7bb46b34cc5383cf"
+DOCAI_PROCESSOR_ID = "8e7372377435d1ba"
 DOCAI_CRED_FILE    = os.path.join(BASE_DIR, "bid-parser-492923-ea3bbe06380d.json")
 
 STREETS_PROMPT_DOCAI = """You are parsing road construction bid document tables extracted by a layout parser.
@@ -836,12 +836,12 @@ def _get_docai_credentials():
 
 def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) -> dict:
     """
-    Send PDF to Document AI Layout Parser in 15-page chunks.
-    Returns {page_num (1-indexed): [list of table row lists]}.
-    Each table is a list of rows; each row is a list of cell strings.
+    Send PDF to Document AI Form Parser in 10-page chunks.
+    Returns {page_num (1-indexed): [(header_rows, body_rows), ...]}.
 
-    Layout Parser returns data in document_layout.blocks (not document.pages).
-    Each block has table_block / text_block / list_block and a page_span.
+    Form Parser returns tables via document.pages[i].tables.
+    Cell text is extracted via text anchors into document.text.
+    Columns are preserved separately — unlike Layout Parser which merges adjacent columns.
     """
     # Check persistent DocAI cache first
     pdf_hash = hashlib.sha256(pdf_bytes).hexdigest()
@@ -880,26 +880,41 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
     CHUNK_SIZE = 10
     all_tables: dict = {}
 
-    def _cell_text(cell) -> str:
-        """Extract text from a Layout Parser table cell, preserving newlines between blocks."""
+    def _cell_text(cell_layout, full_text: str) -> str:
+        """Extract text from a Form Parser table cell using text anchors into document.text."""
+        try:
+            segs = cell_layout.text_anchor.text_segments
+        except AttributeError:
+            return ""
         parts = []
-        for block in cell.blocks:
-            if block.text_block.text:
-                parts.append(block.text_block.text.strip())
-        return "\n".join(parts).strip()
+        for seg in segs:
+            try:
+                start = int(seg.start_index) if seg.start_index is not None else 0
+                end   = int(seg.end_index)   if seg.end_index   is not None else 0
+                if end > start:
+                    parts.append(full_text[start:end])
+            except Exception:
+                pass
+        return "".join(parts).strip()
 
-    def _parse_table_block(table_block, page_offset: int) -> tuple:
+    def _parse_form_table(table, full_text: str) -> tuple:
         """
-        Parse a Layout Parser table_block into (header_rows, body_rows).
-        Uses Document AI's native header/body split — no guessing needed.
+        Parse a Form Parser table into (header_rows, body_rows).
+        Form Parser natively splits header vs body rows.
         Returns (header_rows, body_rows) each as list of list of strings.
         """
-        header_rows = [[_cell_text(cell) for cell in row.cells] for row in table_block.header_rows]
-        body_rows   = [[_cell_text(cell) for cell in row.cells] for row in table_block.body_rows]
+        header_rows = []
+        for row in (table.header_rows or []):
+            header_rows.append([_cell_text(cell.layout, full_text) for cell in (row.cells or [])])
+
+        body_rows = []
+        for row in (table.body_rows or []):
+            body_rows.append([_cell_text(cell.layout, full_text) for cell in (row.cells or [])])
+
         return header_rows, body_rows
 
     def _process_chunk(chunk_start: int, chunk_end: int):
-        """Send one chunk of pages to DocAI and add results to all_tables. Returns True on success."""
+        """Send one chunk of pages to DocAI Form Parser and add results to all_tables."""
         src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         chunk_doc = fitz.open()
         chunk_doc.insert_pdf(src_doc, from_page=chunk_start, to_page=chunk_end - 1)
@@ -913,24 +928,23 @@ def docai_extract_all_tables(pdf_bytes: bytes, log_fn=None, save_raw_path=None) 
         )
         resp = client.process_document(request=req)
         doc_obj = resp.document
-        layout = doc_obj.document_layout
+        full_text = doc_obj.text or ""  # Form Parser stores all text here; cells reference via anchors
 
-        def _recurse_blocks(blocks):
-            for block in blocks:
-                has_table = block.table_block.body_rows or block.table_block.header_rows
-                if has_table:
-                    local_page = block.page_span.page_start
-                    global_page = chunk_start + local_page
-                    header_rows, body_rows = _parse_table_block(block.table_block, chunk_start)
-                    if body_rows:
-                        yield global_page, (header_rows, body_rows)
-                if block.text_block.text is not None:
-                    children = list(block.text_block.blocks)
-                    if children:
-                        yield from _recurse_blocks(children)
+        if log_fn:
+            log_fn(f"    Form Parser: {len(doc_obj.pages)} pages, text={len(full_text)} chars")
 
-        for global_page, table_tuple in _recurse_blocks(layout.blocks):
-            all_tables.setdefault(global_page, []).append(table_tuple)
+        # Form Parser: tables live in document.pages[i].tables
+        for page in doc_obj.pages:
+            # page.page_number is 1-indexed within this chunk
+            local_page  = getattr(page, "page_number", None)
+            if local_page is None:
+                continue
+            global_page = chunk_start + local_page
+            tables_on_page = getattr(page, "tables", []) or []
+            for table in tables_on_page:
+                header_rows, body_rows = _parse_form_table(table, full_text)
+                if body_rows:
+                    all_tables.setdefault(global_page, []).append((header_rows, body_rows))
 
     for chunk_start in range(0, total_pages, CHUNK_SIZE):
         chunk_end = min(chunk_start + CHUNK_SIZE, total_pages)

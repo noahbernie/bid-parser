@@ -1625,6 +1625,34 @@ Do not invent names — only use the exact text from the merged cell."""
                     return True
         return False
 
+    # ── Stage 0: Text keyword filter (free, no API call) ─────────────────────
+
+    _STREET_KEYWORDS = {
+        "FROM", "TO", "START", "END", "BEGIN", "BEGINNING",
+        "LIMITS", "LIMIT", "PORTION", "SEGMENT",
+        "STREET", "ROAD", "AVENUE", "CROSS", "NAME",
+    }
+
+    def _text_header_filter(header_rows, body_rows):
+        """
+        Check header cells for street-table vocabulary.
+        Returns False immediately (skip table) if no keywords found.
+        """
+        for row in header_rows:
+            for cell in row:
+                words = str(cell or "").upper().split()
+                if any(w in _STREET_KEYWORDS for w in words):
+                    return True
+        # No headers? Fall back to checking first body row
+        if not header_rows and body_rows:
+            for cell in body_rows[0]:
+                words = str(cell or "").upper().split()
+                if any(w in _STREET_KEYWORDS for w in words):
+                    return True
+        return False
+
+    # ── Stage 1: Haiku Vision — is this a street table? ──────────────────────
+
     _HAIKU_IS_STREET_TABLE_PROMPT = (
         "Look at this page image and table data from a road construction bid document. "
         "Does this table contain a LIST of streets where pavement work will be performed? "
@@ -1844,16 +1872,22 @@ Return ONLY valid JSON, no markdown:
 
     total_doc_pages  = doc["total_pages"]
     total_tables     = sum(len(v) for v in all_page_tables.values())
-    skipped_heuristic = 0
-    skipped_haiku     = 0
-    sent_to_opus      = 0
-    opus_pages        = set()
+    skipped_text  = 0
+    skipped_haiku = 0
+    sent_to_opus  = 0
+    opus_pages    = set()
 
-    log("🤖 Extracting streets with new pipeline (filter → vision headers → Gemini 2.5 Pro)...")
+    log("🤖 Extracting streets with new pipeline (text filter → Haiku ×2 → Gemini 2.5 Pro)...")
     for page_num in sorted(all_page_tables.keys()):
         for table_tuple in all_page_tables[page_num]:
             header_rows, body_rows = table_tuple
             if not body_rows:
+                continue
+
+            # Stage 0: Text keyword filter — free, instant
+            if not _text_header_filter(header_rows, body_rows):
+                skipped_text += 1
+                log(f"  ⏩ p.{page_num}: text filter skip — {str([c for r in header_rows[:1] for c in r])[:80]}")
                 continue
 
             # Stage 1: Haiku Vision — is this a street table?
@@ -1861,11 +1895,12 @@ Return ONLY valid JSON, no markdown:
                 skipped_haiku += 1
                 continue
 
-            # Stage 3: Haiku Vision confirms column mapping (cached per header signature)
+            # Stage 2: Haiku Vision — confirm column mapping
             confirmed_cols = _confirm_headers_with_vision(header_rows, body_rows, page_num)
             if not confirmed_cols or confirmed_cols.get("main_col") is None:
-                log(f"  ⚠ Page {page_num}: vision could not confirm headers — falling back to full Opus")
-                confirmed_cols = {"main_col": 0, "from_col": 1, "to_col": 2}
+                log(f"  ⏭ p.{page_num}: Haiku could not confirm col mapping — skipping table")
+                skipped_haiku += 1
+                continue
 
             # Stage 4: Opus extracts streets in chunks
             sent_to_opus += 1
@@ -1877,8 +1912,9 @@ Return ONLY valid JSON, no markdown:
     log(
         f"📊 Filter summary — doc pages: {total_doc_pages} | "
         f"tables found by DocAI: {total_tables} | "
+        f"skipped (text): {skipped_text} | "
         f"skipped (Haiku): {skipped_haiku} | "
-        f"sent to Opus: {sent_to_opus} tables on {len(opus_pages)} pages"
+        f"sent to Gemini: {sent_to_opus} tables on {len(opus_pages)} pages"
     )
 
     # --- Step 4: Deduplication ---

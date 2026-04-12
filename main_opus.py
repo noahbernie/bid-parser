@@ -1866,7 +1866,10 @@ Return ONLY valid JSON, no markdown:
                             elif e.code >= 500:
                                 log(f"  ⚠ Gemini 2.5 Pro server error {e.code} (attempt {attempt+1}) — retrying...")
                             else:
-                                raise
+                                log(f"  ⚠ Gemini 2.5 Pro HTTP error {e.code} (attempt {attempt+1}) — retrying...")
+                            time.sleep(3 * (attempt + 1))
+                        except Exception as e:
+                            log(f"  ⚠ Gemini 2.5 Pro error (attempt {attempt+1}): {str(e)[:80]} — retrying...")
                             time.sleep(3 * (attempt + 1))
                     if result is None:
                         log(f"  ⚠ Gemini 2.5 Pro failed after 4 attempts — falling back to Opus...")

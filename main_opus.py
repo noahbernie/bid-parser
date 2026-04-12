@@ -1869,7 +1869,8 @@ Return ONLY valid JSON, no markdown:
                                 raise
                             time.sleep(3 * (attempt + 1))
                     if result is None:
-                        raise Exception("Gemini 2.5 Pro failed after 4 attempts")
+                        log(f"  ⚠ Gemini 2.5 Pro failed after 4 attempts — falling back to Opus...")
+                        result = _call_opus_fallback()
                 else:
                     log(f"  ⚠ No Gemini key — falling back to Opus...")
                     result = _call_opus_fallback()

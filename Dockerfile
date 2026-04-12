@@ -16,7 +16,7 @@ COPY . .
 EXPOSE 8000
 
 # Single worker — extraction is CPU/IO heavy and uses shared in-memory state
-CMD ["gunicorn", "main:app", \
+CMD ["gunicorn", "main_opus:app", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--workers", "1", \
      "--bind", "0.0.0.0:8000", \

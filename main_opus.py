@@ -28,7 +28,6 @@ VISION_CACHE_FILE = os.path.join(BASE_DIR, "vision_cache.json")
 os.makedirs(DOCAI_CACHE_DIR, exist_ok=True)
 
 # Global semaphore: cap concurrent LLM calls to avoid rate limits across parallel eval workers
-_LLM_SEMAPHORE = threading.Semaphore(8)
 
 _header_cache_lock   = threading.Lock()
 
@@ -1066,49 +1065,48 @@ def call_gemini_text(prompt: str, text: str, max_retries: int = 6, log_fn=None) 
         "generationConfig": {"maxOutputTokens": 65536, "temperature": 0},
     }).encode()
 
-    with _LLM_SEMAPHORE:
-        for attempt in range(max_retries):
-            use_claude = (attempt % 2 == 1)  # alternate: Gemini on even, Claude on odd attempts
-            try:
-                if not use_claude:
-                    if not gemini_key:
-                        use_claude = True
-                    else:
-                        req = urllib.request.Request(gemini_url, data=gemini_payload, headers={"Content-Type": "application/json"})
-                        with urllib.request.urlopen(req, timeout=60) as resp:
-                            data = json.loads(resp.read())
-                        raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                        return _parse_llm_json(raw)
-
-                if use_claude:
-                    client = anthropic.Anthropic(api_key=anthropic_key)
-                    msg = client.messages.create(
-                        model="claude-haiku-4-5-20251001",
-                        max_tokens=4096,
-                        temperature=0,
-                        messages=[{"role": "user", "content": prompt + "\n\n" + text}],
-                    )
-                    return _parse_llm_json(msg.content[0].text.strip())
-
-            except urllib.error.HTTPError as e:
-                body = e.read().decode()
-                if e.code == 429:
-                    if log_fn:
-                        log_fn(f"  ⚠ Gemini rate limit (attempt {attempt+1}) — switching to Claude...")
-                    time.sleep(5)
-                elif attempt < max_retries - 1:
-                    time.sleep(3)
+    for attempt in range(max_retries):
+        use_claude = (attempt % 2 == 1)  # alternate: Gemini on even, Claude on odd attempts
+        try:
+            if not use_claude:
+                if not gemini_key:
+                    use_claude = True
                 else:
-                    raise Exception(f"Gemini HTTP {e.code}: {body[:200]}")
-            except anthropic.RateLimitError:
+                    req = urllib.request.Request(gemini_url, data=gemini_payload, headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        data = json.loads(resp.read())
+                    raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    return _parse_llm_json(raw)
+
+            if use_claude:
+                client = anthropic.Anthropic(api_key=anthropic_key)
+                msg = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=4096,
+                    temperature=0,
+                    messages=[{"role": "user", "content": prompt + "\n\n" + text}],
+                )
+                return _parse_llm_json(msg.content[0].text.strip())
+
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            if e.code == 429:
                 if log_fn:
-                    log_fn(f"  ⚠ Claude rate limit (attempt {attempt+1}) — switching to Gemini...")
+                    log_fn(f"  ⚠ Gemini rate limit (attempt {attempt+1}) — switching to Claude...")
                 time.sleep(5)
-            except Exception:
-                if attempt < max_retries - 1:
-                    time.sleep(3)
-                else:
-                    raise
+            elif attempt < max_retries - 1:
+                time.sleep(3)
+            else:
+                raise Exception(f"Gemini HTTP {e.code}: {body[:200]}")
+        except anthropic.RateLimitError:
+            if log_fn:
+                log_fn(f"  ⚠ Claude rate limit (attempt {attempt+1}) — switching to Gemini...")
+            time.sleep(5)
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(3)
+            else:
+                raise
     raise Exception("LLM max retries exceeded (both Gemini and Claude rate limited)")
 
 
@@ -1844,25 +1842,24 @@ Return ONLY valid JSON, no markdown:
 
         try:
             log(f"  🤖 Page {page_num} ({len(body_rows)} rows) → Gemini 2.5 Pro...")
-            with _LLM_SEMAPHORE:
-                result = None
-                for attempt in range(6):
-                    try:
-                        result = _call_gemini_pro()
-                        break
-                    except urllib.error.HTTPError as e:
-                        if e.code == 429:
-                            log(f"  ⚠ Gemini 2.5 Pro rate limit (attempt {attempt+1}) — retrying...")
-                        elif e.code >= 500:
-                            log(f"  ⚠ Gemini 2.5 Pro server error {e.code} (attempt {attempt+1}) — retrying...")
-                        else:
-                            log(f"  ⚠ Gemini 2.5 Pro HTTP error {e.code} (attempt {attempt+1}) — retrying...")
-                        time.sleep(3 * (attempt + 1))
-                    except Exception as e:
-                        log(f"  ⚠ Gemini 2.5 Pro error (attempt {attempt+1}): {str(e)[:80]} — retrying...")
-                        time.sleep(3 * (attempt + 1))
-                if result is None:
-                    raise Exception("Gemini 2.5 Pro failed after 6 attempts")
+            result = None
+            for attempt in range(6):
+                try:
+                    result = _call_gemini_pro()
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code == 429:
+                        log(f"  ⚠ Gemini 2.5 Pro rate limit (attempt {attempt+1}) — retrying...")
+                    elif e.code >= 500:
+                        log(f"  ⚠ Gemini 2.5 Pro server error {e.code} (attempt {attempt+1}) — retrying...")
+                    else:
+                        log(f"  ⚠ Gemini 2.5 Pro HTTP error {e.code} (attempt {attempt+1}) — retrying...")
+                    time.sleep(3 * (attempt + 1))
+                except Exception as e:
+                    log(f"  ⚠ Gemini 2.5 Pro error (attempt {attempt+1}): {str(e)[:80]} — retrying...")
+                    time.sleep(3 * (attempt + 1))
+            if result is None:
+                raise Exception("Gemini 2.5 Pro failed after 6 attempts")
 
             streets = []
             for s in result.get("streets", []):

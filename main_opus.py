@@ -1903,15 +1903,53 @@ Return ONLY valid JSON, no markdown:
                 continue
 
             # Pre-filter: skip DocAI artifact tables where the header cell contains
-            # a column keyword (STREET/LIMITS/ZONE) followed by stacked data rows.
-            # These are duplicate fragments of the clean table that follows on the same page.
+            # a column keyword (STREET/LIMITS/ZONE) followed by stacked data rows,
+            # BUT only when a clean sibling table also exists on the same page.
+            # If no clean sibling exists, the stacked table IS the real data — don't skip it.
             if header_rows and len(body_rows) <= 2:
                 first_cell = str(header_rows[0][0]) if header_rows[0] else ""
-                _COL_KEYWORDS = ("STREET\n", "LIMITS\n", "ZONE\n", "STREET NAME\n", "BEGIN\n", "END\n")
-                if any(first_cell.startswith(kw) for kw in _COL_KEYWORDS):
-                    log(f"  ⏩ p.{page_num}: skipping DocAI artifact table (column header + stacked data in header cell)")
-                    skipped_text += 1
-                    continue
+                _ARTIFACT_KWS = ("STREET\n", "LIMITS\n", "ZONE\n", "STREET NAME\n", "BEGIN\n", "END\n")
+                if any(first_cell.startswith(kw) for kw in _ARTIFACT_KWS):
+                    page_tables_list = all_page_tables[page_num]
+                    has_clean_sibling = any(
+                        other_h and other_h[0] and "\n" not in str(other_h[0][0])
+                        for (other_h, other_b) in page_tables_list
+                        if (other_h, other_b) is not table_tuple and other_b and len(other_b) > 2
+                    )
+                    if has_clean_sibling:
+                        log(f"  ⏩ p.{page_num}: skipping DocAI artifact table (clean sibling exists on same page)")
+                        skipped_text += 1
+                        continue
+
+            # Stacked-header expansion: DocAI sometimes packs data rows into header cells
+            # e.g. header[0][0] = "STREET\nECCELSTONE CIR\nKENNEDY DR\n..."
+            # Expand those embedded lines into additional body rows so Gemini sees them.
+            if header_rows:
+                first_cell = str(header_rows[0][0] if header_rows[0] else "")
+                _STACK_KWS = ("STREET\n", "LIMITS\n", "ZONE\n", "STREET NAME\n", "BEGIN\n", "END\n",
+                              "CROSS STREET\n", "FROM\n", "TO\n")
+                if any(first_cell.startswith(kw) for kw in _STACK_KWS):
+                    num_cols = max(len(r) for r in header_rows)
+                    # Split every header cell by newline; first line = column label
+                    split_cols = []
+                    for col_i in range(num_cols):
+                        cell = str(header_rows[0][col_i]) if col_i < len(header_rows[0]) else ""
+                        parts = [p for p in cell.split("\n") if p.strip()]
+                        split_cols.append(parts)
+                    max_data_lines = max((len(p) - 1 for p in split_cols), default=0)
+                    if max_data_lines > 0:
+                        # Rebuild clean single-line header
+                        clean_header = [[p[0] if p else "" for p in split_cols]]
+                        # Build expanded body rows from the stacked lines
+                        expanded_body = []
+                        for row_i in range(max_data_lines):
+                            row = []
+                            for p in split_cols:
+                                row.append(p[row_i + 1] if row_i + 1 < len(p) else "")
+                            expanded_body.append(row)
+                        header_rows = clean_header
+                        body_rows   = expanded_body + list(body_rows)
+                        log(f"  📋 p.{page_num}: expanded stacked header — {max_data_lines} rows extracted from header cells")
 
             # Stage 0: Text keyword filter — free, instant
             if not _text_header_filter(header_rows, body_rows):

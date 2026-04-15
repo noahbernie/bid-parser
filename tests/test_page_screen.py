@@ -57,7 +57,7 @@ _GEMINI_PAGE_SCREEN_PROMPT = (
     "(6) The table columns are about traffic control, permits, or administrative data only. "
     "(7) The page is a section cover page, appendix title page, table of contents, or blank divider — even if the title mentions 'locations' or 'list'. "
     "(8) The page contains specification requirements or contractor instructions that MENTION streets by name in prose paragraphs or as a numbered/bulleted list, but those streets are NOT organized as rows in a multi-column table. "
-    "(9) The page is a large multi-page condition database or pavement management export — identifiable by having hundreds of rows with many flag/code columns (C, M, SP, PCI, etc.) and a Latitude/Longitude column. These are asset inventory tables, not work schedules. "
+    "(9) The page is an extremely dense pavement management database export — identifiable by having MORE THAN 12 narrow columns packed tightly across the page AND a Latitude/Longitude column. These PMS asset inventory tables typically have columns like C, M, SP, PCI, Supervisorial District, Council District, and hundreds of rows of data. Answer NO for these even if they contain street names. "
     'Reply ONLY with valid JSON: {"is_street_schedule": true} or {"is_street_schedule": false}'
 )
 

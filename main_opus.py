@@ -1189,8 +1189,29 @@ async def get_chunks(doc_id: str):
     return PlainTextResponse("\n".join(lines))
 
 
+_GEMINI_PAGE_SCREEN_PROMPT = (
+    "You are screening a page from a road construction bid document. "
+    "Does this page contain a STREET WORK SCHEDULE TABLE — a structured grid table listing streets "
+    "where pavement work (paving, slurry seal, rehab, overlay, etc.) will be performed, "
+    "with columns for street name and from/to cross-streets or limits? "
+    "Answer YES only if ALL are true: "
+    "(A) There is a visible grid table with clear rows and columns. "
+    "(B) The table lists MULTIPLE streets (3 or more rows of street names) with work limits or cross-streets. "
+    "(C) The columns are clearly about pavement work locations — Street Name, From, To, Begin, End, Limits, Cross Street, etc. "
+    "Answer NO if ANY of these are true: "
+    "(1) The table is a TRUCK ROUTE list, permit route, or hauling route ordinance. "
+    "(2) The table is a quantities/cost table, bid schedule, or spec table. "
+    "(3) The page is a map, striping plan, diagram, or permit form. "
+    "(4) The table has a STATUS column listing Restricted/Unrestricted — this is a project zones table, not a street schedule. "
+    "(5) The page is a LANE/SHOULDER CLOSURE REQUEST FORM or any permittee/contractor form with County/Route/PM columns. "
+    "(6) The table is a form with blank fields to be filled in (checkboxes, signature lines, blank date fields). "
+    "(7) The table columns are about traffic control, permits, or administrative data rather than pavement work locations. "
+    'Reply ONLY with valid JSON: {"is_street_schedule": true} or {"is_street_schedule": false}'
+)
+
+
 def run_extraction(doc_id: str, api_key: str):
-    """Extract streets using Document AI for table extraction + Gemini for column mapping."""
+    """New pipeline: Gemini Flash page screen → DocAI (filtered pages) → Gemini Pro extraction."""
     doc = documents[doc_id]
     pdf_bytes = doc["bytes"]
 
@@ -1203,21 +1224,124 @@ def run_extraction(doc_id: str, api_key: str):
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    # --- Step 1: Extract project header from first 5 pages ---
-    log("Extracting project info from cover pages...")
+    # --- Step 1: Extract project header from first 5 pages (include city & state) ---
+    log("📋 Step 1: Extracting project info from cover pages...")
+    _HEADER_PROMPT_V2 = """You are parsing a road construction bid document. Extract project-level fields only.
+Return ONLY valid JSON with these fields:
+- bid_number, project_name, city, state, work_type, estimated_cost, bid_due_date
+Use null for any field not found. city and state are the city/state where the work will be performed."""
+
     header_blocks = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for i in range(min(5, len(pdf.pages))):
             text = pdf.pages[i].extract_text() or ""
             header_blocks.append({"type": "text", "text": f"\n--- Page {i+1} ---\n{text}"})
     try:
-        schema = call_claude_with_retry(client, HEADER_PROMPT, header_blocks, max_tokens=1024, log_fn=log)
-        log(f"✓ Project: {schema.get('project_name')} | {schema.get('city')} | {schema.get('bid_number')}")
+        schema = call_claude_with_retry(client, _HEADER_PROMPT_V2, header_blocks, max_tokens=1024, log_fn=log)
+        log(f"✓ Project: {schema.get('project_name')} | {schema.get('city')}, {schema.get('state')} | bid={schema.get('bid_number')}")
     except Exception as e:
         log(f"✗ Header extraction failed: {e}")
-        return
+        schema = {}
 
+    city  = schema.get("city") or ""
+    state = schema.get("state") or ""
     schema["streets"] = []
+    all_streets = []
+
+    # --- Step 2: Gemini Flash page screen — classify every page in parallel ---
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    gemini_flash_url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+        if gemini_key else None
+    )
+
+    total_pages = doc["total_pages"]
+    log(f"🔍 Step 2: Gemini Flash page screen — {total_pages} pages in parallel...")
+
+    def _screen_page(page_idx: int) -> tuple:
+        """Returns (page_num_1indexed, is_street_schedule: bool)."""
+        page_num = page_idx + 1
+        try:
+            b64 = render_page_as_image(pdf_bytes, page_idx, dpi=150)
+            payload = json.dumps({
+                "contents": [{"parts": [
+                    {"text": _GEMINI_PAGE_SCREEN_PROMPT},
+                    {"inline_data": {"mime_type": "image/png", "data": b64}},
+                ]}],
+                "generationConfig": {"maxOutputTokens": 512, "temperature": 0},
+            }).encode()
+            req = urllib.request.Request(
+                gemini_flash_url, data=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+            # Gemini 2.5 Flash may include thinking tokens — always use the LAST text part
+            parts = data["candidates"][0]["content"].get("parts", [])
+            text_parts = [p["text"].strip() for p in parts if isinstance(p, dict) and p.get("text")]
+            if not text_parts:
+                log(f"  ⚠ Page {page_num}: no text in response — assuming no")
+                return page_num, False
+            answer = text_parts[-1]  # last part is always the final answer
+            log(f"  🔎 Page {page_num} answer: {repr(answer[:120])}")
+            answer_lower = answer.lower().replace(" ", "").replace("\n", "")
+            if '"is_street_schedule":true' in answer_lower:
+                return page_num, True
+            if '"is_street_schedule":false' in answer_lower:
+                return page_num, False
+            # Broader fallback
+            if "true" in answer_lower:
+                return page_num, True
+            return page_num, False
+        except Exception as e:
+            log(f"  ⚠ Page screen failed p.{page_num}: {str(e)[:80]} — assuming no")
+            return page_num, False
+
+    selected_pages = []
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        futures = {pool.submit(_screen_page, i): i for i in range(total_pages)}
+        results = {}
+        for future in as_completed(futures):
+            page_num, is_schedule = future.result()
+            results[page_num] = is_schedule
+
+    for page_num in sorted(results):
+        verdict = results[page_num]
+        icon = "✅" if verdict else "⏭"
+        log(f"  {icon} Page {page_num}: {'STREET SCHEDULE — will send to DocAI' if verdict else 'skip'}")
+        if verdict:
+            selected_pages.append(page_num)
+
+    log(f"")
+    log(f"📊 Page screen complete — {len(selected_pages)}/{total_pages} pages selected for DocAI:")
+    log(f"   Pages: {selected_pages}")
+    log(f"")
+    log(f"⏸️  STOPPING HERE — review selected pages above before proceeding to DocAI.")
+
+    schema["_meta"] = {
+        "total_pages": total_pages,
+        "selected_pages": selected_pages,
+        "city": city,
+        "state": state,
+    }
+    doc["extracted_schema"] = schema
+    log(f"✓ Done (page screen only — DocAI not yet called).", [])
+
+
+def run_extraction_DISABLED(doc_id: str, api_key: str):
+    """OLD pipeline — kept for reference, not called."""
+    doc = documents[doc_id]
+    pdf_bytes = doc["bytes"]
+
+    def log(msg, streets_so_far=None):
+        p = doc.get("progress") or {"logs": [], "streets_so_far": []}
+        p["logs"].append(msg)
+        if streets_so_far is not None:
+            p["streets_so_far"] = streets_so_far
+        doc["progress"] = p
+
+    client = anthropic.Anthropic(api_key=api_key)
+    schema = {}
     all_streets = []
 
     # --- Step 2: Extract all tables via Document AI Form Parser ---

@@ -1191,21 +1191,22 @@ async def get_chunks(doc_id: str):
 
 _GEMINI_PAGE_SCREEN_PROMPT = (
     "You are screening a page from a road construction bid document. "
-    "Does this page contain a STREET WORK SCHEDULE TABLE — a structured grid table listing streets "
-    "where pavement work (paving, slurry seal, rehab, overlay, etc.) will be performed, "
-    "with columns for street name and from/to cross-streets or limits? "
-    "Answer YES only if ALL are true: "
-    "(A) There is a visible grid table with clear rows and columns. "
-    "(B) The table lists MULTIPLE streets (3 or more rows of street names) with work limits or cross-streets. "
-    "(C) The columns are clearly about pavement work locations — Street Name, From, To, Begin, End, Limits, Cross Street, etc. "
+    "Does this page contain a TABULAR WORK SCHEDULE listing STREET LOCATIONS where paving, slurry seal, resurfacing, or utility adjustment work will be performed? "
+    "Answer YES only if the page has a structured multi-column table whose rows each represent a street segment or address where physical work will be done. "
+    "This includes: "
+    "(A) Street work schedule tables with columns like Street Name, From, To, Begin, End, Limits, Cross Street, Activity, Treatment. "
+    "(B) Utility adjustment location lists with address/street rows and a work type column (e.g. Address | Utility Type | Frame Size). "
+    "(C) Continuation pages of such tables even if the column headers are not visible — the page has rows of street data in column-aligned tabular format. "
     "Answer NO if ANY of these are true: "
     "(1) The table is a TRUCK ROUTE list, permit route, or hauling route ordinance. "
-    "(2) The table is a quantities/cost table, bid schedule, or spec table. "
-    "(3) The page is a map, striping plan, diagram, or permit form. "
-    "(4) The table has a STATUS column listing Restricted/Unrestricted — this is a project zones table, not a street schedule. "
-    "(5) The page is a LANE/SHOULDER CLOSURE REQUEST FORM or any permittee/contractor form with County/Route/PM columns. "
-    "(6) The table is a form with blank fields to be filled in (checkboxes, signature lines, blank date fields). "
-    "(7) The table columns are about traffic control, permits, or administrative data rather than pavement work locations. "
+    "(2) The table is a quantities/cost/bid schedule with no street names or addresses. "
+    "(3) The page is a CAD engineering drawing, plan sheet, striping plan, slurry seal plan, or intersection diagram — recognizable by road geometry/line work showing curbs, lanes, and centerlines, with a title block in the corner. Answer NO even if the page contains a small embedded table labeled 'STREETS THIS SHEET', 'QUANTITIES THIS SHEET', 'NO DETAILS THIS SHEET', or similar plan-sheet summary tables. "
+    "(4) The table has a STATUS column listing Restricted/Unrestricted — this is a project zones table. "
+    "(5) The page is a LANE/SHOULDER CLOSURE REQUEST FORM or contractor form with blank fields to fill in. "
+    "(6) The table columns are about traffic control, permits, or administrative data only. "
+    "(7) The page is a section cover page, appendix title page, table of contents, or blank divider — even if the title mentions 'locations' or 'list'. "
+    "(8) The page contains specification requirements or contractor instructions that MENTION streets by name in prose paragraphs or as a numbered/bulleted list, but those streets are NOT organized as rows in a multi-column table. "
+    "(9) The page is a large multi-page condition database or pavement management export — identifiable by having hundreds of rows with many flag/code columns (C, M, SP, PCI, etc.) and a Latitude/Longitude column. These are asset inventory tables, not work schedules. "
     'Reply ONLY with valid JSON: {"is_street_schedule": true} or {"is_street_schedule": false}'
 )
 
@@ -1305,8 +1306,26 @@ Use null for any field not found. city and state are the city/state where the wo
             page_num, is_schedule = future.result()
             results[page_num] = is_schedule
 
+    # Expand selections to include continuation pages:
+    # If page N is selected, also include up to 4 following pages that weren't explicitly
+    # rejected (i.e., they either timed out or are continuations with no visible header).
+    # Stop expanding if a page was screened and explicitly returned false.
+    raw_selected = {p for p, v in results.items() if v}
+    expanded = set(raw_selected)
+    for p in sorted(raw_selected):
+        for offset in range(1, 5):
+            candidate = p + offset
+            if candidate > total_pages:
+                break
+            if candidate in raw_selected:
+                break  # already selected, stop
+            if results.get(candidate) is False:
+                break  # explicitly rejected — stop expanding
+            # Not screened (timeout) or adjacent to a selected page — include it
+            expanded.add(candidate)
+
     for page_num in sorted(results):
-        verdict = results[page_num]
+        verdict = page_num in expanded
         icon = "✅" if verdict else "⏭"
         log(f"  {icon} Page {page_num}: {'STREET SCHEDULE — will send to DocAI' if verdict else 'skip'}")
         if verdict:

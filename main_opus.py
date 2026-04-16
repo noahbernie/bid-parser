@@ -1335,16 +1335,415 @@ Use null for any field not found. city and state are the city/state where the wo
     log(f"📊 Page screen complete — {len(selected_pages)}/{total_pages} pages selected for DocAI:")
     log(f"   Pages: {selected_pages}")
     log(f"")
-    log(f"⏸️  STOPPING HERE — review selected pages above before proceeding to DocAI.")
 
+    if not selected_pages:
+        log("⚠ No pages selected — nothing to extract.")
+        doc["extracted_schema"] = schema
+        return
+
+    # --- Step 3: DocAI Form Parser — send each selected page individually in parallel ---
+    log(f"🔷 Step 3: Document AI Form Parser — {len(selected_pages)} pages in parallel...")
+
+    from google.cloud import documentai as _docai
+
+    credentials = _get_docai_credentials()
+    if not credentials:
+        log("✗ No Document AI credentials — set GOOGLE_APPLICATION_CREDENTIALS_JSON")
+        doc["extracted_schema"] = schema
+        return
+
+    docai_client = _docai.DocumentProcessorServiceClient(
+        credentials=credentials,
+        client_options={"api_endpoint": f"{DOCAI_LOCATION}-documentai.googleapis.com"},
+    )
+    processor_name = f"projects/{DOCAI_PROJECT}/locations/{DOCAI_LOCATION}/processors/{DOCAI_PROCESSOR_ID}"
+
+    def _cell_text(cell_layout, full_text: str) -> str:
+        try:
+            segs = cell_layout.text_anchor.text_segments
+        except AttributeError:
+            return ""
+        parts = []
+        for seg in segs:
+            try:
+                start = int(seg.start_index) if seg.start_index is not None else 0
+                end   = int(seg.end_index)   if seg.end_index   is not None else 0
+                if end > start:
+                    parts.append(full_text[start:end])
+            except Exception:
+                pass
+        return "".join(parts).strip()
+
+    def _parse_form_table(table, full_text: str) -> tuple:
+        header_rows = []
+        for row in (table.header_rows or []):
+            header_rows.append([_cell_text(cell.layout, full_text) for cell in (row.cells or [])])
+        body_rows = []
+        for row in (table.body_rows or []):
+            body_rows.append([_cell_text(cell.layout, full_text) for cell in (row.cells or [])])
+        return header_rows, body_rows
+
+    def _docai_single_page(page_num_1indexed: int) -> tuple:
+        """Extract tables from a single page via DocAI. Returns (page_num, [(hdr,body),...])."""
+        page_idx = page_num_1indexed - 1
+        # Check per-page cache using (pdf_hash, page_num) key
+        pdf_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        page_cache_path = os.path.join(DOCAI_CACHE_DIR, f"{pdf_hash}_p{page_num_1indexed}.json")
+        if os.path.exists(page_cache_path):
+            try:
+                with open(page_cache_path) as f:
+                    raw = json.load(f)
+                tables = [(t["header_rows"], t["body_rows"]) for t in raw]
+                log(f"  💾 DocAI cache hit p.{page_num_1indexed} ({len(tables)} tables)")
+                return page_num_1indexed, tables
+            except Exception:
+                pass
+        try:
+            src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            single_doc = fitz.open()
+            single_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
+            page_bytes = single_doc.tobytes()
+            src_doc.close()
+            single_doc.close()
+
+            req = _docai.ProcessRequest(
+                name=processor_name,
+                raw_document=_docai.RawDocument(content=page_bytes, mime_type="application/pdf"),
+            )
+            resp = docai_client.process_document(request=req)
+            doc_obj = resp.document
+            full_text = doc_obj.text or ""
+
+            tables = []
+            for page in doc_obj.pages:
+                for table in (getattr(page, "tables", []) or []):
+                    hdr, body = _parse_form_table(table, full_text)
+                    if body:
+                        tables.append((hdr, body))
+
+            log(f"  🔷 DocAI p.{page_num_1indexed}: {len(tables)} table(s)")
+
+            # Cache result
+            try:
+                serializable = [{"header_rows": h, "body_rows": b} for h, b in tables]
+                with open(page_cache_path, "w") as f:
+                    json.dump(serializable, f)
+            except Exception:
+                pass
+
+            return page_num_1indexed, tables
+        except Exception as e:
+            log(f"  ⚠ DocAI failed p.{page_num_1indexed}: {str(e)[:100]} — skipping")
+            return page_num_1indexed, []
+
+    all_page_tables: dict = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = {pool.submit(_docai_single_page, p): p for p in selected_pages}
+        for fut in as_completed(futs):
+            pn, tables = fut.result()
+            if tables:
+                all_page_tables[pn] = tables
+
+    total_tables = sum(len(v) for v in all_page_tables.values())
+    total_rows   = sum(len(t[1]) for v in all_page_tables.values() for t in v)
+    log(f"✓ DocAI complete — {len(all_page_tables)} pages with tables, {total_tables} tables, {total_rows} body rows")
+
+    if not all_page_tables:
+        log("⚠ DocAI found no tables on selected pages.")
+        schema["streets"] = []
+        schema["_meta"] = {"total_pages": total_pages, "selected_pages": selected_pages,
+                           "city": city, "state": state, "total_streets": 0}
+        doc["extracted_schema"] = schema
+        return
+
+    # --- Step 4: Extract streets (Haiku Vision col-confirm → Gemini 2.5 Pro extraction) ---
+    log("🤖 Step 4: Extracting streets — Haiku col-confirm → Gemini 2.5 Pro...")
+
+    STREET_SUFFIXES = {"RD", "AV", "AVE", "DR", "LN", "CT", "PL", "ST", "BL", "BLVD", "WY", "WAY",
+                       "TR", "TRL", "CIR", "TER", "ML", "HWY", "PKWY", "FWY"}
+    _MAX_UNSCRAMBLE_SUFFIXES = 10
+
+    _STREET_TABLE_HEADER_KW = {
+        "STREET", "ROAD", "ROADWAY", "FROM", "TO", "BEGIN", "END",
+        "LIMITS", "CROSS", "INTERSECTION", "LOCATION", "WORK", "TREATMENT",
+        "SCOPE", "ACTIVITY", "OVERLAY", "SLURRY", "SEAL", "RESURFAC",
+    }
+    _STREET_KEYWORDS = {
+        "FROM", "TO", "START", "END", "BEGIN", "BEGINNING", "LIMITS", "LIMIT",
+        "PORTION", "SEGMENT", "STREET", "ROAD", "AVENUE", "CROSS", "NAME",
+    }
+
+    def _text_header_filter(header_rows, body_rows):
+        for row in header_rows:
+            for cell in row:
+                if any(w in _STREET_KEYWORDS for w in str(cell or "").upper().split()):
+                    return True
+        if not header_rows and body_rows:
+            for cell in body_rows[0]:
+                if any(w in _STREET_KEYWORDS for w in str(cell or "").upper().split()):
+                    return True
+        return False
+
+    header_cache: dict = {}
+
+    _HEADER_CONFIRM_PROMPT = """You are analyzing a table from a road construction bid document.
+
+Raw table data (headers + first 3 data rows):
+{table_sample}
+
+The page image above shows how this table looks visually.
+
+Identify (using 0-based column index):
+1. main_col: column containing the PRIMARY STREET being worked on
+2. from_col: column for where work BEGINS / first cross-street (FROM, BEGIN, CROSS STREET 1, etc.)
+3. to_col: column for where work ENDS / second cross-street (TO, END, CROSS STREET 2, etc.)
+
+IMPORTANT: Look at the actual DATA ROWS, not just the header text. Sometimes the data is in a different order than the header label implies. Trust what you see in the data.
+
+Return ONLY valid JSON:
+{"main_col": <int or null>, "from_col": <int or null>, "to_col": <int or null>, "notes": "..."}"""
+
+    def _confirm_headers_with_vision(header_rows, body_rows, page_num):
+        body_sample = tuple(tuple(r) for r in body_rows[:2])
+        header_key = tuple(tuple(r) for r in header_rows) + body_sample
+        with _header_cache_lock:
+            if header_key in _vision_header_cache:
+                cached = _vision_header_cache[header_key]
+                log(f"  👁 p.{page_num}: cached vision col map: {cached}")
+                return cached
+        try:
+            b64_img = render_page_as_image(pdf_bytes, page_num - 1, dpi=120)
+        except Exception as e:
+            log(f"  ⚠ Could not render p.{page_num} for vision: {e}")
+            return {}
+        sample = {"header_rows": header_rows, "sample_body_rows": body_rows[:6]}
+        prompt = _HEADER_CONFIRM_PROMPT.replace("{table_sample}", json.dumps(sample, ensure_ascii=False, indent=2))
+        try:
+            log(f"  👁 p.{page_num}: confirming headers with Haiku Vision...")
+            result = call_vision_with_retry(prompt, b64_img, max_tokens=256, log_fn=log)
+            log(f"  ✓ Vision: main={result.get('main_col')} from={result.get('from_col')} to={result.get('to_col')} — {result.get('notes','')}")
+            with _header_cache_lock:
+                _vision_header_cache[header_key] = result
+                _save_vision_cache(_vision_header_cache)
+            return result
+        except Exception as e:
+            log(f"  ✗ Vision header confirm failed p.{page_num}: {e}")
+            return {}
+
+    _OPUS_CHUNK_PROMPT = """You are extracting street work segments from a road construction bid document table.
+
+Column mapping (0-based indices):
+- main_street: column {main_col} — the PRIMARY street being worked on
+- from_street: column {from_col} — where work BEGINS / first cross-street
+- to_street:   column {to_col}   — where work ENDS / second cross-street
+
+Rules:
+- Copy street names EXACTLY as they appear — do not rename or substitute
+- "TO" (uppercase, surrounded by spaces) between street names separates from_street and to_street
+- Strip asset IDs and work order numbers (SS-001459-PV1, S2624, etc.) — not street names
+- Skip header rows, totals, subtotals, and non-street data rows
+- Use "" for missing from_street or to_street
+- HEADER PREFIX: Some cells have the column header word merged into the value (e.g. "STREET BARRANCA PKWY", "LIMITS JAMBOREE RD TO MAIN ST"). Strip the leading column-type keyword (STREET, LIMITS, ROAD, LOCATION, FROM, TO, ZONE) before extracting the actual value.
+- INVERTED SUFFIX: DocAI sometimes reads multi-line cells with the street type first (e.g. "RD JAMBOREE"). If a cell starts with a street suffix followed by a name, reorder it.
+
+CRITICAL — STACKED ROWS: When a cell contains multiple street names merged together, extract EACH as a separate segment. Positions match across columns.
+
+CRITICAL — CONCATENATED CELLS: DocAI sometimes dumps multiple rows into a single cell separated by asset IDs. Extract each street+cross-street pair as its own segment.
+
+- If from_col and to_col are the same index, that column contains a merged LIMITS cell like "MAIN ST to BROADWAY" — split on " to " or " TO ".
+
+Return ONLY valid JSON, no markdown:
+{{"streets": [{{"main_street": "...", "from_street": "...", "to_street": "..."}}]}}"""
+
+    def _extract_with_gemini_pro(header_rows, body_rows, confirmed_cols, page_num):
+        gemini_key = os.environ.get("GEMINI_API_KEY")
+        gemini_pro_url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={gemini_key}"
+            if gemini_key else None
+        )
+        main_col = confirmed_cols.get("main_col")
+        from_col = confirmed_cols.get("from_col")
+        to_col   = confirmed_cols.get("to_col")
+        if main_col is None:
+            log(f"  ⚠ p.{page_num}: no main_col — skipping")
+            return []
+        # Slice to only relevant columns
+        relevant_cols = sorted({c for c in [main_col, from_col, to_col] if c is not None})
+        def _slice(rows):
+            return [[row[c] if c < len(row) else "" for c in relevant_cols] for row in rows]
+        col_remap = {orig: new for new, orig in enumerate(relevant_cols)}
+        sliced_main = col_remap.get(main_col)
+        sliced_from = col_remap.get(from_col) if from_col is not None else None
+        sliced_to   = col_remap.get(to_col)   if to_col   is not None else None
+        prompt = _OPUS_CHUNK_PROMPT.format(
+            main_col=sliced_main,
+            from_col=sliced_from if sliced_from is not None else "N/A",
+            to_col=sliced_to     if sliced_to   is not None else "N/A",
+        )
+        notes = confirmed_cols.get("notes", "")
+        if notes:
+            prompt += f"\n\nAdditional context from visual inspection: {notes}"
+        table_data = {"header_rows": _slice(header_rows), "body_rows": _slice(body_rows)}
+        full_prompt = prompt + "\n\n" + json.dumps(table_data, ensure_ascii=False, indent=2)
+
+        result = None
+        for attempt in range(6):
+            try:
+                payload = json.dumps({
+                    "contents": [{"parts": [{"text": full_prompt}]}],
+                    "generationConfig": {"maxOutputTokens": 65536, "temperature": 0},
+                }).encode()
+                req = urllib.request.Request(gemini_pro_url, data=payload, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    data = json.loads(resp.read())
+                raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                result = _parse_llm_json(raw)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 503):
+                    log(f"  ⚠ Gemini Pro HTTP {e.code} p.{page_num} attempt {attempt+1} — retrying...")
+                    time.sleep(3 * (attempt + 1))
+                else:
+                    log(f"  ⚠ Gemini Pro HTTP {e.code} p.{page_num} — {e}")
+                    break
+            except Exception as e:
+                log(f"  ⚠ Gemini Pro error p.{page_num} attempt {attempt+1}: {str(e)[:80]}")
+                time.sleep(3 * (attempt + 1))
+
+        if result is None:
+            log(f"  ⚠ Gemini Pro failed after retries p.{page_num} — falling back to Opus...")
+            try:
+                content_blocks = [{"type": "text", "text": json.dumps(table_data, ensure_ascii=False, indent=2)}]
+                result = call_claude_with_retry(
+                    client, prompt, content_blocks, max_tokens=8192,
+                    model="claude-opus-4-6", log_fn=log,
+                )
+            except Exception as e:
+                log(f"  ✗ Opus fallback also failed p.{page_num}: {e}")
+                return []
+
+        streets = []
+        for s in result.get("streets", []):
+            main = (s.get("main_street") or "").strip()
+            if not main:
+                continue
+            streets.append({
+                "main_street": main,
+                "from_street": s.get("from_street") or None,
+                "to_street":   s.get("to_street")   or None,
+                "work_type":   None,
+                "source": "gemini-pro",
+                "page": page_num,
+            })
+        log(f"  ✓ p.{page_num}: {len(streets)} streets extracted")
+        return streets
+
+    skipped_text  = 0
+    skipped_haiku = 0
+    sent_to_gemini = 0
+
+    for page_num in sorted(all_page_tables.keys()):
+        for table_tuple in all_page_tables[page_num]:
+            header_rows, body_rows = table_tuple
+            if not body_rows:
+                continue
+
+            # Pre-filter: skip DocAI artifact tables (stacked header cells) when a clean sibling exists
+            if header_rows and len(body_rows) <= 2:
+                first_cell = str(header_rows[0][0]) if header_rows[0] else ""
+                _ARTIFACT_KWS = ("STREET\n", "LIMITS\n", "ZONE\n", "STREET NAME\n", "BEGIN\n", "END\n")
+                if any(first_cell.startswith(kw) for kw in _ARTIFACT_KWS):
+                    page_tables_list = all_page_tables[page_num]
+                    has_clean_sibling = any(
+                        other_h and other_h[0] and "\n" not in str(other_h[0][0])
+                        for (other_h, other_b) in page_tables_list
+                        if (other_h, other_b) is not table_tuple and other_b and len(other_b) > 2
+                    )
+                    if has_clean_sibling:
+                        log(f"  ⏩ p.{page_num}: skipping DocAI artifact (clean sibling exists)")
+                        skipped_text += 1
+                        continue
+
+            # Stacked-header expansion
+            if header_rows:
+                first_cell = str(header_rows[0][0] if header_rows[0] else "")
+                _STACK_KWS = ("STREET\n", "LIMITS\n", "ZONE\n", "STREET NAME\n", "BEGIN\n", "END\n",
+                              "CROSS STREET\n", "FROM\n", "TO\n")
+                if any(first_cell.startswith(kw) for kw in _STACK_KWS):
+                    num_cols = max(len(r) for r in header_rows)
+                    split_cols = []
+                    for col_i in range(num_cols):
+                        cell = str(header_rows[0][col_i]) if col_i < len(header_rows[0]) else ""
+                        split_cols.append([p for p in cell.split("\n") if p.strip()])
+                    max_data_lines = max((len(p) - 1 for p in split_cols), default=0)
+                    if max_data_lines > 0:
+                        clean_header = [[p[0] if p else "" for p in split_cols]]
+                        expanded_body = []
+                        for row_i in range(max_data_lines):
+                            expanded_body.append([p[row_i + 1] if row_i + 1 < len(p) else "" for p in split_cols])
+                        header_rows = clean_header
+                        body_rows   = expanded_body + list(body_rows)
+                        log(f"  📋 p.{page_num}: expanded stacked header — {max_data_lines} rows from header cells")
+
+            # Text keyword filter
+            if not _text_header_filter(header_rows, body_rows):
+                skipped_text += 1
+                log(f"  ⏩ p.{page_num}: text filter skip")
+                continue
+
+            # Haiku Vision: confirm column mapping
+            confirmed_cols = _confirm_headers_with_vision(header_rows, body_rows, page_num)
+            if not confirmed_cols or confirmed_cols.get("main_col") is None:
+                log(f"  ⏭ p.{page_num}: Haiku could not confirm col mapping — skipping")
+                skipped_haiku += 1
+                continue
+
+            # Gemini 2.5 Pro: extract streets
+            sent_to_gemini += 1
+            extracted = _extract_with_gemini_pro(header_rows, body_rows, confirmed_cols, page_num)
+            all_streets.extend(extracted)
+
+    log(f"📊 Extraction summary — {skipped_text} text-filtered, {skipped_haiku} haiku-skipped, {sent_to_gemini} tables sent to Gemini")
+
+    # --- Step 5: Deduplicate ---
+    log("🔀 Step 5: Deduplicating...")
+    _SUFFIX_MAP = {
+        "STREET": "ST", "AVENUE": "AV", "DRIVE": "DR", "BOULEVARD": "BL",
+        "ROAD": "RD", "COURT": "CT", "LANE": "LN", "PLACE": "PL",
+        "WAY": "WY", "CIRCLE": "CIR", "TERRACE": "TER", "TRAIL": "TRL",
+    }
+    def norm_name(v):
+        if not v:
+            return ""
+        parts = v.strip().upper().split()
+        if parts and parts[-1] in _SUFFIX_MAP:
+            parts[-1] = _SUFFIX_MAP[parts[-1]]
+        return " ".join(parts)
+
+    before = len(all_streets)
+    seen = {}
+    for s in all_streets:
+        key = (
+            norm_name(s.get("main_street")),
+            norm_name(s.get("from_street")),
+            norm_name(s.get("to_street")),
+            (s.get("work_type") or "").strip().upper(),
+        )
+        if key not in seen:
+            seen[key] = s
+    all_streets = list(seen.values())
+    log(f"  Dedup: {before} → {len(all_streets)} streets")
+
+    schema["streets"] = all_streets
     schema["_meta"] = {
         "total_pages": total_pages,
         "selected_pages": selected_pages,
         "city": city,
         "state": state,
+        "total_streets": len(all_streets),
     }
     doc["extracted_schema"] = schema
-    log(f"✓ Done (page screen only — DocAI not yet called).", [])
+    log(f"✓ Done! {len(all_streets)} streets extracted.", all_streets)
 
 
 def run_extraction_DISABLED(doc_id: str, api_key: str):

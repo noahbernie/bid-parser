@@ -29,7 +29,10 @@ VISION_CACHE_FILE = os.path.join(BASE_DIR, "vision_cache.json")
 os.makedirs(DOCAI_CACHE_DIR, exist_ok=True)
 os.makedirs(SCREEN_CACHE_DIR, exist_ok=True)
 
-# Global semaphore: cap concurrent LLM calls to avoid rate limits across parallel eval workers
+# Global semaphores: cap concurrent API calls across all parallel document runs
+_SCREEN_SEMAPHORE   = threading.Semaphore(15)  # Gemini Flash page screening
+_DOCAI_SEMAPHORE    = threading.Semaphore(6)   # Document AI form parser
+_GEMINI_PRO_SEM     = threading.Semaphore(4)   # Gemini 2.5 Pro extraction
 
 _header_cache_lock   = threading.Lock()
 
@@ -1288,12 +1291,13 @@ Use null for any field not found. city and state are the city/state where the wo
         last_err = None
         for attempt in range(3):
             try:
-                req = urllib.request.Request(
-                    gemini_flash_url, data=payload,
-                    headers={"Content-Type": "application/json"}
-                )
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    data = json.loads(resp.read())
+                with _SCREEN_SEMAPHORE:
+                    req = urllib.request.Request(
+                        gemini_flash_url, data=payload,
+                        headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        data = json.loads(resp.read())
                 # Gemini 2.5 Flash may include thinking tokens — always use the LAST text part
                 parts = data["candidates"][0]["content"].get("parts", [])
                 text_parts = [p["text"].strip() for p in parts if isinstance(p, dict) and p.get("text")]
@@ -1421,62 +1425,95 @@ Use null for any field not found. city and state are the city/state where the wo
             try:
                 with open(page_cache_path) as f:
                     raw = json.load(f)
-                tables = [(t["header_rows"], t["body_rows"]) for t in raw]
+                # New format: dict with full_text, lines, tables
+                # Old format: list of table dicts (backward compat)
+                if isinstance(raw, dict):
+                    tables = [(t["header_rows"], t["body_rows"]) for t in raw.get("tables", [])]
+                    full_text_cached = raw.get("full_text", "")
+                    lines_cached = raw.get("lines", [])
+                else:
+                    tables = [(t["header_rows"], t["body_rows"]) for t in raw]
+                    full_text_cached = ""
+                    lines_cached = []
                 log(f"  💾 DocAI cache hit p.{page_num_1indexed} ({len(tables)} tables)")
-                return page_num_1indexed, tables
+                return page_num_1indexed, tables, full_text_cached, lines_cached
             except Exception:
                 pass
         try:
-            src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            single_doc = fitz.open()
-            single_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
-            page_bytes = single_doc.tobytes()
-            src_doc.close()
-            single_doc.close()
+            with _DOCAI_SEMAPHORE:
+                src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                single_doc = fitz.open()
+                single_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
+                page_bytes = single_doc.tobytes()
+                src_doc.close()
+                single_doc.close()
 
-            req = _docai.ProcessRequest(
-                name=processor_name,
-                raw_document=_docai.RawDocument(content=page_bytes, mime_type="application/pdf"),
-            )
-            resp = docai_client.process_document(request=req)
-            doc_obj = resp.document
-            full_text = doc_obj.text or ""
+                req = _docai.ProcessRequest(
+                    name=processor_name,
+                    raw_document=_docai.RawDocument(content=page_bytes, mime_type="application/pdf"),
+                )
+                resp = docai_client.process_document(request=req)
+                doc_obj = resp.document
+                full_text = doc_obj.text or ""
 
-            tables = []
-            for page in doc_obj.pages:
-                for table in (getattr(page, "tables", []) or []):
-                    hdr, body = _parse_form_table(table, full_text)
-                    if body:
-                        tables.append((hdr, body))
+                tables = []
+                lines = []
+                form_fields = []
+                for page in doc_obj.pages:
+                    for table in (getattr(page, "tables", []) or []):
+                        hdr, body = _parse_form_table(table, full_text)
+                        if body:
+                            tables.append((hdr, body))
+                    for line in (getattr(page, "lines", []) or []):
+                        lt = _cell_text(getattr(line, "layout", None), full_text)
+                        if lt.strip():
+                            lines.append(lt.strip())
+                    for ff in (getattr(page, "form_fields", []) or []):
+                        try:
+                            fname = _cell_text(getattr(ff.field_name, "text_anchor", None) if ff.field_name else None, full_text)
+                            fval  = _cell_text(getattr(ff.field_value, "text_anchor", None) if ff.field_value else None, full_text)
+                            if fname or fval:
+                                form_fields.append({"name": fname, "value": fval})
+                        except Exception:
+                            pass
 
-            log(f"  🔷 DocAI p.{page_num_1indexed}: {len(tables)} table(s)")
+                log(f"  🔷 DocAI p.{page_num_1indexed}: {len(tables)} table(s), {len(lines)} lines")
 
-            # Cache result
-            try:
-                serializable = [{"header_rows": h, "body_rows": b} for h, b in tables]
-                with open(page_cache_path, "w") as f:
-                    json.dump(serializable, f)
-            except Exception:
-                pass
+                # Cache all fields
+                try:
+                    serializable = {
+                        "full_text": full_text,
+                        "lines": lines,
+                        "form_fields": form_fields,
+                        "tables": [{"header_rows": h, "body_rows": b} for h, b in tables],
+                    }
+                    with open(page_cache_path, "w") as f:
+                        json.dump(serializable, f)
+                except Exception:
+                    pass
 
-            return page_num_1indexed, tables
+                return page_num_1indexed, tables, full_text, lines
         except Exception as e:
             log(f"  ⚠ DocAI failed p.{page_num_1indexed}: {str(e)[:100]} — skipping")
-            return page_num_1indexed, []
+            return page_num_1indexed, [], "", []
 
-    all_page_tables: dict = {}
+    # {page_num: {"tables": [(hdr, body), ...], "full_text": "...", "lines": [...]}}
+    all_page_data: dict = {}
     with ThreadPoolExecutor(max_workers=8) as pool:
         futs = {pool.submit(_docai_single_page, p): p for p in selected_pages}
         for fut in as_completed(futs):
-            pn, tables = fut.result()
-            if tables:
-                all_page_tables[pn] = tables
+            pn, tables, full_text_p, lines_p = fut.result()
+            if tables or full_text_p:
+                all_page_data[pn] = {"tables": tables, "full_text": full_text_p, "lines": lines_p}
+
+    # Keep backward-compat alias for legacy code paths below
+    all_page_tables = {pn: d["tables"] for pn, d in all_page_data.items() if d["tables"]}
 
     total_tables = sum(len(v) for v in all_page_tables.values())
     total_rows   = sum(len(t[1]) for v in all_page_tables.values() for t in v)
-    log(f"✓ DocAI complete — {len(all_page_tables)} pages with tables, {total_tables} tables, {total_rows} body rows")
+    log(f"✓ DocAI complete — {len(all_page_data)} pages with data ({len(all_page_tables)} with tables), {total_tables} tables, {total_rows} body rows")
 
-    if not all_page_tables:
+    if not all_page_data:
         log("⚠ DocAI found no tables on selected pages.")
         schema["streets"] = []
         schema["_meta"] = {"total_pages": total_pages, "selected_pages": selected_pages,
@@ -1485,7 +1522,7 @@ Use null for any field not found. city and state are the city/state where the wo
         return
 
     # --- Step 4: Extract streets (Haiku Vision col-confirm → Gemini 2.5 Pro extraction) ---
-    log("🤖 Step 4: Extracting streets — Haiku col-confirm → Gemini 2.5 Pro...")
+    log("🤖 Step 4: Extracting streets — Gemini 2.5 Pro...")
 
     STREET_SUFFIXES = {"RD", "AV", "AVE", "DR", "LN", "CT", "PL", "ST", "BL", "BLVD", "WY", "WAY",
                        "TR", "TRL", "CIR", "TER", "ML", "HWY", "PKWY", "FWY"}
@@ -1501,7 +1538,7 @@ Use null for any field not found. city and state are the city/state where the wo
         "PORTION", "SEGMENT", "STREET", "ROAD", "AVENUE", "CROSS", "NAME",
     }
 
-    def _text_header_filter(header_rows, body_rows):
+    def _text_header_filter(header_rows, body_rows, full_text=""):
         for row in header_rows:
             for cell in row:
                 if any(w in _STREET_KEYWORDS for w in str(cell or "").upper().split()):
@@ -1510,6 +1547,12 @@ Use null for any field not found. city and state are the city/state where the wo
             for cell in body_rows[0]:
                 if any(w in _STREET_KEYWORDS for w in str(cell or "").upper().split()):
                     return True
+        # Fallback: check full_text from DocAI — catches pages where DocAI returns
+        # 0 body rows or keyword-free headers but the OCR text has street data
+        if full_text:
+            upper = full_text.upper()
+            if any(kw in upper for kw in _STREET_KEYWORDS):
+                return True
         return False
 
     # ── Gemini Vision extraction (used when DocAI dropped the STREET column) ───
@@ -1597,16 +1640,26 @@ Rules:
 Return ONLY valid JSON, no markdown:
 {{"streets": [{{"main_street": "...", "from_street": "...", "to_street": "..."}}]}}"""
 
-    def _extract_with_gemini_pro(header_rows, body_rows, page_num):
+    def _extract_with_gemini_pro(header_rows, body_rows, page_num, full_text="", lines=None):  # noqa: ARG001
         gemini_key = os.environ.get("GEMINI_API_KEY")
         gemini_pro_url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={gemini_key}"
             if gemini_key else None
         )
         table_data = {"header_rows": header_rows, "body_rows": body_rows}
-        full_prompt = _OPUS_CHUNK_PROMPT.format(
-            table_data=json.dumps(table_data, ensure_ascii=False, indent=2)
-        )
+        table_json = json.dumps(table_data, ensure_ascii=False, indent=2)
+
+        # Augment with full_text when available (helps for pages where DocAI tables are sparse)
+        if full_text and full_text.strip():
+            augmented = (
+                f"{table_json}\n\n"
+                f"RAW OCR TEXT (full page text from Document AI, use to supplement missing table data):\n"
+                f"{full_text}"
+            )
+        else:
+            augmented = table_json
+
+        full_prompt = _OPUS_CHUNK_PROMPT.format(table_data=augmented)
 
         result = None
         for attempt in range(6):
@@ -1615,9 +1668,10 @@ Return ONLY valid JSON, no markdown:
                     "contents": [{"parts": [{"text": full_prompt}]}],
                     "generationConfig": {"maxOutputTokens": 65536, "temperature": 0},
                 }).encode()
-                req = urllib.request.Request(gemini_pro_url, data=payload, headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=300) as resp:
-                    data = json.loads(resp.read())
+                with _GEMINI_PRO_SEM:
+                    req = urllib.request.Request(gemini_pro_url, data=payload, headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=300) as resp:
+                        data = json.loads(resp.read())
                 raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
                 result = _parse_llm_json(raw)
                 break
@@ -1664,82 +1718,42 @@ Return ONLY valid JSON, no markdown:
     sent_to_gemini = 0
     sent_to_vision = 0
 
-    for page_num in sorted(all_page_tables.keys()):
-        for table_tuple in all_page_tables[page_num]:
-            header_rows, body_rows = table_tuple
-            if not body_rows:
-                continue
+    for page_num in sorted(all_page_data.keys()):
+        page_entry = all_page_data[page_num]
+        page_full_text = page_entry.get("full_text", "")
+        page_lines     = page_entry.get("lines", [])
+        page_tables    = page_entry.get("tables", [])
 
-            # Pre-filter: skip DocAI artifact tables (stacked header cells) when a clean sibling exists
-            if header_rows and len(body_rows) <= 2:
-                first_cell = str(header_rows[0][0]) if header_rows[0] else ""
-                _ARTIFACT_KWS = ("STREET\n", "LIMITS\n", "ZONE\n", "STREET NAME\n", "BEGIN\n", "END\n")
-                if any(first_cell.startswith(kw) for kw in _ARTIFACT_KWS):
-                    page_tables_list = all_page_tables[page_num]
-                    has_clean_sibling = any(
-                        other_h and other_h[0] and "\n" not in str(other_h[0][0])
-                        for (other_h, other_b) in page_tables_list
-                        if (other_h, other_b) is not table_tuple and other_b and len(other_b) > 2
-                    )
-                    if has_clean_sibling:
-                        log(f"  ⏩ p.{page_num}: skipping DocAI artifact (clean sibling exists)")
-                        skipped_text += 1
-                        continue
+        # Filter to tables with body rows
+        valid_tables = [(h, b) for h, b in page_tables if b]
 
-            # Stacked-header expansion
-            # Triggers when the first header cell has 3+ newlines (data rows crammed in)
-            # OR starts with a known column keyword.
-            # After expansion, if col-0 of the first expanded row is "LIMITS" it means
-            # DocAI dropped the STREET column entirely → use Vision fallback.
-            header_was_garbled = False
-            if header_rows:
-                first_cell = str(header_rows[0][0] if header_rows[0] else "")
-                _STACK_KWS = ("STREET\n", "LIMITS\n", "ZONE\n", "STREET NAME\n", "BEGIN\n", "END\n",
-                              "CROSS STREET\n", "FROM\n", "TO\n")
-                first_cell_lines = first_cell.split("\n")
-                second_line = first_cell_lines[1].strip() + "\n" if len(first_cell_lines) > 1 else ""
-                # Trigger: keyword at start OR keyword on second line
-                should_expand = (
-                    any(first_cell.startswith(kw) for kw in _STACK_KWS)
-                    or any(second_line == kw for kw in _STACK_KWS)
-                )
-                if should_expand:
-                    num_cols = max(len(r) for r in header_rows)
-                    split_cols = []
-                    for col_i in range(num_cols):
-                        cell = str(header_rows[0][col_i]) if col_i < len(header_rows[0]) else ""
-                        split_cols.append([p for p in cell.split("\n") if p.strip()])
-                    max_data_lines = max((len(p) - 1 for p in split_cols), default=0)
-                    if max_data_lines > 0:
-                        clean_header = [[p[0] if p else "" for p in split_cols]]
-                        expanded_body = []
-                        for row_i in range(max_data_lines):
-                            expanded_body.append([p[row_i + 1] if row_i + 1 < len(p) else "" for p in split_cols])
-                        # Page 218 pattern: after expansion col-0 row 0 = "LIMITS" →
-                        # STREET column was dropped entirely → Vision fallback
-                        if expanded_body and str(expanded_body[0][0] if expanded_body[0] else "").strip().upper() == "LIMITS":
-                            header_was_garbled = True
-                        header_rows = clean_header
-                        body_rows   = expanded_body + list(body_rows)
-                        log(f"  📋 p.{page_num}: expanded stacked header — {max_data_lines} rows from header cells")
+        # One Gemini call per page (all tables merged) + full_text
+        # Pass all tables together so Gemini sees the full page at once
+        if not valid_tables and not page_full_text:
+            continue
 
-            # Text keyword filter
-            if not _text_header_filter(header_rows, body_rows):
-                skipped_text += 1
-                log(f"  ⏩ p.{page_num}: text filter skip")
-                continue
+        if not _text_header_filter(
+            valid_tables[0][0] if valid_tables else [],
+            valid_tables[0][1] if valid_tables else [],
+            page_full_text
+        ):
+            skipped_text += 1
+            log(f"  ⏩ p.{page_num}: text filter skip")
+            continue
 
-            # Garbled header → STREET column was dropped by DocAI → use Gemini Vision
-            if header_was_garbled:
-                sent_to_vision += 1
-                extracted = _extract_page_with_gemini_vision(page_num, header_rows, body_rows)
-                all_streets.extend(extracted)
-                continue
+        log(f"  📄 p.{page_num}: {len(valid_tables)} table(s) — sending to Gemini Pro")
+        sent_to_gemini += 1
+        # Merge all tables for this page into combined header+body lists
+        merged_headers = []
+        merged_body = []
+        for h, b in valid_tables:
+            if h:
+                merged_headers.extend(h)
+            merged_body.extend(b)
+        extracted = _extract_with_gemini_pro(merged_headers, merged_body, page_num,
+                                              full_text=page_full_text, lines=page_lines)
+        all_streets.extend(extracted)
 
-            # Gemini 2.5 Pro: extract streets from DocAI table data
-            sent_to_gemini += 1
-            extracted = _extract_with_gemini_pro(header_rows, body_rows, page_num)
-            all_streets.extend(extracted)
 
     log(f"📊 Extraction summary — {skipped_text} text-filtered, {sent_to_vision} vision pages, {sent_to_gemini} tables sent to Gemini")
 

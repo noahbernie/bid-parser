@@ -24,8 +24,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Persistent cache paths
 DOCAI_CACHE_DIR  = os.path.join(BASE_DIR, "docai_cache")
+SCREEN_CACHE_DIR = os.path.join(BASE_DIR, "screen_cache")
 VISION_CACHE_FILE = os.path.join(BASE_DIR, "vision_cache.json")
 os.makedirs(DOCAI_CACHE_DIR, exist_ok=True)
+os.makedirs(SCREEN_CACHE_DIR, exist_ok=True)
 
 # Global semaphore: cap concurrent LLM calls to avoid rate limits across parallel eval workers
 
@@ -1259,44 +1261,70 @@ Use null for any field not found. city and state are the city/state where the wo
     total_pages = doc["total_pages"]
     log(f"🔍 Step 2: Gemini Flash page screen — {total_pages} pages in parallel...")
 
+    pdf_screen_hash = hashlib.sha256(pdf_bytes).hexdigest()[:16]
+
     def _screen_page(page_idx: int) -> tuple:
         """Returns (page_num_1indexed, is_street_schedule: bool)."""
         page_num = page_idx + 1
-        try:
-            b64 = render_page_as_image(pdf_bytes, page_idx, dpi=150)
-            payload = json.dumps({
-                "contents": [{"parts": [
-                    {"text": _GEMINI_PAGE_SCREEN_PROMPT},
-                    {"inline_data": {"mime_type": "image/png", "data": b64}},
-                ]}],
-                "generationConfig": {"maxOutputTokens": 512, "temperature": 0},
-            }).encode()
-            req = urllib.request.Request(
-                gemini_flash_url, data=payload,
-                headers={"Content-Type": "application/json"}
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read())
-            # Gemini 2.5 Flash may include thinking tokens — always use the LAST text part
-            parts = data["candidates"][0]["content"].get("parts", [])
-            text_parts = [p["text"].strip() for p in parts if isinstance(p, dict) and p.get("text")]
-            if not text_parts:
-                log(f"  ⚠ Page {page_num}: no text in response — assuming no")
-                return page_num, False
-            answer = text_parts[-1]  # last part is always the final answer
-            log(f"  🔎 Page {page_num} answer: {repr(answer[:120])}")
-            answer_lower = answer.lower().replace(" ", "").replace("\n", "")
-            if '"is_street_schedule":true' in answer_lower:
-                return page_num, True
-            if '"is_street_schedule":false' in answer_lower:
-                return page_num, False
-            # Broader fallback
-            if "true" in answer_lower:
-                return page_num, True
-            return page_num, False
-        except Exception as e:
-            log(f"  ⚠ Page screen failed p.{page_num}: {str(e)[:80]} — assuming no")
-            return page_num, False
+        # Disk cache — survives server restarts
+        cache_file = os.path.join(SCREEN_CACHE_DIR, f"{pdf_screen_hash}_p{page_num}.json")
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file) as f:
+                    return page_num, json.load(f)["result"]
+            except Exception:
+                pass  # corrupt cache entry — re-screen
+
+        b64 = render_page_as_image(pdf_bytes, page_idx, dpi=150)
+        payload = json.dumps({
+            "contents": [{"parts": [
+                {"text": _GEMINI_PAGE_SCREEN_PROMPT},
+                {"inline_data": {"mime_type": "image/png", "data": b64}},
+            ]}],
+            "generationConfig": {"maxOutputTokens": 512, "temperature": 0},
+        }).encode()
+
+        # Retry up to 2 times on transient errors (timeouts, broken pipe, etc.)
+        last_err = None
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(
+                    gemini_flash_url, data=payload,
+                    headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read())
+                # Gemini 2.5 Flash may include thinking tokens — always use the LAST text part
+                parts = data["candidates"][0]["content"].get("parts", [])
+                text_parts = [p["text"].strip() for p in parts if isinstance(p, dict) and p.get("text")]
+                if not text_parts:
+                    log(f"  ⚠ Page {page_num}: no text in response — assuming no")
+                    result = False
+                else:
+                    answer = text_parts[-1]  # last part is always the final answer
+                    log(f"  🔎 Page {page_num} answer: {repr(answer[:120])}")
+                    answer_lower = answer.lower().replace(" ", "").replace("\n", "")
+                    if '"is_street_schedule":true' in answer_lower:
+                        result = True
+                    elif '"is_street_schedule":false' in answer_lower:
+                        result = False
+                    elif "true" in answer_lower:
+                        result = True
+                    else:
+                        result = False
+                # Cache to disk on success
+                try:
+                    with open(cache_file, "w") as f:
+                        json.dump({"result": result}, f)
+                except Exception:
+                    pass
+                return page_num, result
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(2 ** attempt)  # 1s, 2s backoff
+        log(f"  ⚠ Page screen failed p.{page_num} (3 attempts): {str(last_err)[:80]} — assuming no")
+        return page_num, False
 
     selected_pages = []
     with ThreadPoolExecutor(max_workers=20) as pool:
@@ -1484,107 +1512,101 @@ Use null for any field not found. city and state are the city/state where the wo
                     return True
         return False
 
-    header_cache: dict = {}
+    # ── Gemini Vision extraction (used when DocAI dropped the STREET column) ───
+    _GEMINI_VISION_TABLE_PROMPT = (
+        "You are extracting street work locations from a road construction bid document page.\n\n"
+        "PRIMARY SOURCE — use this form parser output as your main data source:\n"
+        "{docai_text}\n\n"
+        "The page is a structured work schedule table. The form parser captured the LIMITS column "
+        "(cross-street pairs like 'CROSS ST A to CROSS ST B') correctly, but is MISSING the leftmost "
+        "STREET NAME column because the PDF uses merged/spanning cells that the parser could not read.\n\n"
+        "Use the page IMAGE ONLY to identify which street name corresponds to each LIMITS row — "
+        "look at the leftmost column in the table where one street name visually spans multiple rows.\n\n"
+        "Instructions:\n"
+        "- The LIMITS data from the form parser is the source of truth — use it exactly as-is\n"
+        "- For each LIMITS row, read the corresponding street name from the image's leftmost column\n"
+        "- Split each LIMITS entry on ' to ' to get from_street and to_street\n\n"
+        "Rules:\n"
+        "- Copy street names exactly as shown in the image\n"
+        "- Skip header rows and blank rows\n"
+        "- If a limits value is just 'to END', from_street is empty\n\n"
+        'Return ONLY valid JSON: {"streets": [{"main_street": "...", "from_street": "...", "to_street": "..."}]}'
+    )
 
-    _HEADER_CONFIRM_PROMPT = """You are analyzing a table from a road construction bid document.
-
-Raw table data (headers + first 3 data rows):
-{table_sample}
-
-The page image above shows how this table looks visually.
-
-Identify (using 0-based column index):
-1. main_col: column containing the PRIMARY STREET being worked on
-2. from_col: column for where work BEGINS / first cross-street (FROM, BEGIN, CROSS STREET 1, etc.)
-3. to_col: column for where work ENDS / second cross-street (TO, END, CROSS STREET 2, etc.)
-
-IMPORTANT: Look at the actual DATA ROWS, not just the header text. Sometimes the data is in a different order than the header label implies. Trust what you see in the data.
-
-Return ONLY valid JSON:
-{"main_col": <int or null>, "from_col": <int or null>, "to_col": <int or null>, "notes": "..."}"""
-
-    def _confirm_headers_with_vision(header_rows, body_rows, page_num):
-        body_sample = tuple(tuple(r) for r in body_rows[:2])
-        header_key = tuple(tuple(r) for r in header_rows) + body_sample
-        with _header_cache_lock:
-            if header_key in _vision_header_cache:
-                cached = _vision_header_cache[header_key]
-                log(f"  👁 p.{page_num}: cached vision col map: {cached}")
-                return cached
+    def _extract_page_with_gemini_vision(page_num, header_rows, body_rows):
+        """Use Gemini Vision to extract streets directly from the page image."""
+        gemini_key = os.environ.get("GEMINI_API_KEY")
+        if not gemini_key:
+            log(f"  ⚠ p.{page_num}: GEMINI_API_KEY not set")
+            return []
         try:
-            b64_img = render_page_as_image(pdf_bytes, page_num - 1, dpi=120)
+            b64_img = render_page_as_image(pdf_bytes, page_num - 1, dpi=150)
         except Exception as e:
-            log(f"  ⚠ Could not render p.{page_num} for vision: {e}")
-            return {}
-        sample = {"header_rows": header_rows, "sample_body_rows": body_rows[:6]}
-        prompt = _HEADER_CONFIRM_PROMPT.replace("{table_sample}", json.dumps(sample, ensure_ascii=False, indent=2))
+            log(f"  ⚠ p.{page_num}: could not render page image: {e}")
+            return []
+        log(f"  🖼 p.{page_num}: STREET col missing from DocAI — using Gemini Vision + text...")
+        docai_text = json.dumps({"header_rows": header_rows, "body_rows": body_rows}, ensure_ascii=False, indent=2)
+        prompt = _GEMINI_VISION_TABLE_PROMPT.replace("{docai_text}", docai_text)
         try:
-            log(f"  👁 p.{page_num}: confirming headers with Haiku Vision...")
-            result = call_vision_with_retry(prompt, b64_img, max_tokens=256, log_fn=log)
-            log(f"  ✓ Vision: main={result.get('main_col')} from={result.get('from_col')} to={result.get('to_col')} — {result.get('notes','')}")
-            with _header_cache_lock:
-                _vision_header_cache[header_key] = result
-                _save_vision_cache(_vision_header_cache)
-            return result
+            result = call_gemini_image(prompt, b64_img, log_fn=log)
         except Exception as e:
-            log(f"  ✗ Vision header confirm failed p.{page_num}: {e}")
-            return {}
+            log(f"  ✗ p.{page_num}: Gemini Vision failed: {e}")
+            return []
+        streets = []
+        for s in result.get("streets", []):
+            main = (s.get("main_street") or "").strip()
+            if not main:
+                continue
+            streets.append({
+                "main_street": main,
+                "from_street": s.get("from_street") or None,
+                "to_street":   s.get("to_street")   or None,
+                "work_type":   None,
+                "source": "gemini-vision",
+                "page": page_num,
+            })
+        log(f"  ✓ p.{page_num}: {len(streets)} streets extracted via vision")
+        return streets
 
+    # ── Gemini Pro extraction from DocAI table data (no Haiku pre-confirm) ─────
     _OPUS_CHUNK_PROMPT = """You are extracting street work segments from a road construction bid document table.
 
-Column mapping (0-based indices):
-- main_street: column {main_col} — the PRIMARY street being worked on
-- from_street: column {from_col} — where work BEGINS / first cross-street
-- to_street:   column {to_col}   — where work ENDS / second cross-street
+Table data (header rows + body rows) extracted by a form parser:
+{table_data}
+
+Instructions:
+1. Identify which column is the PRIMARY STREET being worked on (main_street).
+   - Typical headers: STREET NAME, STREET, ROAD, ROADWAY, LOCATION
+   - The values should be street names (e.g. "MAIN ST", "JAMBOREE RD")
+2. Identify which column is the FROM/BEGIN cross-street (from_street).
+   - Typical headers: FROM, BEGIN, START, CROSS STREET 1
+3. Identify which column is the TO/END cross-street (to_street).
+   - Typical headers: TO, END, CROSS STREET 2
+4. Extract ALL data rows.
 
 Rules:
 - Copy street names EXACTLY as they appear — do not rename or substitute
-- "TO" (uppercase, surrounded by spaces) between street names separates from_street and to_street
 - Strip asset IDs and work order numbers (SS-001459-PV1, S2624, etc.) — not street names
-- Skip header rows, totals, subtotals, and non-street data rows
+- Skip header rows, totals rows, subtotals, and blank rows
 - Use "" for missing from_street or to_street
-- HEADER PREFIX: Some cells have the column header word merged into the value (e.g. "STREET BARRANCA PKWY", "LIMITS JAMBOREE RD TO MAIN ST"). Strip the leading column-type keyword (STREET, LIMITS, ROAD, LOCATION, FROM, TO, ZONE) before extracting the actual value.
-- INVERTED SUFFIX: DocAI sometimes reads multi-line cells with the street type first (e.g. "RD JAMBOREE"). If a cell starts with a street suffix followed by a name, reorder it.
-
-CRITICAL — STACKED ROWS: When a cell contains multiple street names merged together, extract EACH as a separate segment. Positions match across columns.
-
-CRITICAL — CONCATENATED CELLS: DocAI sometimes dumps multiple rows into a single cell separated by asset IDs. Extract each street+cross-street pair as its own segment.
-
-- If from_col and to_col are the same index, that column contains a merged LIMITS cell like "MAIN ST to BROADWAY" — split on " to " or " TO ".
+- HEADER PREFIX: Some cells have the column header merged into the value (e.g. "STREET BARRANCA PKWY", "LIMITS JAMBOREE RD TO MAIN ST"). Strip the leading keyword before extracting.
+- INVERTED SUFFIX: DocAI sometimes reads multi-line cells with the street type first (e.g. "RD JAMBOREE"). Reorder if needed.
+- STACKED ROWS: When a cell contains multiple street names or limits separated by newlines, extract EACH as a separate entry. Row positions match across columns.
+- LIMITS column: If a single column contains "FROM ST to TO ST" combined, split on " to " or " TO " to get from_street and to_street.
 
 Return ONLY valid JSON, no markdown:
 {{"streets": [{{"main_street": "...", "from_street": "...", "to_street": "..."}}]}}"""
 
-    def _extract_with_gemini_pro(header_rows, body_rows, confirmed_cols, page_num):
+    def _extract_with_gemini_pro(header_rows, body_rows, page_num):
         gemini_key = os.environ.get("GEMINI_API_KEY")
         gemini_pro_url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={gemini_key}"
             if gemini_key else None
         )
-        main_col = confirmed_cols.get("main_col")
-        from_col = confirmed_cols.get("from_col")
-        to_col   = confirmed_cols.get("to_col")
-        if main_col is None:
-            log(f"  ⚠ p.{page_num}: no main_col — skipping")
-            return []
-        # Slice to only relevant columns
-        relevant_cols = sorted({c for c in [main_col, from_col, to_col] if c is not None})
-        def _slice(rows):
-            return [[row[c] if c < len(row) else "" for c in relevant_cols] for row in rows]
-        col_remap = {orig: new for new, orig in enumerate(relevant_cols)}
-        sliced_main = col_remap.get(main_col)
-        sliced_from = col_remap.get(from_col) if from_col is not None else None
-        sliced_to   = col_remap.get(to_col)   if to_col   is not None else None
-        prompt = _OPUS_CHUNK_PROMPT.format(
-            main_col=sliced_main,
-            from_col=sliced_from if sliced_from is not None else "N/A",
-            to_col=sliced_to     if sliced_to   is not None else "N/A",
+        table_data = {"header_rows": header_rows, "body_rows": body_rows}
+        full_prompt = _OPUS_CHUNK_PROMPT.format(
+            table_data=json.dumps(table_data, ensure_ascii=False, indent=2)
         )
-        notes = confirmed_cols.get("notes", "")
-        if notes:
-            prompt += f"\n\nAdditional context from visual inspection: {notes}"
-        table_data = {"header_rows": _slice(header_rows), "body_rows": _slice(body_rows)}
-        full_prompt = prompt + "\n\n" + json.dumps(table_data, ensure_ascii=False, indent=2)
 
         result = None
         for attempt in range(6):
@@ -1615,7 +1637,7 @@ Return ONLY valid JSON, no markdown:
             try:
                 content_blocks = [{"type": "text", "text": json.dumps(table_data, ensure_ascii=False, indent=2)}]
                 result = call_claude_with_retry(
-                    client, prompt, content_blocks, max_tokens=8192,
+                    client, full_prompt, content_blocks, max_tokens=8192,
                     model="claude-opus-4-6", log_fn=log,
                 )
             except Exception as e:
@@ -1639,8 +1661,8 @@ Return ONLY valid JSON, no markdown:
         return streets
 
     skipped_text  = 0
-    skipped_haiku = 0
     sent_to_gemini = 0
+    sent_to_vision = 0
 
     for page_num in sorted(all_page_tables.keys()):
         for table_tuple in all_page_tables[page_num]:
@@ -1665,11 +1687,23 @@ Return ONLY valid JSON, no markdown:
                         continue
 
             # Stacked-header expansion
+            # Triggers when the first header cell has 3+ newlines (data rows crammed in)
+            # OR starts with a known column keyword.
+            # After expansion, if col-0 of the first expanded row is "LIMITS" it means
+            # DocAI dropped the STREET column entirely → use Vision fallback.
+            header_was_garbled = False
             if header_rows:
                 first_cell = str(header_rows[0][0] if header_rows[0] else "")
                 _STACK_KWS = ("STREET\n", "LIMITS\n", "ZONE\n", "STREET NAME\n", "BEGIN\n", "END\n",
                               "CROSS STREET\n", "FROM\n", "TO\n")
-                if any(first_cell.startswith(kw) for kw in _STACK_KWS):
+                first_cell_lines = first_cell.split("\n")
+                second_line = first_cell_lines[1].strip() + "\n" if len(first_cell_lines) > 1 else ""
+                # Trigger: keyword at start OR keyword on second line
+                should_expand = (
+                    any(first_cell.startswith(kw) for kw in _STACK_KWS)
+                    or any(second_line == kw for kw in _STACK_KWS)
+                )
+                if should_expand:
                     num_cols = max(len(r) for r in header_rows)
                     split_cols = []
                     for col_i in range(num_cols):
@@ -1681,6 +1715,10 @@ Return ONLY valid JSON, no markdown:
                         expanded_body = []
                         for row_i in range(max_data_lines):
                             expanded_body.append([p[row_i + 1] if row_i + 1 < len(p) else "" for p in split_cols])
+                        # Page 218 pattern: after expansion col-0 row 0 = "LIMITS" →
+                        # STREET column was dropped entirely → Vision fallback
+                        if expanded_body and str(expanded_body[0][0] if expanded_body[0] else "").strip().upper() == "LIMITS":
+                            header_was_garbled = True
                         header_rows = clean_header
                         body_rows   = expanded_body + list(body_rows)
                         log(f"  📋 p.{page_num}: expanded stacked header — {max_data_lines} rows from header cells")
@@ -1691,19 +1729,19 @@ Return ONLY valid JSON, no markdown:
                 log(f"  ⏩ p.{page_num}: text filter skip")
                 continue
 
-            # Haiku Vision: confirm column mapping
-            confirmed_cols = _confirm_headers_with_vision(header_rows, body_rows, page_num)
-            if not confirmed_cols or confirmed_cols.get("main_col") is None:
-                log(f"  ⏭ p.{page_num}: Haiku could not confirm col mapping — skipping")
-                skipped_haiku += 1
+            # Garbled header → STREET column was dropped by DocAI → use Gemini Vision
+            if header_was_garbled:
+                sent_to_vision += 1
+                extracted = _extract_page_with_gemini_vision(page_num, header_rows, body_rows)
+                all_streets.extend(extracted)
                 continue
 
-            # Gemini 2.5 Pro: extract streets
+            # Gemini 2.5 Pro: extract streets from DocAI table data
             sent_to_gemini += 1
-            extracted = _extract_with_gemini_pro(header_rows, body_rows, confirmed_cols, page_num)
+            extracted = _extract_with_gemini_pro(header_rows, body_rows, page_num)
             all_streets.extend(extracted)
 
-    log(f"📊 Extraction summary — {skipped_text} text-filtered, {skipped_haiku} haiku-skipped, {sent_to_gemini} tables sent to Gemini")
+    log(f"📊 Extraction summary — {skipped_text} text-filtered, {sent_to_vision} vision pages, {sent_to_gemini} tables sent to Gemini")
 
     # --- Step 5: Deduplicate ---
     log("🔀 Step 5: Deduplicating...")

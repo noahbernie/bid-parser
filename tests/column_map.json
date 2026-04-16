@@ -9,7 +9,7 @@
   },
 
   "20230307115819832 FY 22-23 Street Rehab and Slurry Seal Specification Final 2": {
-    "screen_pages": [218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 245],
+    "screen_pages": [218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241],
     "tabs": {
       "Page 218-241": [
         { "header_row": 2,   "data_start_row": 4,   "data_end_row": 459, "main_street": "STREET",      "limits_col": "LIMITS", "work_type": null },
@@ -74,7 +74,7 @@
   },
 
   "20260304073432504 WPR026 Treatments Specs FINAL": {
-    "screen_pages": [187, 188, 189, 190, 191, 192, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 232],
+    "screen_pages": [187, 188, 189, 190, 191, 192, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216],
     "tabs": {
       "Page 187-188": { "header_row": 2, "main_street": "Street Name", "from_street": "Begin Location", "to_street": "End Location", "work_type": "Treatment Type" },
       "Page 189-190": { "header_row": 2, "main_street": "Street Name", "from_street": "Begin Location", "to_street": "End Location", "work_type": "Treatment Type" },
@@ -98,14 +98,14 @@
   },
 
   "IFB 21-1824": {
-    "screen_pages": [208, 209, 210, 216],
+    "screen_pages": [208, 209, 210],
     "tabs": {
       "Page 208-210": { "header_row": 2, "main_street": "STREET", "limits_col": "LIMITS", "work_type": null }
     }
   },
 
   "IFB 22-3163": {
-    "screen_pages": [213, 214, 215, 216, 217, 218, 219, 222, 252, 253, 254, 255],
+    "screen_pages": [213, 214, 215, 216, 217, 218, 219, 222],
     "tabs": {
       "Page 213-219": { "header_row": 2, "main_street": "STREET", "limits_col": "LIMITS", "work_type": null },
       "Page 222":     { "header_row": 2, "main_street": "STREET", "limits_col": "LIMITS", "work_type": null }
@@ -144,9 +144,7 @@
       "Page 146": { "header_row": 2, "main_street": "Street",      "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null },
       "Page 147": { "header_row": 2, "main_street": "Street",      "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null },
       "Page 149": { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null },
-      "Page 150": { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null },
-      "Page 151": { "header_row": 2, "main_street": "Intersection", "from_street": null, "to_street": null, "work_type": null },
-      "Page 174": { "header_row": 2, "main_street": "Intersection", "from_street": null, "to_street": null, "work_type": null }
+      "Page 150": { "header_row": 2, "main_street": "Street Name", "from_street": "Cross Street 1", "to_street": "Cross Street 2", "work_type": null }
     }
   },
 

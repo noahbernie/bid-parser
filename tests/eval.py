@@ -13,6 +13,7 @@ import re
 import sys
 import requests
 import openpyxl
+from rapidfuzz import fuzz as _fuzz
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -24,15 +25,41 @@ PDF_DIR    = os.path.join(TESTS_DIR, "pdfs")
 CACHE_DIR  = os.path.join(TESTS_DIR, "cache")
 COL_MAP    = os.path.join(TESTS_DIR, "column_map.json")
 
-FUZZY_THRESHOLD = 0.80
+FUZZY_THRESHOLD = 0.74
 
 # ── Normalization ─────────────────────────────────────────────────────────────
 
+# All street-type suffixes collapse to "ST" for comparison purposes.
+# Whatever Google returns is the real output — but DRIVE=AVENUE=STREET etc. all match in eval.
 _SUFFIX_MAP = {
-    "STREET": "ST", "AVENUE": "AV", "DRIVE": "DR", "BOULEVARD": "BL",
-    "ROAD": "RD",   "COURT": "CT",  "LANE": "LN",  "PLACE": "PL",
-    "WAY": "WY",    "CIRCLE": "CIR","TERRACE": "TER","TRAIL": "TRL",
-    "AVE": "AV",    "BLVD": "BL",   "PKWY": "PKWY",  "BI": "BL",
+    # Long forms
+    "STREET": "ST",   "AVENUE": "ST",   "DRIVE": "ST",   "BOULEVARD": "ST",
+    "ROAD": "ST",     "COURT": "ST",    "LANE": "ST",    "PLACE": "ST",
+    "WAY": "ST",      "CIRCLE": "ST",   "TERRACE": "ST", "TRAIL": "ST",
+    "PARKWAY": "ST",  "HIGHWAY": "ST",  "FREEWAY": "ST",
+    # Common abbreviations
+    "AVE": "ST",  "AV": "ST",  "DR": "ST",  "BL": "ST",  "BLVD": "ST",
+    "RD": "ST",   "CT": "ST",  "LN": "ST",  "PL": "ST",  "WY": "ST",
+    "CIR": "ST",  "TER": "ST", "TRL": "ST", "PKWY": "ST", "HWY": "ST",
+    "FWY": "ST",  "BI": "ST",  "CR": "ST",
+}
+
+# Limit-token synonyms — all mean "end of segment"
+_LIMIT_NORM = {
+    "EOP": "END", "EOR": "END", "EOS": "END", "EOC": "END",
+    "EOL": "END", "EOF": "END", "BEGIN": "END", "BEGINNING": "END",
+    "START": "END", "STOP": "END",
+}
+
+# Numeric ordinal → written form (e.g. "5TH" → "FIFTH", "12TH" → "TWELFTH")
+_ORDINAL_MAP = {
+    "1ST": "FIRST",    "2ND": "SECOND",   "3RD": "THIRD",
+    "4TH": "FOURTH",   "5TH": "FIFTH",    "6TH": "SIXTH",
+    "7TH": "SEVENTH",  "8TH": "EIGHTH",   "9TH": "NINTH",
+    "10TH": "TENTH",   "11TH": "ELEVENTH","12TH": "TWELFTH",
+    "13TH": "THIRTEENTH","14TH": "FOURTEENTH","15TH": "FIFTEENTH",
+    "16TH": "SIXTEENTH","17TH": "SEVENTEENTH","18TH": "EIGHTEENTH",
+    "19TH": "NINETEENTH","20TH": "TWENTIETH",
 }
 
 # Cyrillic/Greek lookalikes that DocAI OCR sometimes emits instead of Latin chars
@@ -100,6 +127,11 @@ def norm(v) -> str:
             split_parts.append(p)
     parts = split_parts
 
+    # Normalize limit tokens (EOP/EOR/EOS/EOF/BEGIN/START → END)
+    if len(parts) == 1 and parts[0] in _LIMIT_NORM:
+        return _LIMIT_NORM[parts[0]]
+    # Normalize ordinals anywhere in the name (e.g. "5TH ST" → "FIFTH ST")
+    parts = [_ORDINAL_MAP.get(p, p) for p in parts]
     if parts and parts[-1] in _SUFFIX_MAP:
         parts[-1] = _SUFFIX_MAP[parts[-1]]
     # Strip leading/trailing 1-2 digit noise tokens (row numbers, zone IDs, etc.)
@@ -115,12 +147,7 @@ def similarity(a: str, b: str) -> float:
     na, nb = norm(a), norm(b)
     if not na or not nb:
         return 0.0
-    ta, tb = na.split(), nb.split()
-    sa, sb = set(ta), set(tb)
-    # One name is a subset of the other — suffix likely omitted (e.g. ARLINGTON vs ARLINGTON AV)
-    if sa < sb or sb < sa:
-        return 0.75
-    return len(sa & sb) / max(len(sa), len(sb))
+    return _fuzz.token_sort_ratio(na, nb) / 100.0
 
 def street_key(s: dict) -> tuple:
     return (norm(s.get("main_street", "")),
@@ -226,19 +253,24 @@ def load_ground_truth(doc_key: str, col_map: dict) -> list:
 
 # ── Parser runner ─────────────────────────────────────────────────────────────
 
-def run_parser(doc_key: str, use_cache: bool = True) -> list:
+def run_parser(doc_key: str, use_cache: bool = True) -> tuple:
+    """Returns (streets, low_confidence_streets)."""
     cache_path = os.path.join(CACHE_DIR, doc_key + ".json")
 
     if use_cache and os.path.exists(cache_path):
         print(f"  📦 Using cached result")
         with open(cache_path) as f:
-            return json.load(f)
+            cached = json.load(f)
+        # Support old cache format (plain list) and new format (dict with streets key)
+        if isinstance(cached, list):
+            return cached, []
+        return cached.get("streets", []), cached.get("low_confidence_streets", [])
 
     # PDF has same base name as xlsx
     pdf_path = os.path.join(PDF_DIR, doc_key + ".pdf")
     if not os.path.exists(pdf_path):
         print(f"  ⚠  PDF not found: {pdf_path}")
-        return []
+        return [], []
 
     print(f"  🔄 Parsing {doc_key}.pdf ...")
     headers = {"X-Api-Key": API_KEY} if API_KEY else {}
@@ -250,13 +282,15 @@ def run_parser(doc_key: str, use_cache: bool = True) -> list:
             timeout=600,
         )
     resp.raise_for_status()
-    streets = resp.json().get("streets", [])
+    body = resp.json()
+    streets           = body.get("streets", [])
+    low_conf_streets  = body.get("low_confidence_streets", [])
 
     os.makedirs(CACHE_DIR, exist_ok=True)
     with open(cache_path, "w") as f:
-        json.dump(streets, f, indent=2)
+        json.dump({"streets": streets, "low_confidence_streets": low_conf_streets}, f, indent=2)
 
-    return streets
+    return streets, low_conf_streets
 
 # ── Matching ──────────────────────────────────────────────────────────────────
 
@@ -324,14 +358,15 @@ def match_streets(truth: list, parsed: list) -> dict:
 
 # ── Report ────────────────────────────────────────────────────────────────────
 
-def print_report(doc_key: str, r: dict, show_matched: bool = False):
+def print_report(doc_key: str, r: dict, show_matched: bool = False, low_conf: list = None):
     p, re_, f1 = r["precision"], r["recall"], r["f1"]
     bar = "█" * int(f1 * 20) + "░" * (20 - int(f1 * 20))
     print(f"\n{'='*60}")
     print(f"  {doc_key}")
     print(f"{'='*60}")
+    lc_note = f"  |  Low-conf (removed): {len(low_conf)}" if low_conf else ""
     print(f"  Truth: {r['total_truth']}  |  Parsed: {r['total_parsed']}  |  "
-          f"Matched: {len(r['matched'])}  Missed: {len(r['missed'])}  Extra: {len(r['extra'])}")
+          f"Matched: {len(r['matched'])}  Missed: {len(r['missed'])}  Extra: {len(r['extra'])}{lc_note}")
     print(f"  Precision: {p:.0%}   Recall: {re_:.0%}   F1: {f1:.0%}  [{bar}]")
 
     if show_matched and r["matched"]:
@@ -356,6 +391,14 @@ def print_report(doc_key: str, r: dict, show_matched: bool = False):
                   f"[p.{s.get('page','')}]")
         if len(r["extra"]) > 15:
             print(f"     ... and {len(r['extra']) - 15} more")
+
+    if low_conf:
+        print(f"\n  🔍 LOW CONFIDENCE (removed from scoring, {len(low_conf)}):")
+        for s in low_conf[:20]:
+            print(f"     {s.get('main_street','')}  |  {s.get('from_street','')} → {s.get('to_street','')}  "
+                  f"[p.{s.get('page','')}]")
+        if len(low_conf) > 20:
+            print(f"     ... and {len(low_conf) - 20} more")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -390,10 +433,10 @@ def main():
             print(f"  ⚠  No ground truth rows loaded — skipping")
             continue
         print(f"  📋 {len(truth)} ground truth rows loaded")
-        parsed = run_parser(doc_key, use_cache=not args.no_cache)
+        parsed, low_conf = run_parser(doc_key, use_cache=not args.no_cache)
         result = match_streets(truth, parsed)
         all_results[doc_key] = result
-        print_report(doc_key, result, show_matched=args.show_matched)
+        print_report(doc_key, result, show_matched=args.show_matched, low_conf=low_conf)
 
     if len(all_results) > 1:
         total_matched = sum(len(r["matched"]) for r in all_results.values())

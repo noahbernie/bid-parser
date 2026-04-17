@@ -13,6 +13,9 @@ opus_prompt_dump_*.json
 docai_cache/
 screen_cache/
 tests/screen_cache/
+osm_cache/
+geocode_cache/
+gemini_cache/
 vision_cache.json
 server.log
 server_opus.log

@@ -6,6 +6,7 @@ import pdfplumber
 import fitz  # PyMuPDF
 import anthropic
 import io
+import re
 import uuid
 import os
 import json
@@ -13,6 +14,8 @@ import time
 import asyncio
 import base64
 import urllib.request
+import urllib.parse
+from rapidfuzz import fuzz as _fuzz
 import threading
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,11 +26,13 @@ load_dotenv()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Persistent cache paths
-DOCAI_CACHE_DIR  = os.path.join(BASE_DIR, "docai_cache")
-SCREEN_CACHE_DIR = os.path.join(BASE_DIR, "screen_cache")
+DOCAI_CACHE_DIR   = os.path.join(BASE_DIR, "docai_cache")
+SCREEN_CACHE_DIR  = os.path.join(BASE_DIR, "screen_cache")
+GEMINI_CACHE_DIR  = os.path.join(BASE_DIR, "gemini_cache")
 VISION_CACHE_FILE = os.path.join(BASE_DIR, "vision_cache.json")
 os.makedirs(DOCAI_CACHE_DIR, exist_ok=True)
 os.makedirs(SCREEN_CACHE_DIR, exist_ok=True)
+os.makedirs(GEMINI_CACHE_DIR, exist_ok=True)
 
 # Global semaphores: cap concurrent API calls across all parallel document runs
 _SCREEN_SEMAPHORE   = threading.Semaphore(15)  # Gemini Flash page screening
@@ -1661,6 +1666,19 @@ Return ONLY valid JSON, no markdown:
 
         full_prompt = _OPUS_CHUNK_PROMPT.format(table_data=augmented)
 
+        # Cache keyed by (pdf, page, prompt content) so we don't re-call Gemini on reruns
+        pdf_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        prompt_hash = hashlib.sha256(full_prompt.encode()).hexdigest()[:16]
+        gemini_cache_path = os.path.join(GEMINI_CACHE_DIR, f"{pdf_hash}_p{page_num}_{prompt_hash}.json")
+        if os.path.exists(gemini_cache_path):
+            try:
+                with open(gemini_cache_path) as f:
+                    cached_result = json.load(f)
+                log(f"  📦 Gemini cache hit p.{page_num}")
+                return cached_result
+            except Exception:
+                pass  # corrupt cache — fall through to re-call
+
         result = None
         for attempt in range(6):
             try:
@@ -1712,6 +1730,14 @@ Return ONLY valid JSON, no markdown:
                 "page": page_num,
             })
         log(f"  ✓ p.{page_num}: {len(streets)} streets extracted")
+
+        # Save to Gemini cache
+        try:
+            with open(gemini_cache_path, "w") as f:
+                json.dump(streets, f)
+        except Exception:
+            pass
+
         return streets
 
     skipped_text  = 0
@@ -1759,15 +1785,44 @@ Return ONLY valid JSON, no markdown:
 
     # --- Step 5: Deduplicate ---
     log("🔀 Step 5: Deduplicating...")
+
+    # Suffix normalization — all variants → short canonical form
     _SUFFIX_MAP = {
-        "STREET": "ST", "AVENUE": "AV", "DRIVE": "DR", "BOULEVARD": "BL",
-        "ROAD": "RD", "COURT": "CT", "LANE": "LN", "PLACE": "PL",
-        "WAY": "WY", "CIRCLE": "CIR", "TERRACE": "TER", "TRAIL": "TRL",
+        "STREET": "ST", "AVENUE": "AV", "AVE": "AV", "DRIVE": "DR",
+        "BOULEVARD": "BL", "BLVD": "BL", "ROAD": "RD", "COURT": "CT",
+        "LANE": "LN", "PLACE": "PL", "WAY": "WY", "CIRCLE": "CIR",
+        "CR": "CIR", "TERRACE": "TER", "TRAIL": "TRL", "PARKWAY": "PKWY",
+        "FREEWAY": "FWY", "HIGHWAY": "HWY",
     }
+
+    # Ordinal normalization — numeric and written forms → written canonical
+    _ORDINAL_MAP = {
+        "1ST": "FIRST", "2ND": "SECOND", "3RD": "THIRD",
+        "4TH": "FOURTH", "5TH": "FIFTH", "6TH": "SIXTH",
+        "7TH": "SEVENTH", "8TH": "EIGHTH", "9TH": "NINTH",
+        "10TH": "TENTH", "11TH": "ELEVENTH", "12TH": "TWELFTH",
+        "13TH": "THIRTEENTH", "14TH": "FOURTEENTH", "15TH": "FIFTEENTH",
+        "16TH": "SIXTEENTH", "17TH": "SEVENTEENTH", "18TH": "EIGHTEENTH",
+        "19TH": "NINETEENTH", "20TH": "TWENTIETH",
+    }
+
+    # Limit descriptor normalization — all variants → END for dedup purposes
+    _LIMIT_NORM = {
+        "EOP": "END", "EOR": "END", "EOS": "END", "EOC": "END",
+        "EOL": "END", "EOF": "END", "BEGIN": "END", "BEGINNING": "END",
+        "START": "END", "STOP": "END",
+    }
+
     def norm_name(v):
         if not v:
             return ""
         parts = v.strip().upper().split()
+        # Normalize limit descriptors (EOP/EOR/EOS/EOF → END)
+        if len(parts) == 1 and parts[0] in _LIMIT_NORM:
+            return _LIMIT_NORM[parts[0]]
+        # Normalize ordinals (can appear anywhere, e.g. "NORTH 5TH ST")
+        parts = [_ORDINAL_MAP.get(p, p) for p in parts]
+        # Normalize suffix (last word)
         if parts and parts[-1] in _SUFFIX_MAP:
             parts[-1] = _SUFFIX_MAP[parts[-1]]
         return " ".join(parts)
@@ -1786,7 +1841,351 @@ Return ONLY valid JSON, no markdown:
     all_streets = list(seen.values())
     log(f"  Dedup: {before} → {len(all_streets)} streets")
 
+    # --- Step 6: Google Geocoding — intersection validation + spelling correction ---
+    log("🗺 Step 6: Google Geocoding intersection validation...")
+
+    GEOCODE_CACHE_DIR = os.path.join(BASE_DIR, "geocode_cache")
+    os.makedirs(GEOCODE_CACHE_DIR, exist_ok=True)
+
+    # Limit descriptors — valid segment endpoints, not real cross-street names
+    _LIMIT_TOKENS = {
+        "END", "BEGIN", "BEGINNING", "START", "STOP",
+        "EOP", "EOR", "EOS", "EOC", "EOL", "EOF",
+    }
+
+    def _geocode_intersection(main: str, cross: str, city: str, state: str, api_key: str) -> dict:
+        """
+        Geocode a street intersection via Google.
+        Returns {found, intersection, main_canonical, cross_canonical, result_type}.
+        Cached per (main, cross, city).
+        """
+        cache_key = f"{main}|{cross}|{city}|{state}".upper()
+        cache_file = os.path.join(GEOCODE_CACHE_DIR, f"{abs(hash(cache_key)) % 10**12}.json")
+
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+
+        query = urllib.parse.quote(f"{main} & {cross}, {city}, {state}")
+        url = f"https://maps.googleapis.com/maps/api/geocode/json?address={query}&key={api_key}"
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+
+            if data.get("status") != "OK" or not data.get("results"):
+                result = {"found": False, "intersection": False,
+                          "main_canonical": None, "cross_canonical": None}
+            else:
+                first = data["results"][0]
+                result_types = first.get("types", [])
+                components = first.get("address_components", [])
+                is_intersection = "intersection" in result_types
+
+                if is_intersection:
+                    # For intersections Google packs both names into one component:
+                    # "Merrill Avenue & Brockton Avenue" — split on &
+                    intersection_component = next(
+                        (c["long_name"] for c in components
+                         if "intersection" in c.get("types", []) or "&" in c.get("long_name", "")),
+                        None
+                    )
+                    if intersection_component and "&" in intersection_component:
+                        parts = [p.strip() for p in intersection_component.split("&")]
+                        main_can  = parts[0] if parts else None
+                        cross_can = parts[1] if len(parts) > 1 else None
+                    else:
+                        # Fallback: parse formatted_address
+                        fmt = first.get("formatted_address", "")
+                        street_part = fmt.split(",")[0] if "," in fmt else fmt
+                        if "&" in street_part:
+                            parts = [p.strip() for p in street_part.split("&")]
+                            main_can  = parts[0] if parts else None
+                            cross_can = parts[1] if len(parts) > 1 else None
+                        else:
+                            main_can = cross_can = None
+                    routes = [r for r in [main_can, cross_can] if r]
+                else:
+                    routes = [c["long_name"] for c in components if "route" in c.get("types", [])]
+
+                # Match canonicals back to which input they correspond to
+                # by finding which returned name is closer to main vs cross
+                if len(routes) >= 2:
+                    pass  # fuzz imported as _fuzz at top
+                    main_upper  = main.upper()
+                    cross_upper = cross.upper()
+                    score_00 = _fuzz.token_sort_ratio(main_upper,  routes[0].upper())
+                    score_01 = _fuzz.token_sort_ratio(main_upper,  routes[1].upper())
+                    score_10 = _fuzz.token_sort_ratio(cross_upper, routes[0].upper())
+                    score_11 = _fuzz.token_sort_ratio(cross_upper, routes[1].upper())
+                    # Assign: routes[0]=main, routes[1]=cross OR routes[0]=cross, routes[1]=main
+                    if (score_00 + score_11) >= (score_01 + score_10):
+                        main_can, cross_can = routes[0], routes[1]
+                    else:
+                        main_can, cross_can = routes[1], routes[0]
+                elif len(routes) == 1:
+                    # Only one route returned — figure out which input it matches
+                    pass  # fuzz imported as _fuzz at top
+                    if _fuzz.token_sort_ratio(main.upper(), routes[0].upper()) >= \
+                       _fuzz.token_sort_ratio(cross.upper(), routes[0].upper()):
+                        main_can, cross_can = routes[0], None
+                    else:
+                        main_can, cross_can = None, routes[0]
+                else:
+                    main_can = cross_can = None
+
+                result = {
+                    "found": True,
+                    "intersection": is_intersection,
+                    "main_canonical":  main_can,
+                    "cross_canonical": cross_can,
+                    "result_type": result_types[0] if result_types else None,
+                }
+        except Exception as e:
+            result = {"found": False, "intersection": False,
+                      "main_canonical": None, "cross_canonical": None,
+                      "error": str(e)[:80]}
+
+        try:
+            with open(cache_file, "w") as f:
+                json.dump(result, f)
+        except Exception:
+            pass
+
+        return result
+
+    def _geocode_main_only(main: str, city: str, state: str, api_key: str) -> dict:
+        """Geocode just a main street name (for rows with no cross streets)."""
+        cache_key = f"{main}||{city}|{state}".upper()
+        cache_file = os.path.join(GEOCODE_CACHE_DIR, f"{abs(hash(cache_key)) % 10**12}.json")
+
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+
+        query = urllib.parse.quote(f"{main}, {city}, {state}")
+        url = f"https://maps.googleapis.com/maps/api/geocode/json?address={query}&key={api_key}"
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+
+            if data.get("status") != "OK" or not data.get("results"):
+                result = {"found": False, "main_canonical": None}
+            else:
+                components = data["results"][0].get("address_components", [])
+                route = next((c["long_name"] for c in components if "route" in c.get("types", [])), None)
+                result = {"found": bool(route), "main_canonical": route}
+        except Exception as e:
+            result = {"found": False, "main_canonical": None, "error": str(e)[:80]}
+
+        try:
+            with open(cache_file, "w") as f:
+                json.dump(result, f)
+        except Exception:
+            pass
+
+        return result
+
+    def _validate_streets(streets: list, city: str, state: str) -> tuple:
+        api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+        if not api_key:
+
+            log("  ⚠ GOOGLE_MAPS_API_KEY not set — skipping validation")
+            return streets
+
+        # Build unique geocode tasks to minimize API calls
+        # Each task is (main, cross) where cross may be None
+        tasks = set()
+        for s in streets:
+            main  = (s.get("main_street") or "").strip()
+            fr    = (s.get("from_street") or "").strip()
+            to    = (s.get("to_street")   or "").strip()
+            if not main or main.upper() in _LIMIT_TOKENS:
+                continue
+            fr_valid = fr and fr.upper() not in _LIMIT_TOKENS
+            to_valid = to and to.upper() not in _LIMIT_TOKENS
+            if fr_valid:
+                tasks.add((main, fr))
+            if to_valid:
+                tasks.add((main, to))
+            if not fr_valid and not to_valid:
+                tasks.add((main, None))
+
+        log(f"  🌐 Geocoding {len(tasks)} intersections/streets...")
+
+        geo_results: dict = {}
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futs = {}
+            for main, cross in tasks:
+                if cross:
+                    futs[pool.submit(_geocode_intersection, main, cross, city, state, api_key)] = (main, cross)
+                else:
+                    futs[pool.submit(_geocode_main_only, main, city, state, api_key)] = (main, None)
+            for fut in as_completed(futs):
+                key = futs[fut]
+                try:
+                    geo_results[key] = fut.result()
+                except Exception:
+                    geo_results[key] = {"found": False}
+
+        # Directional prefixes — don't apply a correction that adds one of these
+        _DIRECTIONALS = {"N", "S", "E", "W", "NORTH", "SOUTH", "EAST", "WEST"}
+
+        def _safe_correct(original: str, canonical: str) -> str:
+            """
+            Return canonical only if it's safe to apply:
+            - Don't add a directional prefix that wasn't in the original
+            - Don't change the base name to something completely different
+            """
+            if not canonical:
+                return original
+            orig_parts = original.strip().upper().split()
+            can_parts  = canonical.strip().upper().split()
+            # Strip known suffixes and directionals to get base tokens
+            orig_base = [p for p in orig_parts if p not in _DIRECTIONALS and p not in _SUFFIX_MAP and p not in {"AVENUE","STREET","DRIVE","ROAD","BOULEVARD","LANE","PLACE","CIRCLE","WAY","COURT","TRAIL","TERRACE"}]
+            can_base  = [p for p in can_parts  if p not in _DIRECTIONALS and p not in _SUFFIX_MAP and p not in {"AVENUE","STREET","DRIVE","ROAD","BOULEVARD","LANE","PLACE","CIRCLE","WAY","COURT","TRAIL","TERRACE"}]
+            # Reject if canonical added a directional not in original
+            can_dir   = can_parts[0]  if can_parts and can_parts[0]  in _DIRECTIONALS else None
+            orig_dir  = orig_parts[0] if orig_parts and orig_parts[0] in _DIRECTIONALS else None
+            if can_dir and can_dir != orig_dir:
+                return original  # don't add new directional
+            # Reject if base names differ significantly
+            if orig_base and can_base and orig_base != can_base:
+                pass  # fuzz imported as _fuzz at top
+                if _fuzz.token_sort_ratio(" ".join(orig_base), " ".join(can_base)) < 80:
+                    return original
+            return canonical
+
+        corrected_main = 0
+        corrected_cross = 0
+        flagged = 0
+
+        # If the majority of rows in this document have from/to streets, rows missing
+        # both are likely address-list noise (e.g. sewer/pothole pages) — flag them.
+        real_streets = [s for s in streets if (s.get("main_street") or "").strip()
+                        and (s.get("main_street") or "").strip().upper() not in _LIMIT_TOKENS]
+        has_limits_count = sum(
+            1 for s in real_streets
+            if ((s.get("from_street") or "").strip() and
+                (s.get("from_street") or "").strip().upper() not in _LIMIT_TOKENS)
+            or ((s.get("to_street") or "").strip() and
+                (s.get("to_street") or "").strip().upper() not in _LIMIT_TOKENS)
+        )
+        doc_has_limits = len(real_streets) > 0 and (has_limits_count / len(real_streets)) >= 0.40
+        if doc_has_limits:
+            log(f"  ℹ Doc has limits on {has_limits_count}/{len(real_streets)} rows "
+                f"({has_limits_count/len(real_streets):.0%}) — rows missing both from/to will be flagged low_confidence")
+
+        # Detect measurement-based limits (e.g. "143' E/O FRANK GREG WAY", "319FT W/O...")
+        _MEAS_RE = re.compile(r"^\d+['\"FT\s]", re.IGNORECASE)
+
+        for s in streets:
+            main  = (s.get("main_street") or "").strip()
+            fr    = (s.get("from_street") or "").strip()
+            to    = (s.get("to_street")   or "").strip()
+            if not main or main.upper() in _LIMIT_TOKENS:
+                continue
+
+            fr_valid = fr and fr.upper() not in _LIMIT_TOKENS
+            to_valid = to and to.upper() not in _LIMIT_TOKENS
+
+            # If doc normally has limits but this row has neither, it's likely noise
+            if doc_has_limits and not fr_valid and not to_valid:
+                s["low_confidence"] = True
+                s["low_confidence_reason"] = "no_from_to_in_segment_doc"
+                flagged += 1
+                continue
+
+            fr_is_measurement = bool(fr and _MEAS_RE.match(fr))
+            to_is_measurement = bool(to and _MEAS_RE.match(to))
+
+            # Gather results for this row
+            fr_result = geo_results.get((main, fr)) if fr_valid else None
+            to_result = geo_results.get((main, to)) if to_valid else None
+            main_result = geo_results.get((main, None)) if not fr_valid and not to_valid else None
+
+            # Determine if row is valid
+            has_intersection = (
+                (fr_result and fr_result.get("intersection")) or
+                (to_result and to_result.get("intersection"))
+            )
+            has_any_hit = (
+                (fr_result and fr_result.get("found")) or
+                (to_result and to_result.get("found")) or
+                (main_result and main_result.get("found"))
+            )
+
+            if not has_any_hit:
+                if fr_is_measurement or to_is_measurement:
+                    reason = "measurement_based_limits"
+                else:
+                    reason = "google_maps_no_hit"
+                s["low_confidence"] = True
+                s["low_confidence_reason"] = reason
+                flagged += 1
+                continue  # will be filtered into low_confidence_streets below
+
+            # Correct main street name safely
+            best = fr_result or to_result or main_result or {}
+            canonical_main = best.get("main_canonical")
+            if canonical_main:
+                corrected = _safe_correct(main, canonical_main)
+                if corrected.upper() != main.upper():
+                    s["main_street"] = corrected
+                    s["name_corrected"] = True
+                    corrected_main += 1
+
+            # Correct from_street safely
+            if fr_valid and fr_result and fr_result.get("found"):
+                canonical_fr = fr_result.get("cross_canonical")
+                if canonical_fr:
+                    corrected_fr = _safe_correct(fr, canonical_fr)
+                    if corrected_fr.upper() != fr.upper():
+                        s["from_street"] = corrected_fr
+                        corrected_cross += 1
+
+            # Correct to_street safely
+            if to_valid and to_result and to_result.get("found"):
+                canonical_to = to_result.get("cross_canonical")
+                if canonical_to:
+                    corrected_to = _safe_correct(to, canonical_to)
+                    if corrected_to.upper() != to.upper():
+                        s["to_street"] = corrected_to
+                        corrected_cross += 1
+
+            # Flag if no confirmed intersection
+            if not has_intersection and not (main_result and main_result.get("found")):
+                s["low_confidence"] = True
+                if fr_is_measurement or to_is_measurement:
+                    s["low_confidence_reason"] = "measurement_based_limits"
+                else:
+                    s["low_confidence_reason"] = "google_maps_no_intersection"
+
+        confident = [s for s in streets if not s.get("low_confidence")]
+        low_conf  = [s for s in streets if s.get("low_confidence")]
+        reason_counts = {}
+        for s in low_conf:
+            r = s.get("low_confidence_reason", "unknown")
+            reason_counts[r] = reason_counts.get(r, 0) + 1
+        reason_str = ", ".join(f"{v}x {k}" for k, v in sorted(reason_counts.items()))
+        log(f"  ✓ Geocoding: {corrected_main} main corrected, {corrected_cross} cross corrected, "
+            f"{flagged} flagged low_confidence [{reason_str}] (removed from streets)")
+        for s in low_conf:
+            log(f"    🚫 [{(s.get('low_confidence_reason') or '?'):35s}] p.{s.get('page') or ''}  "
+                f"{(s.get('main_street') or ''):30s} | {(s.get('from_street') or ''):25s} | {s.get('to_street') or ''}")
+        return confident, low_conf
+
+    all_streets, low_confidence_streets = _validate_streets(all_streets, city, state)
+
     schema["streets"] = all_streets
+    schema["low_confidence_streets"] = low_confidence_streets
     schema["_meta"] = {
         "total_pages": total_pages,
         "selected_pages": selected_pages,

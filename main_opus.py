@@ -2002,15 +2002,29 @@ Return ONLY valid JSON, no markdown:
 
         # Build unique geocode tasks to minimize API calls
         # Each task is (main, cross) where cross may be None
+        _DIR_SUFFIX_RE_TASK = re.compile(r"\s*\((EB|WB|NB|SB)\)\s*", re.IGNORECASE)  # anywhere in string
+        _ORDINAL_ZERO_RE    = re.compile(r'\b0+(\d*(?:ST|ND|RD|TH))\b', re.IGNORECASE)
+        # Ramp-like from/to values: "NIMITZ BL RA", "TEXAS ST OFF RA", "MAIN ST ON RA"
+        _RAMP_RE = re.compile(r'\b(OFF\s+RA|ON\s+RA|RA)\s*$', re.IGNORECASE)
+
+        def _norm_for_geocode(s: str) -> str:
+            """Strip directional suffixes (anywhere) and leading zeros from ordinals for geocoding."""
+            s = _DIR_SUFFIX_RE_TASK.sub(" ", s.strip()).strip()  # VISTA (SB) LN → VISTA LN
+            s = _ORDINAL_ZERO_RE.sub(r'\1', s)  # 01ST → 1ST, 04TH → 4TH
+            return s
+
+        def _is_ramp(s: str) -> bool:
+            return bool(s and _RAMP_RE.search(s.strip()))
+
         tasks = set()
         for s in streets:
-            main  = (s.get("main_street") or "").strip()
-            fr    = (s.get("from_street") or "").strip()
-            to    = (s.get("to_street")   or "").strip()
+            main  = _norm_for_geocode((s.get("main_street") or ""))
+            fr    = _norm_for_geocode((s.get("from_street") or ""))
+            to    = _norm_for_geocode((s.get("to_street")   or ""))
             if not main or main.upper() in _LIMIT_TOKENS:
                 continue
-            fr_valid = fr and fr.upper() not in _LIMIT_TOKENS
-            to_valid = to and to.upper() not in _LIMIT_TOKENS
+            fr_valid = fr and fr.upper() not in _LIMIT_TOKENS and not _is_ramp(fr)
+            to_valid = to and to.upper() not in _LIMIT_TOKENS and not _is_ramp(to)
             if fr_valid:
                 tasks.add((main, fr))
             if to_valid:
@@ -2087,14 +2101,26 @@ Return ONLY valid JSON, no markdown:
         _MEAS_RE = re.compile(r"^\d+['\"FT\s]", re.IGNORECASE)
 
         for s in streets:
-            main  = (s.get("main_street") or "").strip()
-            fr    = (s.get("from_street") or "").strip()
-            to    = (s.get("to_street")   or "").strip()
+            main  = _norm_for_geocode((s.get("main_street") or ""))
+            fr    = _norm_for_geocode((s.get("from_street") or ""))
+            to    = _norm_for_geocode((s.get("to_street")   or ""))
             if not main or main.upper() in _LIMIT_TOKENS:
                 continue
 
-            fr_valid = fr and fr.upper() not in _LIMIT_TOKENS
-            to_valid = to and to.upper() not in _LIMIT_TOKENS
+            fr_is_ramp  = _is_ramp(fr)
+            to_is_ramp  = _is_ramp(to)
+            fr_valid = fr and fr.upper() not in _LIMIT_TOKENS and not fr_is_ramp
+            to_valid = to and to.upper() not in _LIMIT_TOKENS and not to_is_ramp
+            # Track whether one side is a known limit token (BEGIN/END/EOS/etc.) or ramp
+            # If so, we only have one geocodable side — don't require full intersection
+            one_side_is_limit = (
+                bool(fr and fr.upper() in _LIMIT_TOKENS) or
+                bool(to and to.upper() in _LIMIT_TOKENS) or
+                fr_is_ramp or to_is_ramp
+            )
+            # Flag the street if one endpoint is a ramp
+            if fr_is_ramp or to_is_ramp:
+                s["has_ramp_endpoint"] = True
 
             # If doc normally has limits but this row has neither, it's likely noise
             if doc_has_limits and not fr_valid and not to_valid:
@@ -2161,12 +2187,35 @@ Return ONLY valid JSON, no markdown:
                         corrected_cross += 1
 
             # Flag if no confirmed intersection
+            # Exception: if one side is a limit token (BEGIN/END/EOS/etc.), we only
+            # have one geocodable cross street — if that was found, accept the row.
             if not has_intersection and not (main_result and main_result.get("found")):
-                s["low_confidence"] = True
-                if fr_is_measurement or to_is_measurement:
-                    s["low_confidence_reason"] = "measurement_based_limits"
+                if one_side_is_limit and has_any_hit:
+                    pass  # one limit side + real cross street found → keep
                 else:
-                    s["low_confidence_reason"] = "google_maps_no_intersection"
+                    s["low_confidence"] = True
+                    if fr_is_measurement or to_is_measurement:
+                        s["low_confidence_reason"] = "measurement_based_limits"
+                    else:
+                        s["low_confidence_reason"] = "google_maps_no_intersection"
+
+        # Remove streets with only one cross street and the other genuinely blank
+        # (not a limit token like BEGIN/END — those are kept). These are typically
+        # OCR artifacts where DocAI extracted an incomplete row.
+        for s in streets:
+            if s.get("low_confidence"):
+                continue
+            fr = (s.get("from_street") or "").strip()
+            to = (s.get("to_street")   or "").strip()
+            fr_has_value = bool(fr)
+            to_has_value = bool(to)
+            fr_is_limit_val = fr_has_value and fr.upper() in _LIMIT_TOKENS
+            to_is_limit_val = to_has_value and to.upper() in _LIMIT_TOKENS
+            # One side filled, other blank (not a limit) → incomplete segment
+            if (fr_has_value and not fr_is_limit_val and not to_has_value) or \
+               (to_has_value and not to_is_limit_val and not fr_has_value):
+                s["low_confidence"] = True
+                s["low_confidence_reason"] = "missing_one_endpoint"
 
         confident = [s for s in streets if not s.get("low_confidence")]
         low_conf  = [s for s in streets if s.get("low_confidence")]

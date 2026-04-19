@@ -159,7 +159,12 @@ def _run_eval(job_id: str, doc_key: str, force_reparse: bool):
         if not force_reparse and os.path.exists(parser_cache):
             log("Loading parser cache (skipping re-parse)...")
             with open(parser_cache) as f:
-                parsed = json.load(f)
+                cached = json.load(f)
+            # Support old format (plain list) and new format (dict with streets key)
+            if isinstance(cached, list):
+                parsed = cached
+            else:
+                parsed = cached.get("streets", [])
             log(f"✓ {len(parsed)} streets from cache", "success")
             job["progress"]["phase"] = "matching"
 

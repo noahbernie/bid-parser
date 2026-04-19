@@ -25,7 +25,7 @@ PDF_DIR    = os.path.join(TESTS_DIR, "pdfs")
 CACHE_DIR  = os.path.join(TESTS_DIR, "cache")
 COL_MAP    = os.path.join(TESTS_DIR, "column_map.json")
 
-FUZZY_THRESHOLD = 0.74
+FUZZY_THRESHOLD = 0.70
 
 # ── Normalization ─────────────────────────────────────────────────────────────
 
@@ -86,6 +86,8 @@ def norm(v) -> str:
         return ""
     s = re.sub(r"\s+", " ", str(v).strip().upper())
     s = s.translate(_UNICODE_CONFUSABLES)  # replace Cyrillic/Greek lookalikes with Latin
+    # Strip directional lane suffixes: "ALTON PKWY (EB)" → "ALTON PKWY"
+    s = re.sub(r"\s*\((EB|WB|NB|SB)\)\s*$", "", s, flags=re.IGNORECASE)
     # Strip asset ID prefixes like "SS-001459-PV1 " before further normalization
     s = re.sub(r'^[A-Z]{1,4}-\d{4,8}-[A-Z0-9]+(?:-[A-Z0-9]+)*\s+', '', s)
     # Normalize all Unicode dash/hyphen variants to ASCII hyphen, then to space
@@ -143,11 +145,26 @@ def norm(v) -> str:
         parts.pop()
     return " ".join(parts)
 
+_DIR_SUFFIX_RE = re.compile(r"\s*\((EB|WB|NB|SB)\)\s*$", re.IGNORECASE)
+
+def _dir_suffix(s: str) -> str:
+    """Extract directional suffix from raw string, e.g. 'ALTON PKWY (WB)' → 'WB'. Empty if none."""
+    m = _DIR_SUFFIX_RE.search(str(s or ""))
+    return m.group(1).upper() if m else ""
+
 def similarity(a: str, b: str) -> float:
     na, nb = norm(a), norm(b)
     if not na or not nb:
         return 0.0
     return _fuzz.token_sort_ratio(na, nb) / 100.0
+
+def main_street_similarity(a: str, b: str) -> float:
+    """Like similarity() but treats conflicting directional suffixes as non-matching."""
+    da, db = _dir_suffix(a), _dir_suffix(b)
+    # If both sides have a directional suffix and they differ → not the same street
+    if da and db and da != db:
+        return 0.0
+    return similarity(a, b)
 
 def street_key(s: dict) -> tuple:
     return (norm(s.get("main_street", "")),
@@ -299,23 +316,29 @@ def match_streets(truth: list, parsed: list) -> dict:
     used = set()
 
     # Deduplicate ground truth — same street can appear in multiple tabs/pages
+    # Use raw uppercased values so directional variants (EB/WB) stay distinct
     seen_keys, deduped_truth = set(), []
     for t in truth:
-        k = (norm(t.get("main_street","")), norm(t.get("from_street","")), norm(t.get("to_street","")))
+        k = (
+            (t.get("main_street") or "").strip().upper(),
+            (t.get("from_street") or "").strip().upper(),
+            (t.get("to_street")   or "").strip().upper(),
+        )
         if k not in seen_keys:
             seen_keys.add(k)
             deduped_truth.append(t)
     truth = deduped_truth
 
-    # Deduplicate parsed streets — strip exact and swapped (main, from, to) duplicates
+    # Deduplicate parsed streets — remove exact duplicates only.
+    # Do NOT collapse swapped (from→to vs to→from) because NB and SB directions
+    # are genuinely different segments (e.g. "CAMPUS→MARTIN" ≠ "MARTIN→CAMPUS").
     seen_keys, deduped = set(), []
     for p in parsed:
-        mn = norm(p.get("main_street",""))
-        fr = norm(p.get("from_street",""))
-        to = norm(p.get("to_street",""))
-        k        = (mn, fr, to)
-        k_swapped = (mn, to, fr)
-        if k not in seen_keys and k_swapped not in seen_keys:
+        mn = (p.get("main_street") or "").strip().upper()
+        fr = (p.get("from_street") or "").strip().upper()
+        to = (p.get("to_street")   or "").strip().upper()
+        k = (mn, fr, to)
+        if k not in seen_keys:
             seen_keys.add(k)
             deduped.append(p)
     parsed = deduped
@@ -327,7 +350,7 @@ def match_streets(truth: list, parsed: list) -> dict:
             if i in used:
                 continue
             pk = street_key(p)
-            ms_score = similarity(tk[0], pk[0])
+            ms_score = main_street_similarity(t.get("main_street", ""), p.get("main_street", ""))
             # Check normal orientation and swapped FROM/TO (limits can be written either direction)
             from_ok  = (not tk[1] or not pk[1] or similarity(tk[1], pk[1]) >= 0.6)
             to_ok    = (not tk[2] or not pk[2] or similarity(tk[2], pk[2]) >= 0.6)

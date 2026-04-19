@@ -1841,6 +1841,22 @@ Return ONLY valid JSON, no markdown:
     all_streets = list(seen.values())
     log(f"  Dedup: {before} → {len(all_streets)} streets")
 
+    # --- Step 5b: Extract parenthetical tags from street fields ---
+    # Parenthetical descriptors like "(NORTHBOUND ONLY)", "(WB ONLY)", "(BRIDGE OVERPASS)"
+    # are not part of the street name — extract them as tags and clean the field value.
+    _PAREN_RE = re.compile(r"\s*\(([^)]+)\)\s*")
+    _DIR_TAG_RE = re.compile(r"\b(NB|SB|EB|WB|NORTHBOUND|SOUTHBOUND|EASTBOUND|WESTBOUND)\b", re.IGNORECASE)
+    for s in all_streets:
+        tags = []
+        for field in ("main_street", "from_street", "to_street"):
+            val = s.get(field) or ""
+            matches = _PAREN_RE.findall(val)
+            if matches:
+                tags.extend(m.strip() for m in matches)
+                s[field] = _PAREN_RE.sub(" ", val).strip()
+        if tags:
+            s["tags"] = tags
+
     # --- Step 6: Google Geocoding — intersection validation + spelling correction ---
     log("🗺 Step 6: Google Geocoding intersection validation...")
 

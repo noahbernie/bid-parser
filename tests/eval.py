@@ -49,6 +49,7 @@ _LIMIT_NORM = {
     "EOP": "END", "EOR": "END", "EOS": "END", "EOC": "END",
     "EOL": "END", "EOF": "END", "BEGIN": "END", "BEGINNING": "END",
     "START": "END", "STOP": "END",
+    "TEOP": "END",  # OCR artifact: leading char glued to "EOP"
 }
 
 # Numeric ordinal → written form (e.g. "5TH" → "FIFTH", "12TH" → "TWELFTH")
@@ -88,6 +89,10 @@ def norm(v) -> str:
     s = s.translate(_UNICODE_CONFUSABLES)  # replace Cyrillic/Greek lookalikes with Latin
     # Strip directional lane suffixes: "ALTON PKWY (EB)" → "ALTON PKWY"
     s = re.sub(r"\s*\((EB|WB|NB|SB)\)\s*$", "", s, flags=re.IGNORECASE)
+    # Strip any remaining trailing parenthetical descriptor:
+    # "(NORTHBOUND ONLY)", "(BRIDGE OVERPASS)", "(WB ONLY)", "(Ramp N/of Frwy)", etc.
+    # Parser correctly drops these; GT sometimes retains them.
+    s = re.sub(r"\s*\([^)]+\)\s*$", "", s)
     # Strip asset ID prefixes like "SS-001459-PV1 " before further normalization
     s = re.sub(r'^[A-Z]{1,4}-\d{4,8}-[A-Z0-9]+(?:-[A-Z0-9]+)*\s+', '', s)
     # Normalize all Unicode dash/hyphen variants to ASCII hyphen, then to space
@@ -95,6 +100,10 @@ def norm(v) -> str:
     s = "".join("-" if unicodedata.category(c) in ("Pd",) or c in ('\u2010','\u2011','\u2012','\u2013','\u2014','\u2015','\u2212') else c for c in s)
     s = s.replace("-", " ")  # normalize hyphens so "CDS-WEST END" == "CDS - WEST END"
     s = re.sub(r"[^\w\s]", "", s)
+    # Normalize doubled limit tokens: "ENDEND" → "END" (OCR artifact)
+    s = re.sub(r'\bEND(?:END)+\b', 'END', s, flags=re.IGNORECASE)
+    # Split directional prefix glued to ordinal: "S32ND" → "S 32ND", "N15TH" → "N 15TH"
+    s = re.sub(r'\b([NSEW])(\d+(?:ST|ND|RD|TH))\b', r'\1 \2', s)
     parts = s.split()
     # Collapse adjacent single-letter tokens: "E H ST" → "EH ST"
     # Handles GT xlsx entries where abbreviated names have extra spaces (e.g. "E   H  ST")
@@ -134,8 +143,14 @@ def norm(v) -> str:
         return _LIMIT_NORM[parts[0]]
     # Normalize ordinals anywhere in the name (e.g. "5TH ST" → "FIFTH ST")
     parts = [_ORDINAL_MAP.get(p, p) for p in parts]
+    # Normalize type suffix (last word), with special handling when a compass direction
+    # word follows the suffix: "TECHNOLOGY DRIVE WEST" → last="WEST" (not a suffix),
+    # but second-to-last "DRIVE" is — normalize it so similarity to "TECHNOLOGY DR" works.
+    _COMPASS_WORDS = {"NORTH", "SOUTH", "EAST", "WEST"}
     if parts and parts[-1] in _SUFFIX_MAP:
         parts[-1] = _SUFFIX_MAP[parts[-1]]
+    elif len(parts) >= 2 and parts[-1] in _COMPASS_WORDS and parts[-2] in _SUFFIX_MAP:
+        parts[-2] = _SUFFIX_MAP[parts[-2]]
     # Strip leading/trailing 1-2 digit noise tokens (row numbers, zone IDs, etc.)
     # Ordinals like "44TH", "21ST" are not pure digits — they stay.
     # Route numbers like 101, 405 are 3+ digits — they stay.

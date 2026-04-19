@@ -143,6 +143,10 @@ def norm(v) -> str:
         parts.pop(0)
     while parts and parts[-1].isdigit() and len(parts[-1]) <= 2:
         parts.pop()
+    # Normalize CDS variants ("CDS WEST END", "CDS NORTH END", etc.) → "CDS"
+    # Hyphen was already collapsed to space above, so "CDS-WEST END" → "CDS WEST END" → "CDS"
+    if parts and parts[0] == "CDS":
+        return "CDS"
     return " ".join(parts)
 
 _DIR_SUFFIX_RE = re.compile(r"\s*\((EB|WB|NB|SB)\)\s*$", re.IGNORECASE)
@@ -315,29 +319,54 @@ def match_streets(truth: list, parsed: list) -> dict:
     matched, missed, extra = [], [], []
     used = set()
 
-    # Deduplicate ground truth — same street can appear in multiple tabs/pages
-    # Use raw uppercased values so directional variants (EB/WB) stay distinct
+    # Deduplicate ground truth — use norm() so formatting variants collapse
+    # (e.g. "CDS-SOUTH END" == "CDS - SOUTH END" == "CDS SOUTH END" → "CDS").
     seen_keys, deduped_truth = set(), []
     for t in truth:
         k = (
-            (t.get("main_street") or "").strip().upper(),
-            (t.get("from_street") or "").strip().upper(),
-            (t.get("to_street")   or "").strip().upper(),
+            norm(t.get("main_street") or ""),
+            norm(t.get("from_street") or ""),
+            norm(t.get("to_street")   or ""),
         )
         if k not in seen_keys:
             seen_keys.add(k)
             deduped_truth.append(t)
     truth = deduped_truth
 
-    # Deduplicate parsed streets — remove exact duplicates only.
-    # Do NOT collapse swapped (from→to vs to→from) because NB and SB directions
-    # are genuinely different segments (e.g. "CAMPUS→MARTIN" ≠ "MARTIN→CAMPUS").
+    # Remove one-sided GT entries (one blank endpoint) when a two-sided entry
+    # (both endpoints filled) exists for the same main street.
+    # Some GT tabs record only "end location" with "begin location" blank;
+    # the complete entry appears in another tab.  Keeping the incomplete version
+    # causes it to "steal" a parser match via the swap_ok path, leaving the
+    # proper two-sided entry unmatched.
+    from collections import defaultdict as _defaultdict
+    _by_main = _defaultdict(list)
+    for t in truth:
+        _by_main[norm(t.get("main_street") or "")].append(t)
+    truth = [
+        t for t in truth
+        if not (
+            # one-sided: exactly one of from/to is blank
+            bool((t.get("from_street") or "").strip()) != bool((t.get("to_street") or "").strip())
+            # AND a two-sided entry exists for the same main street
+            and any(
+                (g.get("from_street") or "").strip() and (g.get("to_street") or "").strip()
+                for g in _by_main[norm(t.get("main_street") or "")]
+            )
+        )
+    ]
+
+    # Deduplicate parsed streets using norm() so CDS variants collapse
+    # ("CDS WEST END" == "CDS-WEST END" → same slot).
+    # Do NOT collapse swapped orientations (from→to vs to→from) because NB/SB
+    # directions are genuinely different segments.
     seen_keys, deduped = set(), []
     for p in parsed:
-        mn = (p.get("main_street") or "").strip().upper()
-        fr = (p.get("from_street") or "").strip().upper()
-        to = (p.get("to_street")   or "").strip().upper()
-        k = (mn, fr, to)
+        k = (
+            norm(p.get("main_street") or ""),
+            norm(p.get("from_street") or ""),
+            norm(p.get("to_street")   or ""),
+        )
         if k not in seen_keys:
             seen_keys.add(k)
             deduped.append(p)

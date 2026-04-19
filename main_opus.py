@@ -1851,6 +1851,13 @@ Return ONLY valid JSON, no markdown:
     _LIMIT_TOKENS = {
         "END", "BEGIN", "BEGINNING", "START", "STOP",
         "EOP", "EOR", "EOS", "EOC", "EOL", "EOF",
+        # Cul-de-sac variants — never a geocodable intersection
+        "CDS", "DEAD END", "DEADEND",
+        # Directional CDS (e.g. "E CDS", "NW CDS") — terminus with compass prefix
+        "N CDS", "S CDS", "E CDS", "W CDS",
+        "NE CDS", "NW CDS", "SE CDS", "SW CDS",
+        # Full-word directional CDS
+        "NORTH CDS", "SOUTH CDS", "EAST CDS", "WEST CDS",
     }
 
     def _geocode_intersection(main: str, cross: str, city: str, state: str, api_key: str) -> dict:

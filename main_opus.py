@@ -2199,6 +2199,34 @@ Return ONLY valid JSON, no markdown:
                     else:
                         s["low_confidence_reason"] = "google_maps_no_intersection"
 
+        # Cross-document validation: private/gated-community roads (e.g. CAM CALMA,
+        # CAM PLAYA cluster) exist on Google Maps individually but their intersections
+        # aren't indexed.  If a flagged street's cross street appears as a main_street
+        # elsewhere in this same document, the intersection is real — reinstate it.
+        _CAMINO_RE = re.compile(r'\bCAMINO\b', re.IGNORECASE)
+
+        def _cdv_norm(s: str) -> str:
+            """Normalize for cross-doc comparison: strip dir suffixes/zeros, then CAMINO→CAM."""
+            s = _norm_for_geocode(s).upper()
+            return _CAMINO_RE.sub("CAM", s).strip()
+
+        all_doc_mains = {
+            _cdv_norm(s.get("main_street") or "")
+            for s in streets
+            if (s.get("main_street") or "").strip()
+        }
+        for s in streets:
+            if s.get("low_confidence") and s.get("low_confidence_reason") == "google_maps_no_intersection":
+                fr_norm = _cdv_norm(s.get("from_street") or "")
+                to_norm = _cdv_norm(s.get("to_street")   or "")
+                fr_match = fr_norm and fr_norm not in _LIMIT_TOKENS and fr_norm in all_doc_mains
+                to_match = to_norm and to_norm not in _LIMIT_TOKENS and to_norm in all_doc_mains
+                if fr_match or to_match:
+                    s.pop("low_confidence", None)
+                    s.pop("low_confidence_reason", None)
+                    s["cross_doc_validated"] = True
+                    flagged -= 1
+
         # Remove streets with only one cross street and the other genuinely blank
         # (not a limit token like BEGIN/END — those are kept). These are typically
         # OCR artifacts where DocAI extracted an incomplete row.

@@ -3396,13 +3396,18 @@ async def parse_status(
             "progress": doc.get("progress", {}),
         }
 
-    # Done — return result and clean up memory
+    # Done — return only the 4 DB-shaped tables, strip legacy keys
     del documents[job_id]
     return {
         "job_id": job_id,
         "done": True,
         "status": "done",
-        "result": schema,
+        "result": {
+            "job":               schema.get("job"),
+            "bid_parse_results": schema.get("bid_parse_results"),
+            "parser_stage_logs": schema.get("parser_stage_logs"),
+            "streets_raw":       schema.get("streets_raw"),
+        },
     }
 
 

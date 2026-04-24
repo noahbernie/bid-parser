@@ -1273,7 +1273,17 @@ def run_extraction(doc_id: str, api_key: str):
         return _S()
 
     def _exit_error(message: str):
-        schema["job"] = {"status": "error", "parse_error": message}
+        schema["job"] = {
+            "id": None,
+            "project_id": None,
+            "organization_id": None,
+            "uploaded_by_user_id": None,
+            "job_name": None,
+            "status": "error",
+            "parse_error": message,
+            "created_at": None,
+            "updated_at": None,
+        }
         schema["streets"] = []
         schema["low_confidence_streets"] = []
         schema["bid_parse_results"] = None
@@ -2407,11 +2417,16 @@ Return ONLY valid JSON, no markdown:
         for stg in _stages
     ]
 
-    # job: fields the parser can contribute to the jobs table row
-    # Platform owns id, project_id, organization_id, uploaded_by_user_id, job_name, created_at
     job_patch = {
-        "status":      "parsed",
+        "id": None,
+        "project_id": None,
+        "organization_id": None,
+        "uploaded_by_user_id": None,
+        "job_name": None,
+        "status": "parsed",
         "parse_error": None,
+        "created_at": None,
+        "updated_at": None,
     }
 
     schema["job"]                = job_patch

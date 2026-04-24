@@ -1272,6 +1272,15 @@ def run_extraction(doc_id: str, api_key: str):
                 return rec
         return _S()
 
+    def _exit_error(message: str):
+        schema["job"] = {"status": "error", "parse_error": message}
+        schema["streets"] = []
+        schema["low_confidence_streets"] = []
+        schema["bid_parse_results"] = None
+        schema["parser_stage_logs"] = _stages
+        schema["streets_raw"] = []
+        doc["extracted_schema"] = schema
+
     # --- Step 1: Extract project header from first 5 pages (include city & state) ---
     log("📋 Step 1: Extracting project info from cover pages...")
     _HEADER_PROMPT_V2 = """You are parsing a road construction bid document. Extract project-level fields only.
@@ -1419,8 +1428,7 @@ Use null for any field not found. city and state are the city/state where the wo
 
     if not selected_pages:
         log("⚠ No pages selected — nothing to extract.")
-        doc["extracted_schema"] = schema
-        return
+        _exit_error("No street schedule pages found in document"); return
 
     # --- Step 3: DocAI Form Parser — send each selected page individually in parallel ---
     log(f"🔷 Step 3: Document AI Form Parser — {len(selected_pages)} pages in parallel...")
@@ -1430,8 +1438,7 @@ Use null for any field not found. city and state are the city/state where the wo
     credentials = _get_docai_credentials()
     if not credentials:
         log("✗ No Document AI credentials — set GOOGLE_APPLICATION_CREDENTIALS_JSON")
-        doc["extracted_schema"] = schema
-        return
+        _exit_error("GOOGLE_APPLICATION_CREDENTIALS_JSON not configured"); return
 
     docai_client = _docai.DocumentProcessorServiceClient(
         credentials=credentials,
@@ -1566,13 +1573,7 @@ Use null for any field not found. city and state are the city/state where the wo
 
     if not all_page_data:
         log("⚠ DocAI found no tables on selected pages.")
-        schema["streets"] = []
-        schema["_meta"] = {"total_pages": total_pages, "selected_pages": len(selected_pages),
-                           "selected_page_numbers": selected_pages,
-                           "city": city, "state": state, "total_streets": 0,
-                           "stages": _stages}
-        doc["extracted_schema"] = schema
-        return
+        _exit_error("DocAI found no tables on selected pages"); return
 
     # --- Step 4: Extract streets (Haiku Vision col-confirm → Gemini 2.5 Pro extraction) ---
     log("🤖 Step 4: Extracting streets — Gemini 2.5 Pro...")
@@ -2406,6 +2407,14 @@ Return ONLY valid JSON, no markdown:
         for stg in _stages
     ]
 
+    # job: fields the parser can contribute to the jobs table row
+    # Platform owns id, project_id, organization_id, uploaded_by_user_id, job_name, created_at
+    job_patch = {
+        "status":      "parsed",
+        "parse_error": None,
+    }
+
+    schema["job"]                = job_patch
     schema["bid_parse_results"]  = bid_parse_results
     schema["parser_stage_logs"]  = parser_stage_logs
     schema["streets_raw"]        = streets_raw

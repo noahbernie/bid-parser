@@ -1442,6 +1442,7 @@ Use null for any field not found. city and state are the city/state where the wo
 
     # --- Step 3: DocAI Form Parser — send each selected page individually in parallel ---
     log(f"🔷 Step 3: Document AI Form Parser — {len(selected_pages)} pages in parallel...")
+    _stage_docai = _stage(2, "docai_extract")
 
     from google.cloud import documentai as _docai
 
@@ -1578,7 +1579,6 @@ Use null for any field not found. city and state are the city/state where the wo
     total_tables = sum(len(v) for v in all_page_tables.values())
     total_rows   = sum(len(t[1]) for v in all_page_tables.values() for t in v)
     log(f"✓ DocAI complete — {len(all_page_data)} pages with data ({len(all_page_tables)} with tables), {total_tables} tables, {total_rows} body rows")
-    _stage_docai = _stage(2, "docai_extract")
     _stage_docai.finish(count_out=total_rows, pages_processed=len(selected_pages))
 
     if not all_page_data:
@@ -1587,6 +1587,7 @@ Use null for any field not found. city and state are the city/state where the wo
 
     # --- Step 4: Extract streets (Haiku Vision col-confirm → Gemini 2.5 Pro extraction) ---
     log("🤖 Step 4: Extracting streets — Gemini 2.5 Pro...")
+    _stage_gemini = _stage(3, "gemini_extract")
 
     STREET_SUFFIXES = {"RD", "AV", "AVE", "DR", "LN", "CT", "PL", "ST", "BL", "BLVD", "WY", "WAY",
                        "TR", "TRL", "CIR", "TER", "ML", "HWY", "PKWY", "FWY"}
@@ -1841,12 +1842,12 @@ Return ONLY valid JSON, no markdown:
 
 
     log(f"📊 Extraction summary — {skipped_text} text-filtered, {sent_to_vision} vision pages, {sent_to_gemini} tables sent to Gemini")
-    _stage_gemini = _stage(3, "gemini_extract")
     _stage_gemini.finish(count_out=len(all_streets))
 
     # --- Step 5: Deduplicate ---
     log("🔀 Step 5: Deduplicating...")
     _streets_before_dedup = len(all_streets)
+    _stage_dedup = _stage(4, "dedup", count_in=_streets_before_dedup)
 
     # Suffix normalization — all variants → short canonical form
     _SUFFIX_MAP = {
@@ -1902,7 +1903,6 @@ Return ONLY valid JSON, no markdown:
             seen[key] = s
     all_streets = list(seen.values())
     log(f"  Dedup: {before} → {len(all_streets)} streets")
-    _stage_dedup = _stage(4, "dedup", count_in=_streets_before_dedup)
     _stage_dedup.finish(count_out=len(all_streets), dropped=_streets_before_dedup - len(all_streets))
 
     # --- Step 5b: Extract parenthetical tags from street fields ---

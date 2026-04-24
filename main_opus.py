@@ -2343,11 +2343,10 @@ Return ONLY valid JSON, no markdown:
     all_streets, low_confidence_streets = _validate_streets(all_streets, city, state)
     _stage_geocode.finish(count_out=len(all_streets))
 
-    # Inline confidence + low_confidence_reason on each street
-    _low_conf_ids = {id(s): s for s in low_confidence_streets}
+    # Inline confidence on every street
+    _low_conf_id_set = {id(s) for s in low_confidence_streets}
     for s in all_streets:
-        if id(s) not in _low_conf_ids:
-            s["confidence"] = "high"
+        s.setdefault("confidence", "high")
     for s in low_confidence_streets:
         s["confidence"] = "low"
 
@@ -2358,19 +2357,73 @@ Return ONLY valid JSON, no markdown:
         if s.get("work_type")
     })
 
-    schema["streets"] = all_streets
+    # ── Build DB-shaped response ──────────────────────────────────────────────
+    # streets_raw: all streets (high + low confidence) with fields matching the
+    # streets_raw table. Platform stamps job_id and inserts directly.
+    def _street_to_raw(s: dict) -> dict:
+        return {
+            "main_street":           s.get("main_street") or None,
+            "from_street":           s.get("from_street") or None,
+            "to_street":             s.get("to_street")   or None,
+            "work_type":             s.get("work_type")   or None,
+            "location":              s.get("location")    or None,
+            "page":                  s.get("page")        or None,
+            "source":                s.get("source", "gemini-pro"),
+            "tags":                  s.get("tags")        or None,
+            "confidence":            s.get("confidence", "high"),
+            "low_confidence_reason": s.get("low_confidence_reason") or None,
+            # internal flags — platform may store or ignore
+            "name_corrected":        s.get("name_corrected")        or None,
+            "cross_doc_validated":   s.get("cross_doc_validated")   or None,
+            "has_ramp_endpoint":     s.get("has_ramp_endpoint")     or None,
+        }
+
+    streets_raw = [_street_to_raw(s) for s in all_streets + [
+        s for s in low_confidence_streets if id(s) not in {id(x) for x in all_streets}
+    ]]
+
+    # bid_parse_results: one row per job — maps directly to bid_parse_results table
+    bid_parse_results = {
+        "bid_number":            schema.get("bid_number")      or None,
+        "project_name":          schema.get("project_name")    or None,
+        "city":                  city  or None,
+        "state":                 state or None,
+        "work_types":            _all_work_types or None,
+        "estimated_cost":        schema.get("estimated_cost")  or None,
+        "bid_due_date":          schema.get("bid_due_date")    or None,
+        "total_pages":           total_pages,
+        "selected_pages":        len(selected_pages),
+        "selected_page_numbers": selected_pages,
+        "total_streets":         len(all_streets),
+        "low_confidence_count":  len(low_confidence_streets),
+        "chunks_processed":      None,  # not currently tracked per-chunk
+    }
+
+    # parser_stage_logs: one row per stage — maps directly to parser_stage_logs table
+    # raw_log_s3_key is null here; platform fills it after uploading stage JSON to S3
+    parser_stage_logs = [
+        {**stg, "raw_log_s3_key": None}
+        for stg in _stages
+    ]
+
+    schema["bid_parse_results"]  = bid_parse_results
+    schema["parser_stage_logs"]  = parser_stage_logs
+    schema["streets_raw"]        = streets_raw
+    # Keep legacy keys so eval harness and /status endpoint keep working
+    schema["streets"]            = all_streets
     schema["low_confidence_streets"] = low_confidence_streets
     schema["_meta"] = {
-        "total_pages": total_pages,
-        "selected_pages": len(selected_pages),
+        "total_pages":           total_pages,
+        "selected_pages":        len(selected_pages),
         "selected_page_numbers": selected_pages,
-        "city": city,
-        "state": state,
-        "work_types": _all_work_types,
-        "total_streets": len(all_streets),
-        "low_confidence_count": len(low_confidence_streets),
-        "stages": _stages,
+        "city":                  city,
+        "state":                 state,
+        "work_types":            _all_work_types,
+        "total_streets":         len(all_streets),
+        "low_confidence_count":  len(low_confidence_streets),
+        "stages":                _stages,
     }
+
     doc["extracted_schema"] = schema
     log(f"✓ Done! {len(all_streets)} streets extracted.", all_streets)
 

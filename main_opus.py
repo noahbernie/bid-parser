@@ -3325,20 +3325,22 @@ async def list_docs():
     ]
 
 
+def _check_api_key(x_api_key: str):
+    parser_api_key = os.environ.get("PARSER_API_KEY")
+    if parser_api_key and x_api_key != parser_api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+
+
 @app.post("/parse")
-async def parse_pdf(
+async def parse_pdf_async(
     file: UploadFile = File(...),
     x_api_key: str = Header(default=None),
 ):
     """
-    Single-call endpoint for external integrations.
-    Send a PDF as multipart/form-data (field name: 'file').
-    Optionally pass X-Api-Key header matching env var PARSER_API_KEY.
-    Returns the full extraction result synchronously.
+    Async parse endpoint. Returns a job_id immediately.
+    Poll GET /parse/{job_id} until done=true to get the result.
     """
-    parser_api_key = os.environ.get("PARSER_API_KEY")
-    if parser_api_key and x_api_key != parser_api_key:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+    _check_api_key(x_api_key)
 
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -3362,18 +3364,46 @@ async def parse_pdf(
         "progress": {"logs": [], "streets_so_far": []},
     }
 
-    # Run extraction synchronously (blocks until complete)
+    # Kick off extraction in background — client polls /parse/{doc_id}
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, run_extraction, doc_id, anthropic_key)
+    loop.run_in_executor(None, run_extraction, doc_id, anthropic_key)
 
-    result = documents[doc_id].get("extracted_schema")
-    if result is None:
-        raise HTTPException(status_code=500, detail="Extraction failed — check server logs")
+    return {"job_id": doc_id, "filename": file.filename, "total_pages": total, "status": "processing"}
 
-    # Clean up in-memory doc to avoid memory leak
-    del documents[doc_id]
 
-    return result
+@app.get("/parse/{job_id}")
+async def parse_status(
+    job_id: str,
+    x_api_key: str = Header(default=None),
+):
+    """
+    Poll this endpoint after POST /parse.
+    Returns done=false while processing, done=true with result when complete.
+    """
+    _check_api_key(x_api_key)
+
+    if job_id not in documents:
+        raise HTTPException(status_code=404, detail="Job not found — may have already been retrieved")
+
+    doc = documents[job_id]
+    schema = doc.get("extracted_schema")
+
+    if schema is None:
+        return {
+            "job_id": job_id,
+            "done": False,
+            "status": "processing",
+            "progress": doc.get("progress", {}),
+        }
+
+    # Done — return result and clean up memory
+    del documents[job_id]
+    return {
+        "job_id": job_id,
+        "done": True,
+        "status": "done",
+        "result": schema,
+    }
 
 
 @app.get("/")

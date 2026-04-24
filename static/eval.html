@@ -647,10 +647,17 @@ async function selectDoc(key) {
   const data = await res.json();
   if (!data.error) {
     selectedResults = data;
-    currentTab = 'missed';
+    // Stay on map tab if already there, otherwise default to missed
+    if (currentTab !== 'map') currentTab = 'missed';
     showDoneState(data);
   }
-  // else: stay on truth state
+  // else: stay on truth state — but if on map tab, still trigger it
+  if (currentTab === 'map') {
+    document.getElementById('pdf-pane').style.display = 'none';
+    document.getElementById('results-pane').style.width = '100%';
+    document.getElementById('results-pane').style.maxWidth = '100%';
+    initMapTab();
+  }
 }
 
 let truthCache = {};  // doc_key -> truth data
@@ -1276,19 +1283,23 @@ const MAP_COLORS = {
 };
 
 async function initMapTab() {
-  // Auto-populate city/state from server (parser _meta or city_state.json)
-  if (selectedDoc) {
-    try {
-      const r = await fetch(`/eval/city-state/${encodeURIComponent(selectedDoc)}`);
-      const d = await r.json();
-      const inp = document.getElementById('map-city-input');
-      if (d.city_state && !inp.value) inp.value = d.city_state;
-    } catch(e) {}
-  }
-  // Show existing data if already generated for this doc
+  if (!selectedDoc) return;
+
+  // Always update city/state input for the current doc
+  try {
+    const r = await fetch(`/eval/city-state/${encodeURIComponent(selectedDoc)}`);
+    const d = await r.json();
+    if (d.city_state) document.getElementById('map-city-input').value = d.city_state;
+  } catch(e) {}
+
+  // Already have data for this doc — just re-render
   if (_mapDocKey === selectedDoc && _mapData) {
     _renderMapData(_mapData);
+    return;
   }
+
+  // Different doc — auto-generate (server uses disk cache if already mapped)
+  generateMap();
 }
 
 async function scanCities() {

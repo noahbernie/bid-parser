@@ -1235,6 +1235,43 @@ def run_extraction(doc_id: str, api_key: str):
 
     client = anthropic.Anthropic(api_key=api_key)
 
+    # Stage timing + counts — populated as pipeline runs, returned in _meta.stages
+    import time as _time_mod
+    _stages = []
+
+    def _stage(order: int, name: str, count_in: int = None):
+        """Return a context object that records stage timing + counts."""
+        class _S:
+            def __init__(self):
+                self.order = order
+                self.name = name
+                self.t0 = _time_mod.time()
+                self.count_in = count_in
+                self.count_out = None
+                self.dropped = None
+                self.pages_processed = None
+                self.pages_selected = None
+                self.selected_page_numbers = None
+                self.error = None
+            def finish(self, count_out=None, dropped=None, pages_processed=None,
+                       pages_selected=None, selected_page_numbers=None, error=None):
+                rec = {
+                    "stage_order": self.order,
+                    "stage": self.name,
+                    "status": "error" if error else "success",
+                    "duration_ms": int((_time_mod.time() - self.t0) * 1000),
+                }
+                if self.count_in  is not None: rec["street_count_in"]  = self.count_in
+                if count_out      is not None: rec["street_count_out"] = count_out
+                if dropped        is not None: rec["streets_dropped"]  = dropped
+                if pages_processed is not None: rec["pages_processed"] = pages_processed
+                if pages_selected  is not None: rec["pages_selected"]  = pages_selected
+                if selected_page_numbers is not None: rec["selected_page_numbers"] = selected_page_numbers
+                if error: rec["error_message"] = str(error)[:300]
+                _stages.append(rec)
+                return rec
+        return _S()
+
     # --- Step 1: Extract project header from first 5 pages (include city & state) ---
     log("📋 Step 1: Extracting project info from cover pages...")
     _HEADER_PROMPT_V2 = """You are parsing a road construction bid document. Extract project-level fields only.
@@ -1336,6 +1373,7 @@ Use null for any field not found. city and state are the city/state where the wo
         return page_num, False
 
     selected_pages = []
+    _stage_page_screen = _stage(1, "page_screen")
     with ThreadPoolExecutor(max_workers=20) as pool:
         futures = {pool.submit(_screen_page, i): i for i in range(total_pages)}
         results = {}
@@ -1372,6 +1410,12 @@ Use null for any field not found. city and state are the city/state where the wo
     log(f"📊 Page screen complete — {len(selected_pages)}/{total_pages} pages selected for DocAI:")
     log(f"   Pages: {selected_pages}")
     log(f"")
+
+    _stage_page_screen.finish(
+        pages_processed=total_pages,
+        pages_selected=len(selected_pages),
+        selected_page_numbers=selected_pages,
+    )
 
     if not selected_pages:
         log("⚠ No pages selected — nothing to extract.")
@@ -1517,12 +1561,16 @@ Use null for any field not found. city and state are the city/state where the wo
     total_tables = sum(len(v) for v in all_page_tables.values())
     total_rows   = sum(len(t[1]) for v in all_page_tables.values() for t in v)
     log(f"✓ DocAI complete — {len(all_page_data)} pages with data ({len(all_page_tables)} with tables), {total_tables} tables, {total_rows} body rows")
+    _stage_docai = _stage(2, "docai_extract")
+    _stage_docai.finish(count_out=total_rows, pages_processed=len(selected_pages))
 
     if not all_page_data:
         log("⚠ DocAI found no tables on selected pages.")
         schema["streets"] = []
-        schema["_meta"] = {"total_pages": total_pages, "selected_pages": selected_pages,
-                           "city": city, "state": state, "total_streets": 0}
+        schema["_meta"] = {"total_pages": total_pages, "selected_pages": len(selected_pages),
+                           "selected_page_numbers": selected_pages,
+                           "city": city, "state": state, "total_streets": 0,
+                           "stages": _stages}
         doc["extracted_schema"] = schema
         return
 
@@ -1782,9 +1830,12 @@ Return ONLY valid JSON, no markdown:
 
 
     log(f"📊 Extraction summary — {skipped_text} text-filtered, {sent_to_vision} vision pages, {sent_to_gemini} tables sent to Gemini")
+    _stage_gemini = _stage(3, "gemini_extract")
+    _stage_gemini.finish(count_out=len(all_streets))
 
     # --- Step 5: Deduplicate ---
     log("🔀 Step 5: Deduplicating...")
+    _streets_before_dedup = len(all_streets)
 
     # Suffix normalization — all variants → short canonical form
     _SUFFIX_MAP = {
@@ -1840,10 +1891,14 @@ Return ONLY valid JSON, no markdown:
             seen[key] = s
     all_streets = list(seen.values())
     log(f"  Dedup: {before} → {len(all_streets)} streets")
+    _stage_dedup = _stage(4, "dedup", count_in=_streets_before_dedup)
+    _stage_dedup.finish(count_out=len(all_streets), dropped=_streets_before_dedup - len(all_streets))
 
     # --- Step 5b: Extract parenthetical tags from street fields ---
     # Parenthetical descriptors like "(NORTHBOUND ONLY)", "(WB ONLY)", "(BRIDGE OVERPASS)"
     # are not part of the street name — extract them as tags and clean the field value.
+    _streets_before_tags = len(all_streets)
+    _stage_tags = _stage(5, "tag_extraction", count_in=_streets_before_tags)
     _PAREN_RE = re.compile(r"\s*\(([^)]+)\)\s*")
     _DIR_TAG_RE = re.compile(r"\b(NB|SB|EB|WB|NORTHBOUND|SOUTHBOUND|EASTBOUND|WESTBOUND)\b", re.IGNORECASE)
     for s in all_streets:
@@ -1856,6 +1911,7 @@ Return ONLY valid JSON, no markdown:
                 s[field] = _PAREN_RE.sub(" ", val).strip()
         if tags:
             s["tags"] = tags
+    _stage_tags.finish(count_out=len(all_streets))
 
     # --- Step 6: Google Geocoding — intersection validation + spelling correction ---
     log("🗺 Step 6: Google Geocoding intersection validation...")
@@ -2282,16 +2338,38 @@ Return ONLY valid JSON, no markdown:
                 f"{(s.get('main_street') or ''):30s} | {(s.get('from_street') or ''):25s} | {s.get('to_street') or ''}")
         return confident, low_conf
 
+    _streets_before_geocode = len(all_streets)
+    _stage_geocode = _stage(6, "geocoding", count_in=_streets_before_geocode)
     all_streets, low_confidence_streets = _validate_streets(all_streets, city, state)
+    _stage_geocode.finish(count_out=len(all_streets))
+
+    # Inline confidence + low_confidence_reason on each street
+    _low_conf_ids = {id(s): s for s in low_confidence_streets}
+    for s in all_streets:
+        if id(s) not in _low_conf_ids:
+            s["confidence"] = "high"
+    for s in low_confidence_streets:
+        s["confidence"] = "low"
+
+    # Aggregate work_types across all streets (unique, non-null)
+    _all_work_types = sorted({
+        (s.get("work_type") or "").strip().upper()
+        for s in all_streets + low_confidence_streets
+        if s.get("work_type")
+    })
 
     schema["streets"] = all_streets
     schema["low_confidence_streets"] = low_confidence_streets
     schema["_meta"] = {
         "total_pages": total_pages,
-        "selected_pages": selected_pages,
+        "selected_pages": len(selected_pages),
+        "selected_page_numbers": selected_pages,
         "city": city,
         "state": state,
+        "work_types": _all_work_types,
         "total_streets": len(all_streets),
+        "low_confidence_count": len(low_confidence_streets),
+        "stages": _stages,
     }
     doc["extracted_schema"] = schema
     log(f"✓ Done! {len(all_streets)} streets extracted.", all_streets)

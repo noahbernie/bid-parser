@@ -257,8 +257,9 @@ def _run_eval(job_id: str, doc_key: str, force_reparse: bool):
             if os.path.exists(raw_src):
                 shutil.move(raw_src, raw_dst)
 
+            _meta = schema.get("_meta", {})
             with open(parser_cache, "w") as f:
-                json.dump(parsed, f, indent=2)
+                json.dump({"streets": parsed, "_meta": _meta}, f, indent=2)
             log(f"✓ {len(parsed)} streets extracted", "success")
 
         log("Matching streets against ground truth...")
@@ -303,7 +304,10 @@ def _run_eval(job_id: str, doc_key: str, force_reparse: bool):
 
 @router.get("/")
 async def eval_dashboard():
-    return FileResponse(os.path.join(STATIC_DIR, "eval.html"))
+    return FileResponse(
+        os.path.join(STATIC_DIR, "eval.html"),
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 @router.get("/docs")
@@ -636,3 +640,423 @@ async def save_ledger_snapshot(notes: str = ""):
         json.dump(ledger, f, indent=2)
 
     return {"saved": True, "snapshot_index": len(ledger) - 1, "aggregate": snapshot["aggregate"]}
+
+
+# ── Map / polyline endpoint ───────────────────────────────────────────────────
+
+MAP_CACHE_DIR = os.path.join(CACHE_DIR, "map_cache")
+
+# Limit tokens that cannot be geocoded as cross streets
+_MAP_LIMIT_TOKENS = {
+    "END", "BEGIN", "BEGINNING", "START", "STOP",
+    "EOP", "EOR", "EOS", "EOC", "EOL", "EOF",
+    "CDS", "DEAD END", "DEADEND",
+    "N CDS", "S CDS", "E CDS", "W CDS",
+    "NE CDS", "NW CDS", "SE CDS", "SW CDS",
+}
+
+_MAP_OFFSET_RE = re.compile(
+    r"^\d+['\"FT\s]*(FEET|FT|'|NORTH|SOUTH|EAST|WEST|N|S|E|W|OF|E/O|W/O|N/O|S/O)",
+    re.IGNORECASE,
+)
+
+
+def _is_map_limit(s: str) -> bool:
+    if not s:
+        return True
+    u = s.strip().upper()
+    if u in _MAP_LIMIT_TOKENS:
+        return True
+    if _MAP_OFFSET_RE.match(u):
+        return True
+    return False
+
+
+def _map_geocode(address: str, api_key: str) -> tuple:
+    """Geocode an address string → (lat, lng) or raise ValueError."""
+    import urllib.parse, urllib.request
+    os.makedirs(MAP_CACHE_DIR, exist_ok=True)
+    cache_key = address.upper().strip()
+    cache_file = os.path.join(MAP_CACHE_DIR, f"{abs(hash(cache_key)) % 10**12}.json")
+
+    if os.path.exists(cache_file):
+        with open(cache_file) as f:
+            cached = json.load(f)
+        if cached.get("ok"):
+            return cached["lat"], cached["lng"]
+        raise ValueError(cached.get("error", "cached failure"))
+
+    query = urllib.parse.quote(address)
+    url = f"https://maps.googleapis.com/maps/api/geocode/json?address={query}&key={api_key}"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
+
+    if data.get("status") != "OK" or not data.get("results"):
+        err = f"Geocoding failed: {data.get('status')} for {address}"
+        with open(cache_file, "w") as f:
+            json.dump({"ok": False, "error": err}, f)
+        raise ValueError(err)
+
+    loc = data["results"][0]["geometry"]["location"]
+    with open(cache_file, "w") as f:
+        json.dump({"ok": True, "lat": loc["lat"], "lng": loc["lng"]}, f)
+    return loc["lat"], loc["lng"]
+
+
+def _map_route(start: tuple, end: tuple, api_key: str) -> tuple:
+    """Get encoded polyline between two (lat,lng) points via Routes API v2.
+    Returns (encoded_polyline_str, length_m).
+    Matches the exact same call as Parse/takeoff/core.py _get_directions.
+    """
+    import urllib.request
+    cache_key = f"{start[0]:.6f},{start[1]:.6f}|{end[0]:.6f},{end[1]:.6f}"
+    cache_file = os.path.join(MAP_CACHE_DIR, f"r_{abs(hash(cache_key)) % 10**12}.json")
+
+    if os.path.exists(cache_file):
+        with open(cache_file) as f:
+            cached = json.load(f)
+        if cached.get("ok"):
+            return cached["encoded"], cached["length_m"]
+        raise ValueError(cached.get("error", "cached failure"))
+
+    import json as _json
+    payload = _json.dumps({
+        "origin": {"location": {"latLng": {"latitude": start[0], "longitude": start[1]}}},
+        "destination": {"location": {"latLng": {"latitude": end[0], "longitude": end[1]}}},
+        "travelMode": "DRIVE",
+        "polylineEncoding": "ENCODED_POLYLINE",
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://routes.googleapis.com/directions/v2:computeRoutes",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": "routes.polyline.encodedPolyline,routes.distanceMeters",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read())
+
+    routes = data.get("routes") or []
+    if not routes:
+        err = "Routes API returned no routes"
+        with open(cache_file, "w") as f:
+            json.dump({"ok": False, "error": err}, f)
+        raise ValueError(err)
+
+    encoded = routes[0].get("polyline", {}).get("encodedPolyline", "")
+    length_m = routes[0].get("distanceMeters", 0)
+    if not encoded:
+        err = "Routes API response missing encodedPolyline"
+        with open(cache_file, "w") as f:
+            json.dump({"ok": False, "error": err}, f)
+        raise ValueError(err)
+
+    with open(cache_file, "w") as f:
+        json.dump({"ok": True, "encoded": encoded, "length_m": length_m}, f)
+    return encoded, length_m
+
+
+def _classify_street(encoded: str, length_m: float) -> str:
+    if length_m < 50:
+        return "yellow"   # suspiciously short
+    if length_m > 8000:
+        return "yellow"   # suspiciously long (>5 miles)
+    return "green"
+
+
+@router.post("/scan-cities")
+async def scan_cities():
+    """
+    For every PDF in tests/pdfs/, send the first 5 pages through claude-haiku
+    to extract city + state. Saves results to tests/city_state.json and
+    backfills parser caches (adds _meta.city/state if missing).
+    Returns a per-doc summary.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {"error": "ANTHROPIC_API_KEY not set"}
+
+    import anthropic as _ant
+
+    _HEADER_PROMPT = (
+        "You are parsing a road construction bid document. Extract project-level fields only.\n"
+        "Return ONLY valid JSON with these fields:\n"
+        "- bid_number, project_name, city, state, work_type, estimated_cost, bid_due_date\n"
+        "Use null for any field not found. city and state are the city/state where the work will be performed."
+    )
+
+    cfg_path = os.path.join(TESTS_DIR, "city_state.json")
+    existing: dict = {}
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            existing = json.load(f)
+
+    results = {}
+    pdfs = sorted(f for f in os.listdir(PDF_DIR) if f.endswith(".pdf"))
+
+    def _scan_one(pdf_name: str) -> dict:
+        doc_key = pdf_name[:-4]
+        pdf_path = os.path.join(PDF_DIR, pdf_name)
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                blocks = []
+                for i in range(min(5, len(pdf.pages))):
+                    text = pdf.pages[i].extract_text() or ""
+                    blocks.append({"type": "text", "text": f"\n--- Page {i+1} ---\n{text}"})
+
+            client = _ant.Anthropic(api_key=api_key)
+            resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=512,
+                system=_HEADER_PROMPT,
+                messages=[{"role": "user", "content": blocks}],
+            )
+            raw = resp.content[0].text.strip()
+            # strip markdown fences if present
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+            schema = json.loads(raw)
+            city  = schema.get("city") or ""
+            state = schema.get("state") or ""
+            return {"doc_key": doc_key, "city": city, "state": state,
+                    "city_state": f"{city}, {state}" if (city and state) else city or state or "",
+                    "status": "ok"}
+        except Exception as e:
+            return {"doc_key": doc_key, "city": "", "state": "", "city_state": "", "status": f"error: {e}"}
+
+    loop = asyncio.get_running_loop()
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [loop.run_in_executor(pool, _scan_one, p) for p in pdfs]
+        scan_results = await asyncio.gather(*futures)
+
+    # Merge into city_state.json and backfill parser caches
+    for r in scan_results:
+        doc_key = r["doc_key"]
+        results[doc_key] = r
+        if r["city_state"]:
+            existing[doc_key] = r["city_state"]
+            # Backfill parser cache with _meta
+            parser_cache = _parser_cache_path(doc_key)
+            if os.path.exists(parser_cache):
+                with open(parser_cache) as f:
+                    cached = json.load(f)
+                if isinstance(cached, list):
+                    # Upgrade plain list → dict with _meta
+                    cached = {"streets": cached, "_meta": {"city": r["city"], "state": r["state"]}}
+                    with open(parser_cache, "w") as f:
+                        json.dump(cached, f, indent=2)
+                elif isinstance(cached, dict) and not cached.get("_meta", {}).get("city"):
+                    cached.setdefault("_meta", {})["city"] = r["city"]
+                    cached["_meta"]["state"] = r["state"]
+                    with open(parser_cache, "w") as f:
+                        json.dump(cached, f, indent=2)
+
+    with open(cfg_path, "w") as f:
+        json.dump(existing, f, indent=2)
+
+    return {"scanned": len(results), "results": results}
+
+
+@router.get("/city-state-all")
+async def get_all_city_states():
+    """Return the full city_state.json map for UI display."""
+    cfg = os.path.join(os.path.dirname(__file__), "tests", "city_state.json")
+    if os.path.exists(cfg):
+        with open(cfg) as f:
+            return json.load(f)
+    return {}
+
+
+@router.get("/city-state/{doc_key:path}")
+async def get_city_state(doc_key: str):
+    """Return the known city/state for a document (for UI pre-population)."""
+    # Check parser cache first
+    parser_cache = _parser_cache_path(doc_key)
+    if os.path.exists(parser_cache):
+        with open(parser_cache) as f:
+            cached = json.load(f)
+        if isinstance(cached, dict):
+            meta = cached.get("_meta", {})
+            city, state = meta.get("city", ""), meta.get("state", "")
+            if city:
+                return {"city_state": f"{city}, {state}" if state else city}
+    # Fallback to city_state.json
+    cfg = os.path.join(os.path.dirname(__file__), "tests", "city_state.json")
+    if os.path.exists(cfg):
+        with open(cfg) as f:
+            mapping = json.load(f)
+        if doc_key in mapping:
+            return {"city_state": mapping[doc_key]}
+    return {"city_state": ""}
+
+
+@router.get("/map/{doc_key:path}")
+async def get_map_data(doc_key: str, city_state: str = ""):
+    """
+    For each street in the cached parser output, geocode both endpoints and
+    fetch the driving route polyline via Routes API v2.
+    Returns a list of per-street results for the map view.
+    Fully cached — safe to call repeatedly.
+    city_state: optional override (e.g. "Irvine, California")
+    """
+    api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+    if not api_key:
+        return {"error": "GOOGLE_MAPS_API_KEY not set on server"}
+
+    parser_cache = _parser_cache_path(doc_key)
+    if not os.path.exists(parser_cache):
+        return {"error": "No parser output — run eval first"}
+
+    with open(parser_cache) as f:
+        cached = json.load(f)
+
+    streets = cached if isinstance(cached, list) else cached.get("streets", [])
+
+    # Get city/state: UI override → parser meta → city_state.json fallback
+    meta = cached.get("_meta", {}) if isinstance(cached, dict) else {}
+    city  = meta.get("city", "")
+    state = meta.get("state", "")
+    _city_state_cfg = os.path.join(os.path.dirname(__file__), "tests", "city_state.json")
+    _city_state_map: dict = {}
+    if os.path.exists(_city_state_cfg):
+        with open(_city_state_cfg) as _f:
+            _city_state_map = json.load(_f)
+    # Priority: UI param > parser _meta > city_state.json
+    if city_state.strip():
+        _job_city_state = city_state.strip()
+    elif city:
+        _job_city_state = f"{city}, {state}" if state else city
+        city = ""  # prevent double use below
+        state = ""
+    else:
+        _job_city_state = _city_state_map.get(doc_key, "")
+
+    results = []
+    for s in streets:
+        main = (s.get("main_street") or "").strip()
+        fr   = (s.get("from_street") or "").strip()
+        to   = (s.get("to_street")   or "").strip()
+        # Prefer street-level location → parser meta city/state → city_state.json
+        loc  = (s.get("location") or "").strip()
+        if not loc and city:
+            loc = f"{city}, {state}" if state else city
+        if not loc and _job_city_state:
+            loc = _job_city_state
+        page = s.get("page", "")
+
+        # Classify edge cases without hitting the API
+        fr_limit = _is_map_limit(fr)
+        to_limit = _is_map_limit(to)
+
+        if not main:
+            continue
+
+        if fr_limit or to_limit:
+            results.append({
+                "main_street": main, "from_street": fr, "to_street": to,
+                "page": page,
+                "status": "terminus",
+                "color": "gray",
+                "reason": f"{'from' if fr_limit else 'to'}_is_terminus",
+                "from_addr": None, "to_addr": None,
+                "encoded_polyline": None, "length_m": None,
+            })
+            continue
+
+        if not loc:
+            results.append({
+                "main_street": main, "from_street": fr, "to_street": to,
+                "page": page,
+                "status": "error",
+                "color": "red",
+                "reason": "no_city_state",
+                "from_addr": None, "to_addr": None,
+                "encoded_polyline": None, "length_m": None,
+            })
+            continue
+
+        from_addr = f"{main} & {fr}, {loc}"
+        to_addr   = f"{main} & {to}, {loc}"
+
+        try:
+            start_coords = await asyncio.get_running_loop().run_in_executor(
+                None, _map_geocode, from_addr, api_key
+            )
+        except Exception as e:
+            results.append({
+                "main_street": main, "from_street": fr, "to_street": to,
+                "page": page,
+                "status": "error", "color": "red",
+                "reason": "geocode_failed_from",
+                "from_addr": from_addr, "to_addr": to_addr,
+                "error": str(e)[:120],
+                "encoded_polyline": None, "length_m": None,
+            })
+            continue
+
+        try:
+            end_coords = await asyncio.get_running_loop().run_in_executor(
+                None, _map_geocode, to_addr, api_key
+            )
+        except Exception as e:
+            results.append({
+                "main_street": main, "from_street": fr, "to_street": to,
+                "page": page,
+                "status": "error", "color": "red",
+                "reason": "geocode_failed_to",
+                "from_addr": from_addr, "to_addr": to_addr,
+                "error": str(e)[:120],
+                "encoded_polyline": None, "length_m": None,
+            })
+            continue
+
+        try:
+            encoded, length_m = await asyncio.get_running_loop().run_in_executor(
+                None, _map_route, start_coords, end_coords, api_key
+            )
+            color = _classify_street(encoded, length_m)
+            results.append({
+                "main_street": main, "from_street": fr, "to_street": to,
+                "page": page,
+                "status": "ok", "color": color,
+                "reason": "suspicious_length" if color == "yellow" else None,
+                "from_addr": from_addr, "to_addr": to_addr,
+                "start_coords": list(start_coords),
+                "end_coords": list(end_coords),
+                "encoded_polyline": encoded,
+                "length_m": length_m,
+            })
+        except Exception as e:
+            results.append({
+                "main_street": main, "from_street": fr, "to_street": to,
+                "page": page,
+                "status": "error", "color": "red",
+                "reason": "route_failed",
+                "from_addr": from_addr, "to_addr": to_addr,
+                "start_coords": list(start_coords),
+                "end_coords": list(end_coords),
+                "error": str(e)[:120],
+                "encoded_polyline": None, "length_m": None,
+            })
+
+    ok_count      = sum(1 for r in results if r["status"] == "ok")
+    error_count   = sum(1 for r in results if r["status"] == "error")
+    yellow_count  = sum(1 for r in results if r.get("color") == "yellow")
+    terminus_count= sum(1 for r in results if r["status"] == "terminus")
+
+    return {
+        "doc_key": doc_key,
+        "city_state": loc if loc else None,
+        "total": len(results),
+        "ok": ok_count,
+        "errors": error_count,
+        "suspicious": yellow_count,
+        "terminus": terminus_count,
+        "streets": results,
+    }

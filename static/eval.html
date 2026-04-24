@@ -226,11 +226,14 @@
     .tabs-bar {
       display: flex; border-bottom: 1px solid var(--border);
       padding: 0 16px; flex-shrink: 0;
+      overflow-x: auto; scrollbar-width: none;
     }
+    .tabs-bar::-webkit-scrollbar { display: none; }
     .tab-btn {
-      padding: 8px 12px; font-size: 12px; font-weight: 500; cursor: pointer;
+      padding: 8px 10px; font-size: 11.5px; font-weight: 500; cursor: pointer;
       border: none; background: none; border-bottom: 2px solid transparent;
       color: var(--muted); transition: color .12s; font-family: inherit;
+      white-space: nowrap; flex-shrink: 0;
     }
     .tab-btn:hover  { color: var(--text); }
     .tab-btn.active { color: var(--text); border-bottom-color: var(--violet); }
@@ -451,6 +454,7 @@
           <button class="tab-btn"        id="tab-json"     onclick="switchTab('json')">Eval JSON</button>
           <button class="tab-btn"        id="tab-truth"    onclick="switchTab('truth')">Truth JSON <span class="tab-ct" id="tab-truth-ct"></span></button>
           <button class="tab-btn"        id="tab-docai"    onclick="switchTab('docai')">DocAI Raw <span class="tab-ct" id="tab-docai-ct"></span></button>
+          <button class="tab-btn"        id="tab-map"      onclick="switchTab('map')">🗺 Map View</button>
         </div>
         <div class="street-table" id="street-table"></div>
         <div id="json-view" style="display:none;flex:1;overflow:auto;padding:14px 16px">
@@ -461,6 +465,26 @@
         </div>
         <div id="diagnose-view" style="display:none;flex:1;overflow:auto;padding:14px 16px"></div>
         <div id="docai-view" style="display:none;flex:1;overflow:auto;padding:14px 16px"></div>
+        <div id="map-view" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+          <div id="map-toolbar" style="display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--s1);border-bottom:1px solid var(--border);flex-shrink:0">
+            <input id="map-city-input" type="text" placeholder="City, State (e.g. Irvine, California)" style="width:220px;background:var(--s2);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:12px" />
+            <button id="map-generate-btn" onclick="generateMap()" style="background:var(--violet);color:#fff;border:none;border-radius:6px;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer">Generate Map</button>
+            <button id="map-scan-btn" onclick="scanCities()" title="Re-scan first 5 pages of all PDFs via Haiku to extract city/state" style="background:var(--s2);color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:11px;cursor:pointer">Scan Cities</button>
+            <span id="map-status" style="font-size:12px;color:var(--muted)">Enter city/state, then click Generate Map.</span>
+            <div id="map-legend" style="display:none;margin-left:auto;display:flex;gap:14px;font-size:11px;color:var(--muted)">
+              <span><span style="color:#10d9a0">●</span> OK</span>
+              <span><span style="color:#f5c842">●</span> Suspicious</span>
+              <span><span style="color:#f26060">●</span> Failed</span>
+              <span><span style="color:#888">●</span> Terminus/offset</span>
+            </div>
+          </div>
+          <div style="display:flex;flex:1;overflow:hidden">
+            <div id="map-container" style="flex:1;min-height:0"></div>
+            <div id="map-sidebar" style="width:320px;flex-shrink:0;overflow-y:auto;background:var(--s1);border-left:1px solid var(--border);font-size:12px">
+              <div id="map-sidebar-content" style="padding:12px 14px;color:var(--muted)">Select a polyline to see details.</div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -501,8 +525,16 @@ let currentTab = 'missed', doneLogVisible = false;
 let runningJobs = {};
 let runAllTotal = 0, runAllDone = 0;
 const runningJobProgress = {};
+let cityStateMap = {};
 
-async function init() { await loadDocs(); }
+async function init() { await Promise.all([loadDocs(), loadCityState()]); }
+
+async function loadCityState() {
+  try {
+    const res = await fetch('/eval/city-state-all');
+    cityStateMap = await res.json();
+  } catch(e) {}
+}
 
 async function loadDocs() {
   const res = await fetch('/eval/docs');
@@ -590,6 +622,7 @@ function renderCard(d) {
         <div class="cdot ${d.has_parser_cache?'hit':'miss'}"></div>
         <span class="clabel">${d.has_parser_cache?'cached':'no cache'}</span>
         ${d.eval_cache_time?`<span class="ctime">${d.eval_cache_time}</span>`:''}
+        ${cityStateMap[d.key]?`<span style="margin-left:auto;font-size:10px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:130px" title="${cityStateMap[d.key]}">📍${cityStateMap[d.key]}</span>`:''}
       </div>
     </div>`;
 }
@@ -718,12 +751,28 @@ function _applyTabView(data) {
   const tv  = document.getElementById('truth-view');
   const dv  = document.getElementById('diagnose-view');
   const rv  = document.getElementById('docai-view');
-  const specialTab = currentTab === 'json' || currentTab === 'truth' || currentTab === 'diagnose' || currentTab === 'docai';
+  const mv  = document.getElementById('map-view');
+  const specialTab = currentTab === 'json' || currentTab === 'truth' || currentTab === 'diagnose' || currentTab === 'docai' || currentTab === 'map';
   tbl.style.display = specialTab ? 'none' : '';
   jv.style.display  = currentTab === 'json'      ? 'block' : 'none';
   tv.style.display  = currentTab === 'truth'     ? 'block' : 'none';
   dv.style.display  = currentTab === 'diagnose'  ? 'flex'  : 'none';
   rv.style.display  = currentTab === 'docai'     ? 'block' : 'none';
+  mv.style.display  = currentTab === 'map'       ? 'flex'  : 'none';
+
+  // Map tab: hide PDF pane and let results pane fill full width
+  const pdfPane     = document.getElementById('pdf-pane');
+  const resultsPane = document.getElementById('results-pane');
+  if (currentTab === 'map') {
+    pdfPane.style.display  = 'none';
+    resultsPane.style.width = '100%';
+    resultsPane.style.maxWidth = '100%';
+  } else {
+    pdfPane.style.display  = '';
+    resultsPane.style.width = '';
+    resultsPane.style.maxWidth = '';
+  }
+
   if (currentTab === 'json') {
     document.getElementById('json-pre').textContent = JSON.stringify(data || selectedResults, null, 2);
   } else if (currentTab === 'truth') {
@@ -735,6 +784,8 @@ function _applyTabView(data) {
     loadDiagnose(selectedDoc);
   } else if (currentTab === 'docai') {
     loadDocAIRaw(selectedDoc);
+  } else if (currentTab === 'map') {
+    initMapTab();
   } else {
     renderStreetTable();
   }
@@ -762,7 +813,7 @@ function updateRunningHeader(p) {
 
 function switchTab(tab) {
   currentTab = tab;
-  ['missed','extra','matched','diagnose','json','truth','docai'].forEach(t => {
+  ['missed','extra','matched','diagnose','json','truth','docai','map'].forEach(t => {
     const el = document.getElementById('tab-'+t);
     if (el) el.classList.toggle('active', t === tab);
   });
@@ -1208,6 +1259,248 @@ function closeLedger() {
 }
 
 init();
+
+// ── Map View ──────────────────────────────────────────────────────────────────
+
+let _mapInstance = null;
+let _mapPolylines = [];
+let _mapData = null;
+let _mapDocKey = null;
+let _mapsApiLoaded = false;
+
+const MAP_COLORS = {
+  green:  '#10d9a0',
+  yellow: '#f5c842',
+  red:    '#f26060',
+  gray:   '#666688',
+};
+
+async function initMapTab() {
+  // Auto-populate city/state from server (parser _meta or city_state.json)
+  if (selectedDoc) {
+    try {
+      const r = await fetch(`/eval/city-state/${encodeURIComponent(selectedDoc)}`);
+      const d = await r.json();
+      const inp = document.getElementById('map-city-input');
+      if (d.city_state && !inp.value) inp.value = d.city_state;
+    } catch(e) {}
+  }
+  // Show existing data if already generated for this doc
+  if (_mapDocKey === selectedDoc && _mapData) {
+    _renderMapData(_mapData);
+  }
+}
+
+async function scanCities() {
+  const btn = document.getElementById('map-scan-btn');
+  const status = document.getElementById('map-status');
+  btn.disabled = true;
+  btn.textContent = 'Scanning…';
+  status.textContent = 'Running Haiku on first 5 pages of all PDFs…';
+  try {
+    const res = await fetch('/eval/scan-cities', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) { status.textContent = '⚠ ' + data.error; return; }
+    const ok = Object.values(data.results).filter(r => r.status === 'ok' && r.city_state).length;
+    status.textContent = `✓ Scanned ${data.scanned} docs, found city/state for ${ok}. Refresh page to see updated city inputs.`;
+    // Auto-populate current doc's city input
+    if (selectedDoc && data.results[selectedDoc]?.city_state) {
+      document.getElementById('map-city-input').value = data.results[selectedDoc].city_state;
+    }
+  } catch(e) {
+    status.textContent = '⚠ ' + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = 'Scan Cities';
+}
+
+function _writeMapLogs(data) {
+  const wrap = document.getElementById('log-done-wrap');
+  const body = document.getElementById('log-body-done');
+  if (!wrap || !body) return;
+
+  const STATUS_COLOR = { ok:'#10d9a0', error:'#f26060', terminus:'#666688', suspicious:'#f5c842' };
+  const lines = [`<div style="color:var(--violet);font-weight:600;margin:4px 0 2px">── Map geocode/route log (${data.city_state || 'no city'}) ──</div>`];
+
+  for (const s of data.streets) {
+    const col = STATUS_COLOR[s.color] || STATUS_COLOR[s.status] || '#aaa';
+    const tag = s.status === 'ok'
+      ? (s.color === 'yellow' ? 'SUSPICIOUS' : 'OK')
+      : s.status.toUpperCase();
+    const addr = s.from_addr
+      ? `${s.from_addr}  →  ${s.to_addr}`
+      : (s.reason || '');
+    const len = s.length_m != null ? `  ${Math.round(s.length_m)}m` : '';
+    lines.push(
+      `<div style="padding:1px 0;border-bottom:1px solid rgba(255,255,255,.04)">` +
+      `<span style="color:${col};font-weight:600;min-width:80px;display:inline-block">[${tag}]</span> ` +
+      `<span style="color:var(--fg)">${s.main_street}</span> ` +
+      `<span style="color:var(--dim);font-size:10.5px">${addr}${len}</span>` +
+      (s.error ? `<span style="color:var(--red);font-size:10px"> — ${s.error}</span>` : '') +
+      `</div>`
+    );
+  }
+
+  body.innerHTML = lines.join('');
+  body.style.display = 'block';
+  wrap.style.display = 'block';
+  document.getElementById('log-done-toggle').textContent = 'collapse';
+}
+
+async function generateMap() {
+  if (!selectedDoc) { alert('Select a document first.'); return; }
+  const btn = document.getElementById('map-generate-btn');
+  const status = document.getElementById('map-status');
+  btn.disabled = true;
+  btn.textContent = 'Loading…';
+  status.textContent = 'Geocoding and routing streets…';
+
+  try {
+    const cityOverride = (document.getElementById('map-city-input').value || '').trim();
+    const params = cityOverride ? '?city_state=' + encodeURIComponent(cityOverride) : '';
+    const res = await fetch(`/eval/map/${encodeURIComponent(selectedDoc)}${params}`);
+    const data = await res.json();
+    if (data.error) {
+      status.textContent = '⚠ ' + data.error;
+      btn.disabled = false; btn.textContent = 'Generate Map';
+      return;
+    }
+    _mapData = data;
+    _mapDocKey = selectedDoc;
+    status.textContent = `✓ ${data.ok} OK · ${data.suspicious} suspicious · ${data.errors} failed · ${data.terminus} terminus/offset`;
+    document.getElementById('map-legend').style.display = 'flex';
+    _writeMapLogs(data);
+    await _renderMapData(data);
+  } catch(e) {
+    status.textContent = '⚠ Error: ' + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = 'Regenerate';
+}
+
+async function _ensureMapsApi() {
+  if (_mapsApiLoaded) return;
+  return new Promise((resolve, reject) => {
+    window._gmapsReady = resolve;
+    const s = document.createElement('script');
+    s.src = 'https://maps.googleapis.com/maps/api/js?key=AIzaSyDTFq6X67y_t8JsCN7ZxeWENWNK_SByPWg&callback=_gmapsReady&libraries=geometry';
+    s.onerror = reject;
+    document.head.appendChild(s);
+  }).then(() => { _mapsApiLoaded = true; });
+}
+
+function _decodePolyline(encoded) {
+  // Google encoded polyline decoder (same algorithm as polyline npm package)
+  let index = 0, lat = 0, lng = 0;
+  const coords = [];
+  while (index < encoded.length) {
+    let b, shift = 0, result = 0;
+    do { b = encoded.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+    shift = 0; result = 0;
+    do { b = encoded.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    lng += (result & 1) ? ~(result >> 1) : (result >> 1);
+    coords.push([lat / 1e5, lng / 1e5]);
+  }
+  return coords;
+}
+
+async function _renderMapData(data) {
+  await _ensureMapsApi();
+
+  const container = document.getElementById('map-container');
+
+  // Clear old polylines
+  _mapPolylines.forEach(p => p.setMap(null));
+  _mapPolylines = [];
+
+  if (!_mapInstance) {
+    _mapInstance = new google.maps.Map(container, {
+      zoom: 12,
+      mapTypeId: 'roadmap',
+      styles: [
+        { elementType: 'geometry', stylers: [{ color: '#1a1a2e' }] },
+        { elementType: 'labels.text.fill', stylers: [{ color: '#8888aa' }] },
+        { elementType: 'labels.text.stroke', stylers: [{ color: '#1a1a2e' }] },
+        { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#2d2d4e' }] },
+        { featureType: 'road.arterial', elementType: 'geometry', stylers: [{ color: '#3a3a5e' }] },
+        { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#0d1117' }] },
+      ],
+    });
+  }
+
+  const bounds = new google.maps.LatLngBounds();
+  let hasPoints = false;
+  const sidebar = document.getElementById('map-sidebar-content');
+
+  const routable = data.streets.filter(s => s.encoded_polyline);
+  const others   = data.streets.filter(s => !s.encoded_polyline);
+
+  routable.forEach((s, i) => {
+    const coords = _decodePolyline(s.encoded_polyline);
+    const path = coords.map(([lat, lng]) => ({ lat, lng }));
+    path.forEach(pt => { bounds.extend(pt); hasPoints = true; });
+
+    const poly = new google.maps.Polyline({
+      path,
+      geodesic: true,
+      strokeColor: MAP_COLORS[s.color] || MAP_COLORS.gray,
+      strokeOpacity: 0.85,
+      strokeWeight: s.color === 'yellow' ? 3 : 2.5,
+      map: _mapInstance,
+    });
+
+    poly.addListener('click', () => {
+      // Highlight
+      _mapPolylines.forEach(p => p.setOptions({ strokeWeight: 2.5, strokeOpacity: 0.85 }));
+      poly.setOptions({ strokeWeight: 5, strokeOpacity: 1 });
+
+      const lenStr = s.length_m != null ? `${Math.round(s.length_m)}m (${Math.round(s.length_m * 3.28084)}ft)` : '—';
+      const colorDot = `<span style="color:${MAP_COLORS[s.color]}">●</span>`;
+      sidebar.innerHTML = `
+        <div style="font-weight:600;font-size:13px;color:var(--text);margin-bottom:10px">
+          ${colorDot} ${esc(s.main_street)}
+        </div>
+        <table style="width:100%;border-collapse:collapse;color:var(--muted)">
+          <tr><td style="padding:3px 0;color:var(--dim);width:70px">From</td><td style="color:var(--text)">${esc(s.from_street||'—')}</td></tr>
+          <tr><td style="padding:3px 0;color:var(--dim)">To</td><td style="color:var(--text)">${esc(s.to_street||'—')}</td></tr>
+          <tr><td style="padding:3px 0;color:var(--dim)">Page</td><td>p.${s.page||'?'}</td></tr>
+          <tr><td style="padding:3px 0;color:var(--dim)">Length</td><td>${lenStr}</td></tr>
+          <tr><td style="padding:3px 0;color:var(--dim)">Status</td><td><span style="color:${MAP_COLORS[s.color]}">${s.color}${s.reason ? ' — ' + s.reason : ''}</span></td></tr>
+        </table>
+        <div style="margin-top:12px;font-size:10px;color:var(--dim)">
+          <div style="margin-bottom:2px">From addr:</div>
+          <div style="word-break:break-all;color:var(--muted)">${esc(s.from_addr||'')}</div>
+          <div style="margin:6px 0 2px">To addr:</div>
+          <div style="word-break:break-all;color:var(--muted)">${esc(s.to_addr||'')}</div>
+        </div>`;
+    });
+
+    poly.addListener('mouseover', () => {
+      if (poly.strokeWeight < 4) poly.setOptions({ strokeOpacity: 1 });
+    });
+    poly.addListener('mouseout', () => {
+      if (poly.strokeWeight < 4) poly.setOptions({ strokeOpacity: 0.85 });
+    });
+
+    _mapPolylines.push(poly);
+  });
+
+  // Render non-routable streets in the sidebar list
+  if (others.length) {
+    const errorList = document.createElement('div');
+    errorList.id = 'map-error-list';
+    errorList.style.cssText = 'margin-top:auto;border-top:1px solid var(--border);padding:10px 14px;font-size:11px;';
+    errorList.innerHTML = `<div style="color:var(--dim);margin-bottom:6px;font-weight:600">${others.length} not routed:</div>` +
+      others.map(s => {
+        const dot = `<span style="color:${MAP_COLORS[s.color] || MAP_COLORS.gray}">●</span>`;
+        return `<div style="padding:4px 0;border-bottom:1px solid var(--border);color:var(--muted)">${dot} ${esc(s.main_street)} <span style="color:var(--dim)">| ${esc(s.from_street||'')} → ${esc(s.to_street||'')}</span><br><span style="font-size:10px;color:var(--dim)">${s.reason||s.status}</span></div>`;
+      }).join('');
+    document.getElementById('map-sidebar').appendChild(errorList);
+  }
+
+  if (hasPoints) _mapInstance.fitBounds(bounds);
+}
 </script>
 </body>
 </html>

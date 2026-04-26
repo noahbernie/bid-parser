@@ -2371,11 +2371,53 @@ Return ONLY valid JSON, no markdown:
     # ── Build DB-shaped response ──────────────────────────────────────────────
     # streets_raw: all streets (high + low confidence) with fields matching the
     # streets_raw table. Platform stamps job_id and inserts directly.
+    _EO_RE = re.compile(r'^(FBE\s+|T)?EO[SPR](\s|$)', re.IGNORECASE)
+    _CITY_LIMIT_RE = re.compile(r'CITY\s+(LIMIT|LIMITS|BOUNDARY)', re.IGNORECASE)
+    _WEST_END_RE = re.compile(r'^WEST\s+END\b', re.IGNORECASE)
+    _CARDINAL_END_RE = re.compile(
+        r'^(EAST|WEST|NORTH|SOUTH|NE|NW|SE|SW)\s+END$', re.IGNORECASE
+    )
+    _END_EXACT = {
+        "END", "END OF STREET", "DEAD END", "ENDEND", "W/END",
+        "BEGIN",
+    }
+
+    def _normalize_cross(val: str | None) -> str | None:
+        if not val:
+            return None
+        v = val.strip()
+        u = v.upper()
+        # CDS anywhere → END (cul-de-sac in any compass variant)
+        if "CDS" in u:
+            return "END"
+        # EOS / EOP / EOR / TEOP / FBE EOP → END
+        if _EO_RE.match(v):
+            return "END"
+        # Exact tokens
+        if u in _END_EXACT:
+            return "END" if u != "BEGIN" else "START"
+        # Cardinal end: EAST END, NW END, etc.
+        if _CARDINAL_END_RE.match(v):
+            return "END"
+        # WEST END @ anything
+        if _WEST_END_RE.match(v):
+            return "END"
+        # City limit / boundary
+        if _CITY_LIMIT_RE.search(v):
+            return "END"
+        return v
+
     def _street_to_raw(s: dict) -> dict:
+        from_raw = _normalize_cross(s.get("from_street"))
+        to_raw   = _normalize_cross(s.get("to_street"))
+        # Street with no cross streets at all → START / END
+        if not from_raw and not to_raw:
+            from_raw = "START"
+            to_raw   = "END"
         return {
             "main_street":           s.get("main_street") or None,
-            "from_street":           s.get("from_street") or None,
-            "to_street":             s.get("to_street")   or None,
+            "from_street":           from_raw,
+            "to_street":             to_raw,
             "work_type":             s.get("work_type")   or None,
             "location":              s.get("location")    or None,
             "page":                  s.get("page")        or None,
@@ -2383,7 +2425,6 @@ Return ONLY valid JSON, no markdown:
             "tags":                  s.get("tags")        or None,
             "confidence":            s.get("confidence", "high"),
             "low_confidence_reason": s.get("low_confidence_reason") or None,
-            # internal flags — platform may store or ignore
             "name_corrected":        s.get("name_corrected")        or None,
             "cross_doc_validated":   s.get("cross_doc_validated")   or None,
             "has_ramp_endpoint":     s.get("has_ramp_endpoint")     or None,

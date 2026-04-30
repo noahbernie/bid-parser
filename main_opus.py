@@ -1232,6 +1232,17 @@ def run_extraction(doc_id: str, api_key: str):
         if streets_so_far is not None:
             p["streets_so_far"] = streets_so_far
         doc["progress"] = p
+        # Persist progress to disk so cross-container polls can see it
+        try:
+            _write_job(doc_id, {
+                "done": False,
+                "filename": doc.get("filename", ""),
+                "total_pages": doc.get("total_pages", 0),
+                "logs": p["logs"],
+                "streets_so_far": p.get("streets_so_far", []),
+            })
+        except Exception:
+            pass
 
     client = anthropic.Anthropic(api_key=api_key)
 
@@ -3497,7 +3508,15 @@ async def parse_status(
         raise HTTPException(status_code=404, detail="Job not found — may have expired or never existed")
 
     if not job_file.get("done"):
-        return {"job_id": job_id, "done": False, "status": "processing", "progress": {}}
+        return {
+            "job_id": job_id,
+            "done": False,
+            "status": "processing",
+            "progress": {
+                "logs": job_file.get("logs", []),
+                "streets_so_far": job_file.get("streets_so_far", []),
+            },
+        }
 
     if "error" in job_file:
         raise HTTPException(status_code=500, detail=job_file["error"])
@@ -3514,6 +3533,11 @@ async def parse_status(
             "streets_raw":       job_file.get("streets_raw"),
         },
     }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
 @app.get("/")

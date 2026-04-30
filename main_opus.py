@@ -1961,23 +1961,45 @@ Return ONLY valid JSON, no markdown:
             parts[-1] = _SUFFIX_MAP[parts[-1]]
         return " ".join(parts)
 
+    _MEASURE_RE = re.compile(r"[^,]*\d+(\.\d+)?'[^,]*", re.IGNORECASE)
+
     def _norm_wt_basic(wt):
-        """Normalize spaces around dashes: 'AC-Cape Seal' → 'AC - Cape Seal'."""
+        """Normalize dash spacing: 'AC-Cape Seal' → 'AC - Cape Seal'."""
         if not wt:
             return wt
         return re.sub(r'\s*-\s*', ' - ', wt).strip()
+
+    def _wt_looks_bad(wt):
+        """Return True if wt is structurally a code/garbage rather than a treatment name."""
+        if not wt:
+            return True
+        s = wt.strip()
+        if s[0].isdigit():
+            return True
+        # Single all-caps token ≤4 chars (SW, CG, RAMP, RAMI)
+        if re.match(r'^[A-Z]{1,4}$', s):
+            return True
+        # Dangling conjunction at end
+        if re.search(r'\s+(&|AND|OR)\s*$', s, re.IGNORECASE):
+            return True
+        return False
+
+    def _strip_measurements(wt):
+        """Remove measurement chunks like '0.2' Deep Cold Mill,' leaving treatment names."""
+        cleaned = _MEASURE_RE.sub('', wt)
+        cleaned = re.sub(r'^[\s,]+|[\s,]+$', '', cleaned)
+        cleaned = re.sub(r',\s*,+', ',', cleaned).strip()
+        return cleaned
 
     def _wt_looks_truncated(wt):
         """Return True if the work_type string looks like it was cut off mid-extraction."""
         if not wt:
             return False
         s = wt.strip()
-        # Ends with a dangling conjunction/operator
         if re.search(r'\s+(&|AND|OR)\s*$', s, re.IGNORECASE):
             return True
-        # Last word is very short and not a known abbreviation (suggests mid-word cut)
         last_word = s.split()[-1] if s.split() else ""
-        known_abbrevs = {"AC", "II", "III", "IV", "RPMS", "PG", "HMA"}
+        known_abbrevs = {"AC", "II", "III", "IV", "RPMS", "PG", "HMA", "X"}
         if len(last_word) <= 3 and last_word.upper() not in known_abbrevs and not last_word.endswith('.'):
             return True
         return False
@@ -1991,7 +2013,11 @@ Return ONLY valid JSON, no markdown:
             norm_name(s.get("from_street")),
             norm_name(s.get("to_street")),
         )
-        wt = _norm_wt_basic((s.get("work_type") or "").strip())
+        raw_wt = (s.get("work_type") or "").strip()
+        # Strip measurement chunks, then normalize dashes
+        if raw_wt and re.search(r"\d+(\.\d+)?'", raw_wt):
+            raw_wt = _strip_measurements(raw_wt)
+        wt = _norm_wt_basic(raw_wt) if raw_wt and not _wt_looks_bad(raw_wt) else ""
         if key not in seen:
             seen[key] = s
             seen_work_types[key] = {}  # normalized_upper -> canonical form (first seen wins)

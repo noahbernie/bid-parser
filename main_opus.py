@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -3374,6 +3374,7 @@ def _check_api_key(x_api_key: str):
 
 @app.post("/parse")
 async def parse_pdf_async(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     x_api_key: str = Header(default=None),
 ):
@@ -3405,9 +3406,8 @@ async def parse_pdf_async(
         "progress": {"logs": [], "streets_so_far": []},
     }
 
-    # Kick off extraction in background — client polls /parse/{doc_id}
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, run_extraction, doc_id, anthropic_key)
+    # FastAPI BackgroundTasks runs after response is sent — no timeout risk
+    background_tasks.add_task(run_extraction, doc_id, anthropic_key)
 
     return {"job_id": doc_id, "filename": file.filename, "total_pages": total, "status": "processing"}
 

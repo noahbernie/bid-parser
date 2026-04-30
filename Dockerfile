@@ -20,5 +20,5 @@ CMD ["gunicorn", "main_opus:app", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--workers", "1", \
      "--bind", "0.0.0.0:8000", \
-     "--timeout", "600", \
+     "--timeout", "1800", \
      "--keep-alive", "5"]

@@ -1350,7 +1350,11 @@ Use null for any field not found. city and state are the city/state where the wo
             except Exception:
                 pass  # corrupt cache entry — re-screen
 
-        b64 = render_page_as_image(pdf_bytes, page_idx, dpi=150)
+        try:
+            b64 = render_page_as_image(pdf_bytes, page_idx, dpi=150)
+        except Exception as e:
+            log(f"  ⚠ Page {page_num}: render failed — {str(e)[:60]} — assuming no")
+            return page_num, False
         payload = json.dumps({
             "contents": [{"parts": [
                 {"text": _GEMINI_PAGE_SCREEN_PROMPT},
@@ -1408,7 +1412,13 @@ Use null for any field not found. city and state are the city/state where the wo
         futures = {pool.submit(_screen_page, i): i for i in range(total_pages)}
         results = {}
         for future in as_completed(futures):
-            page_num, is_schedule = future.result()
+            try:
+                page_num, is_schedule = future.result()
+            except Exception as e:
+                page_idx = futures[future]
+                page_num = page_idx + 1
+                log(f"  ⚠ Page {page_num}: unhandled screen error — {str(e)[:80]} — assuming no")
+                is_schedule = False
             results[page_num] = is_schedule
 
     # Expand selections to include continuation pages:

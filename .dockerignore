@@ -1,6 +1,15 @@
 __pycache__
+**/__pycache__
 *.pyc
 *.pyo
 .env
 .git
 *.pdf
+screen_cache/
+docai_cache/
+gemini_cache/
+osm_cache/
+vision_cache.json
+docai_raw_eval_*.json
+tests/
+*.log

@@ -16,5 +16,9 @@ COPY . .
 EXPOSE 8000
 
 # Single worker — extraction is CPU/IO heavy and uses shared in-memory state
-# Shell form so ${PORT:-8000} expands (Railway sets PORT dynamically)
-CMD gunicorn main_opus:app --worker-class uvicorn.workers.UvicornWorker --workers 1 --bind "0.0.0.0:${PORT:-8000}" --timeout 2700 --keep-alive 5
+CMD ["gunicorn", "main_opus:app", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--workers", "1", \
+     "--bind", "0.0.0.0:8000", \
+     "--timeout", "2700", \
+     "--keep-alive", "5"]

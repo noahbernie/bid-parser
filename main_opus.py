@@ -93,6 +93,11 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 from highway.routes import router as highway_router
 app.include_router(highway_router)
 
+try:
+    from eval_routes import router as eval_router
+    app.include_router(eval_router)
+except ImportError:
+    pass  # eval.py not present on Railway — skip silently
 
 documents = {}
 
@@ -1215,7 +1220,13 @@ _GEMINI_PAGE_SCREEN_PROMPT = (
     "(7) The page is a section cover page, appendix title page, table of contents, or blank divider — even if the title mentions 'locations' or 'list'. "
     "(8) The page contains specification requirements or contractor instructions that MENTION streets by name in prose paragraphs or as a numbered/bulleted list, but those streets are NOT organized as rows in a multi-column table. "
     "(9) The page is an extremely dense pavement management database export — identifiable by having MORE THAN 12 narrow columns packed tightly across the page AND a Latitude/Longitude column. These PMS asset inventory tables typically have columns like C, M, SP, PCI, Supervisorial District, Council District, and hundreds of rows of data. Answer NO for these even if they contain street names. "
-    'Reply ONLY with valid JSON: {"is_street_schedule": true} or {"is_street_schedule": false}'
+    'Reply ONLY with valid JSON — two fields: '
+    '{"is_street_schedule": true, "work_type": "Type II/III Slurry Seal"} or '
+    '{"is_street_schedule": false, "work_type": null}. '
+    'For work_type: extract the treatment/material type if explicitly stated on this page '
+    '(e.g. "Slurry Seal", "Cape Seal", "Crack Fill", "AC Overlay", "Fog Seal"). '
+    'Return null if no material/treatment type is mentioned. '
+    'Do NOT return project numbers, group names, district names, or location names as work_type.'
 )
 
 
@@ -1337,14 +1348,15 @@ Use null for any field not found. city and state are the city/state where the wo
     pdf_screen_hash = hashlib.sha256(pdf_bytes).hexdigest()[:16]
 
     def _screen_page(page_idx: int) -> tuple:
-        """Returns (page_num_1indexed, is_street_schedule: bool)."""
+        """Returns (page_num_1indexed, is_street_schedule: bool, work_type: str|None)."""
         page_num = page_idx + 1
         # Disk cache — survives server restarts
         cache_file = os.path.join(SCREEN_CACHE_DIR, f"{pdf_screen_hash}_p{page_num}.json")
         if os.path.exists(cache_file):
             try:
                 with open(cache_file) as f:
-                    return page_num, json.load(f)["result"]
+                    cached = json.load(f)
+                return page_num, cached["result"], cached.get("work_type")
             except Exception:
                 pass  # corrupt cache entry — re-screen
 
@@ -1352,7 +1364,7 @@ Use null for any field not found. city and state are the city/state where the wo
             b64 = render_page_as_image(pdf_bytes, page_idx, dpi=150)
         except Exception as e:
             log(f"  ⚠ Page {page_num}: render failed — {str(e)[:60]} — assuming no")
-            return page_num, False
+            return page_num, False, None
         payload = json.dumps({
             "contents": [{"parts": [
                 {"text": _GEMINI_PAGE_SCREEN_PROMPT},
@@ -1378,46 +1390,61 @@ Use null for any field not found. city and state are the city/state where the wo
                 if not text_parts:
                     log(f"  ⚠ Page {page_num}: no text in response — assuming no")
                     result = False
+                    page_work_type = None
                 else:
                     answer = text_parts[-1]  # last part is always the final answer
                     log(f"  🔎 Page {page_num} answer: {repr(answer[:120])}")
-                    answer_lower = answer.lower().replace(" ", "").replace("\n", "")
-                    if '"is_street_schedule":true' in answer_lower:
-                        result = True
-                    elif '"is_street_schedule":false' in answer_lower:
-                        result = False
-                    elif "true" in answer_lower:
-                        result = True
-                    else:
-                        result = False
+                    # Try JSON parse first to get work_type; fall back to string match
+                    page_work_type = None
+                    try:
+                        parsed = _parse_llm_json(answer)
+                        if parsed and isinstance(parsed, dict):
+                            result = bool(parsed.get("is_street_schedule", False))
+                            wt = (parsed.get("work_type") or "").strip()
+                            page_work_type = wt if wt else None
+                        else:
+                            raise ValueError("not a dict")
+                    except Exception:
+                        answer_lower = answer.lower().replace(" ", "").replace("\n", "")
+                        if '"is_street_schedule":true' in answer_lower:
+                            result = True
+                        elif '"is_street_schedule":false' in answer_lower:
+                            result = False
+                        elif "true" in answer_lower:
+                            result = True
+                        else:
+                            result = False
                 # Cache to disk on success
                 try:
                     with open(cache_file, "w") as f:
-                        json.dump({"result": result}, f)
+                        json.dump({"result": result, "work_type": page_work_type}, f)
                 except Exception:
                     pass
-                return page_num, result
+                return page_num, result, page_work_type
             except Exception as e:
                 last_err = e
                 if attempt < 2:
                     time.sleep(2 ** attempt)  # 1s, 2s backoff
         log(f"  ⚠ Page screen failed p.{page_num} (3 attempts): {str(last_err)[:80]} — assuming no")
-        return page_num, False
+        return page_num, False, None
 
     selected_pages = []
     _stage_page_screen = _stage(1, "page_screen")
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {pool.submit(_screen_page, i): i for i in range(total_pages)}
         results = {}
+        screen_work_types = {}  # page_num -> work_type from Flash (or None)
         for future in as_completed(futures):
             try:
-                page_num, is_schedule = future.result()
+                page_num, is_schedule, page_work_type = future.result()
             except Exception as e:
                 page_idx = futures[future]
                 page_num = page_idx + 1
                 log(f"  ⚠ Page {page_num}: unhandled screen error — {str(e)[:80]} — assuming no")
                 is_schedule = False
+                page_work_type = None
             results[page_num] = is_schedule
+            screen_work_types[page_num] = page_work_type
 
     # Expand selections to include continuation pages:
     # If page N is selected, also include up to 4 following pages that weren't explicitly
@@ -1458,6 +1485,22 @@ Use null for any field not found. city and state are the city/state where the wo
     if not selected_pages:
         log("⚠ No pages selected — nothing to extract.")
         _exit_error("No street schedule pages found in document"); return
+
+    # Compute inherited work_type per selected page:
+    # - If this page itself had a work_type from Flash, use it
+    # - Else if the immediately preceding page was also selected, carry its inherited value
+    # - Else look at the immediately preceding (non-selected) page's Flash work_type
+    # - A non-selected page with no work_type resets the chain
+    selected_set = set(selected_pages)
+    page_inherited_work_type = {}
+    for page_num in sorted(selected_pages):
+        own_wt = screen_work_types.get(page_num)
+        if own_wt:
+            page_inherited_work_type[page_num] = own_wt
+        elif (page_num - 1) in selected_set:
+            page_inherited_work_type[page_num] = page_inherited_work_type.get(page_num - 1)
+        else:
+            page_inherited_work_type[page_num] = screen_work_types.get(page_num - 1)
 
     # --- Step 3: DocAI Form Parser — send each selected page individually in parallel ---
     log(f"🔷 Step 3: Document AI Form Parser — {len(selected_pages)} pages in parallel...")
@@ -1720,11 +1763,15 @@ Rules:
 - INVERTED SUFFIX: DocAI sometimes reads multi-line cells with the street type first (e.g. "RD JAMBOREE"). Reorder if needed.
 - STACKED ROWS: When a cell contains multiple street names or limits separated by newlines, extract EACH as a separate entry. Row positions match across columns.
 - LIMITS column: If a single column contains "FROM ST to TO ST" combined, split on " to " or " TO " to get from_street and to_street.
+5. Extract work_type for each row if a material/treatment column is present (e.g. PROJECT DESCRIPTION, WORK TYPE, TREATMENT, ACTIVITY, SCOPE, TYPE).
+   - If all rows share the same type from a section header, apply it to all rows.
+   - If no work_type is visible in any column or header, use the fallback: {inherited_work_type}.
+   - If the fallback is null, use null. Do NOT invent values.
 
 Return ONLY valid JSON, no markdown:
-{{"streets": [{{"main_street": "...", "from_street": "...", "to_street": "..."}}]}}"""
+{{"streets": [{{"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "..." }}]}}"""
 
-    def _extract_with_gemini_pro(header_rows, body_rows, page_num, full_text="", lines=None):  # noqa: ARG001
+    def _extract_with_gemini_pro(header_rows, body_rows, page_num, full_text="", lines=None, inherited_work_type=None):  # noqa: ARG001
         gemini_key = os.environ.get("GEMINI_API_KEY")
         gemini_pro_url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={gemini_key}"
@@ -1743,7 +1790,10 @@ Return ONLY valid JSON, no markdown:
         else:
             augmented = table_json
 
-        full_prompt = _OPUS_CHUNK_PROMPT.format(table_data=augmented)
+        full_prompt = _OPUS_CHUNK_PROMPT.format(
+            table_data=augmented,
+            inherited_work_type=repr(inherited_work_type) if inherited_work_type else "null",
+        )
 
         # Cache keyed by (pdf, page, prompt content) so we don't re-call Gemini on reruns
         pdf_hash = hashlib.sha256(pdf_bytes).hexdigest()
@@ -1800,11 +1850,12 @@ Return ONLY valid JSON, no markdown:
             main = (s.get("main_street") or "").strip()
             if not main:
                 continue
+            row_wt = (s.get("work_type") or "").strip() or None
             streets.append({
                 "main_street": main,
                 "from_street": s.get("from_street") or None,
                 "to_street":   s.get("to_street")   or None,
-                "work_type":   None,
+                "work_type":   row_wt or inherited_work_type,
                 "source": "gemini-pro",
                 "page": page_num,
             })
@@ -1856,7 +1907,8 @@ Return ONLY valid JSON, no markdown:
                 merged_headers.extend(h)
             merged_body.extend(b)
         extracted = _extract_with_gemini_pro(merged_headers, merged_body, page_num,
-                                              full_text=page_full_text, lines=page_lines)
+                                              full_text=page_full_text, lines=page_lines,
+                                              inherited_work_type=page_inherited_work_type.get(page_num))
         all_streets.extend(extracted)
 
 
@@ -1911,15 +1963,23 @@ Return ONLY valid JSON, no markdown:
 
     before = len(all_streets)
     seen = {}
+    seen_work_types = {}  # key -> set of non-null work_type strings
     for s in all_streets:
         key = (
             norm_name(s.get("main_street")),
             norm_name(s.get("from_street")),
             norm_name(s.get("to_street")),
-            (s.get("work_type") or "").strip().upper(),
         )
+        wt = (s.get("work_type") or "").strip()
         if key not in seen:
             seen[key] = s
+            seen_work_types[key] = {}  # normalized_lower -> canonical form (first seen wins)
+        if wt:
+            wt_norm = wt.upper()
+            if wt_norm not in seen_work_types[key]:
+                seen_work_types[key][wt_norm] = wt
+    for key, s in seen.items():
+        s["work_types"] = sorted(seen_work_types[key].values())  # [] if none found
     all_streets = list(seen.values())
     log(f"  Dedup: {before} → {len(all_streets)} streets")
     _stage_dedup.finish(count_out=len(all_streets), dropped=_streets_before_dedup - len(all_streets))
@@ -2380,12 +2440,13 @@ Return ONLY valid JSON, no markdown:
     for s in low_confidence_streets:
         s["confidence"] = "low"
 
-    # Aggregate work_types across all streets (unique, non-null)
-    _all_work_types = sorted({
-        (s.get("work_type") or "").strip().upper()
-        for s in all_streets + low_confidence_streets
-        if s.get("work_type")
-    })
+    # Aggregate work_types across all streets (unique by uppercase, non-null)
+    _wt_seen: dict = {}
+    for s in all_streets + low_confidence_streets:
+        for wt in (s.get("work_types") or []):
+            if wt and wt.upper() not in _wt_seen:
+                _wt_seen[wt.upper()] = wt
+    _all_work_types = sorted(_wt_seen.values())
 
     # ── Build DB-shaped response ──────────────────────────────────────────────
     # streets_raw: all streets (high + low confidence) with fields matching the
@@ -2401,7 +2462,7 @@ Return ONLY valid JSON, no markdown:
         "BEGIN",
     }
 
-    def _normalize_cross(val: str | None) -> str | None:
+    def _normalize_cross(val):
         if not val:
             return None
         v = val.strip()
@@ -2437,7 +2498,7 @@ Return ONLY valid JSON, no markdown:
             "main_street":           s.get("main_street") or None,
             "from_street":           from_raw,
             "to_street":             to_raw,
-            "work_type":             s.get("work_type")   or None,
+            "work_types":            s.get("work_types")  or [],
             "location":              s.get("location")    or None,
             "page":                  s.get("page")        or None,
             "source":                s.get("source", "gemini-pro"),
@@ -2482,7 +2543,7 @@ Return ONLY valid JSON, no markdown:
         "project_id": None,
         "organization_id": None,
         "uploaded_by_user_id": None,
-        "job_name": None,
+        "job_name": schema.get("project_name") or None,
         "status": "parsed",
         "parse_error": None,
         "created_at": None,

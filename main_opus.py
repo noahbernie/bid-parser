@@ -3366,10 +3366,50 @@ async def list_docs():
     ]
 
 
+_JOBS_DIR = "/tmp/parser_jobs"
+os.makedirs(_JOBS_DIR, exist_ok=True)
+
+def _job_path(job_id: str) -> str:
+    return os.path.join(_JOBS_DIR, f"{job_id}.json")
+
+def _write_job(job_id: str, payload: dict):
+    with open(_job_path(job_id), "w") as f:
+        json.dump(payload, f)
+
+def _read_job(job_id: str):
+    p = _job_path(job_id)
+    if not os.path.exists(p):
+        return None
+    with open(p) as f:
+        return json.load(f)
+
+def _delete_job(job_id: str):
+    p = _job_path(job_id)
+    if os.path.exists(p):
+        os.remove(p)
+
+
 def _check_api_key(x_api_key: str):
     parser_api_key = os.environ.get("PARSER_API_KEY")
     if parser_api_key and x_api_key != parser_api_key:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+
+
+def _run_extraction_and_persist(doc_id: str, api_key: str):
+    """Wrapper that runs extraction and writes the result to disk."""
+    try:
+        run_extraction(doc_id, api_key)
+        schema = (documents.get(doc_id) or {}).get("extracted_schema")
+        if schema:
+            _write_job(doc_id, {
+                "done": True,
+                "job":               schema.get("job"),
+                "bid_parse_results": schema.get("bid_parse_results"),
+                "parser_stage_logs": schema.get("parser_stage_logs"),
+                "streets_raw":       schema.get("streets_raw"),
+            })
+    except Exception as e:
+        _write_job(doc_id, {"done": True, "error": str(e)})
 
 
 @app.post("/parse")
@@ -3406,8 +3446,10 @@ async def parse_pdf_async(
         "progress": {"logs": [], "streets_so_far": []},
     }
 
-    # FastAPI BackgroundTasks runs after response is sent — no timeout risk
-    background_tasks.add_task(run_extraction, doc_id, anthropic_key)
+    # Write a placeholder so the job is findable on disk immediately
+    _write_job(doc_id, {"done": False, "filename": file.filename, "total_pages": total})
+
+    background_tasks.add_task(_run_extraction_and_persist, doc_id, anthropic_key)
 
     return {"job_id": doc_id, "filename": file.filename, "total_pages": total, "status": "processing"}
 
@@ -3423,31 +3465,53 @@ async def parse_status(
     """
     _check_api_key(x_api_key)
 
-    if job_id not in documents:
-        raise HTTPException(status_code=404, detail="Job not found — may have already been retrieved")
-
-    doc = documents[job_id]
-    schema = doc.get("extracted_schema")
-
-    if schema is None:
+    # Check in-memory first (fastest, same container), fall back to disk
+    doc = documents.get(job_id)
+    if doc is not None:
+        schema = doc.get("extracted_schema")
+        if schema is None:
+            return {
+                "job_id": job_id,
+                "done": False,
+                "status": "processing",
+                "progress": doc.get("progress", {}),
+            }
+        # Done — clean up and return
+        del documents[job_id]
+        _delete_job(job_id)
         return {
             "job_id": job_id,
-            "done": False,
-            "status": "processing",
-            "progress": doc.get("progress", {}),
+            "done": True,
+            "status": "done",
+            "result": {
+                "job":               schema.get("job"),
+                "bid_parse_results": schema.get("bid_parse_results"),
+                "parser_stage_logs": schema.get("parser_stage_logs"),
+                "streets_raw":       schema.get("streets_raw"),
+            },
         }
 
-    # Done — return only the 4 DB-shaped tables, strip legacy keys
-    del documents[job_id]
+    # Fall back to disk (handles container restarts / load balancer routing)
+    job_file = _read_job(job_id)
+    if job_file is None:
+        raise HTTPException(status_code=404, detail="Job not found — may have expired or never existed")
+
+    if not job_file.get("done"):
+        return {"job_id": job_id, "done": False, "status": "processing", "progress": {}}
+
+    if "error" in job_file:
+        raise HTTPException(status_code=500, detail=job_file["error"])
+
+    _delete_job(job_id)
     return {
         "job_id": job_id,
         "done": True,
         "status": "done",
         "result": {
-            "job":               schema.get("job"),
-            "bid_parse_results": schema.get("bid_parse_results"),
-            "parser_stage_logs": schema.get("parser_stage_logs"),
-            "streets_raw":       schema.get("streets_raw"),
+            "job":               job_file.get("job"),
+            "bid_parse_results": job_file.get("bid_parse_results"),
+            "parser_stage_logs": job_file.get("parser_stage_logs"),
+            "streets_raw":       job_file.get("streets_raw"),
         },
     }
 

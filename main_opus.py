@@ -1961,19 +1961,40 @@ Return ONLY valid JSON, no markdown:
             parts[-1] = _SUFFIX_MAP[parts[-1]]
         return " ".join(parts)
 
+    def _norm_wt_basic(wt):
+        """Normalize spaces around dashes: 'AC-Cape Seal' → 'AC - Cape Seal'."""
+        if not wt:
+            return wt
+        return re.sub(r'\s*-\s*', ' - ', wt).strip()
+
+    def _wt_looks_truncated(wt):
+        """Return True if the work_type string looks like it was cut off mid-extraction."""
+        if not wt:
+            return False
+        s = wt.strip()
+        # Ends with a dangling conjunction/operator
+        if re.search(r'\s+(&|AND|OR)\s*$', s, re.IGNORECASE):
+            return True
+        # Last word is very short and not a known abbreviation (suggests mid-word cut)
+        last_word = s.split()[-1] if s.split() else ""
+        known_abbrevs = {"AC", "II", "III", "IV", "RPMS", "PG", "HMA"}
+        if len(last_word) <= 3 and last_word.upper() not in known_abbrevs and not last_word.endswith('.'):
+            return True
+        return False
+
     before = len(all_streets)
     seen = {}
-    seen_work_types = {}  # key -> set of non-null work_type strings
+    seen_work_types = {}  # key -> normalized_upper -> canonical
     for s in all_streets:
         key = (
             norm_name(s.get("main_street")),
             norm_name(s.get("from_street")),
             norm_name(s.get("to_street")),
         )
-        wt = (s.get("work_type") or "").strip()
+        wt = _norm_wt_basic((s.get("work_type") or "").strip())
         if key not in seen:
             seen[key] = s
-            seen_work_types[key] = {}  # normalized_lower -> canonical form (first seen wins)
+            seen_work_types[key] = {}  # normalized_upper -> canonical form (first seen wins)
         if wt:
             wt_norm = wt.upper()
             if wt_norm not in seen_work_types[key]:
@@ -1981,6 +2002,38 @@ Return ONLY valid JSON, no markdown:
     for key, s in seen.items():
         s["work_types"] = sorted(seen_work_types[key].values())  # [] if none found
     all_streets = list(seen.values())
+
+    # Build a global resolution map: truncated value → full value
+    # e.g. "SLURRY SEA" → "Slurry Seal",  "CAPE SEAL &" → "Cape Seal & Slurry Seal"
+    _all_wt_upper = {
+        wt.upper(): wt
+        for s in all_streets
+        for wt in (s.get("work_types") or [])
+        if wt
+    }
+    _resolve_map = {}  # bad_upper -> good canonical
+    for bad_upper, bad_canon in list(_all_wt_upper.items()):
+        if _wt_looks_truncated(bad_canon):
+            # Find the longest value that starts with this prefix
+            best = None
+            for full_upper, full_canon in _all_wt_upper.items():
+                if full_upper != bad_upper and full_upper.startswith(bad_upper):
+                    if best is None or len(full_upper) > len(best[0]):
+                        best = (full_upper, full_canon)
+            if best:
+                _resolve_map[bad_upper] = best[1]
+
+    # Apply resolution map back to each street
+    if _resolve_map:
+        for s in all_streets:
+            new_wts = {}
+            for wt in (s.get("work_types") or []):
+                resolved = _resolve_map.get(wt.upper(), wt)
+                norm_upper = resolved.upper()
+                if norm_upper not in new_wts:
+                    new_wts[norm_upper] = resolved
+            s["work_types"] = sorted(new_wts.values())
+
     log(f"  Dedup: {before} → {len(all_streets)} streets")
     _stage_dedup.finish(count_out=len(all_streets), dropped=_streets_before_dedup - len(all_streets))
 
@@ -2447,6 +2500,8 @@ Return ONLY valid JSON, no markdown:
             if wt and wt.upper() not in _wt_seen:
                 _wt_seen[wt.upper()] = wt
     _all_work_types = sorted(_wt_seen.values())
+    # Drop any that still look truncated (no full version found to resolve to)
+    _all_work_types = [wt for wt in _all_work_types if not _wt_looks_truncated(wt)]
 
     # ── Build DB-shaped response ──────────────────────────────────────────────
     # streets_raw: all streets (high + low confidence) with fields matching the

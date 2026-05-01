@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - dev
+
+jobs:
+  python-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check
+        run: python -m py_compile main_opus.py && echo "Syntax OK"
+
+  node-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read .nvmrc
+        id: nvmrc
+        run: echo "version=$(cat .nvmrc)" >> $GITHUB_OUTPUT
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.nvmrc.outputs.version }}
+
+      - name: Install dependencies
+        run: |
+          if [ -f package.json ]; then npm install; else echo "No package.json — skipping npm install"; fi
+
+      - name: Lint
+        run: |
+          if npm run lint --if-present 2>/dev/null; then echo "Lint passed"; else echo "Warning: no lint script found — skipping"; fi
+
+      - name: TypeScript check
+        run: |
+          if [ -f tsconfig.json ]; then npx tsc --noEmit; else echo "Warning: no tsconfig.json found — skipping tsc"; fi

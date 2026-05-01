@@ -31,7 +31,7 @@ pip install -r requirements.txt
 ### Run the parser locally
 
 ```bash
-uvicorn main_opus:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 Submit a PDF:
@@ -52,7 +52,7 @@ curl http://localhost:8000/parse/{job_id} \
 ### Run the eval dashboard (local only)
 
 ```bash
-uvicorn main_opus:app --host 0.0.0.0 --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8000
 open http://localhost:8000/eval
 ```
 

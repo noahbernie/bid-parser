@@ -177,7 +177,7 @@ def _run_eval(job_id: str, doc_key: str, force_reparse: bool):
                         import hashlib as _hl
                         with open(pdf_path, "rb") as _f:
                             _pdf_hash = _hl.sha256(_f.read()).hexdigest()
-                        _main_module = os.environ.get("MAIN_MODULE", "main_opus")
+                        _main_module = os.environ.get("MAIN_MODULE", "main")
                         import importlib as _il
                         _m = _il.import_module(_main_module)
                         _docai_src = os.path.join(_m.DOCAI_CACHE_DIR, f"{_pdf_hash}.json")
@@ -201,7 +201,7 @@ def _run_eval(job_id: str, doc_key: str, force_reparse: bool):
             with open(pdf_path, "rb") as f:
                 pdf_bytes = f.read()
 
-            _main_module = os.environ.get("MAIN_MODULE", "main_opus")
+            _main_module = os.environ.get("MAIN_MODULE", "main")
             import importlib as _il
             _m = _il.import_module(_main_module)
             run_extraction = _m.run_extraction
@@ -621,7 +621,7 @@ async def save_ledger_snapshot(notes: str = ""):
     snapshot = {
         "timestamp":   datetime.now().isoformat(),
         "notes":       notes,
-        "pipeline":    os.environ.get("MAIN_MODULE", "main_opus"),
+        "pipeline":    os.environ.get("MAIN_MODULE", "main"),
         "aggregate": {
             "docs_run":    len(run_docs),
             "docs_total":  len(all_keys),

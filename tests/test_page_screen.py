@@ -38,7 +38,7 @@ CACHE_DIR = TESTS_DIR / "screen_cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
 # --------------------------------------------------------------------------- #
-# Prompt — keep in sync with main_opus.py _GEMINI_PAGE_SCREEN_PROMPT          #
+# Prompt — keep in sync with main.py _GEMINI_PAGE_SCREEN_PROMPT                #
 # --------------------------------------------------------------------------- #
 _GEMINI_PAGE_SCREEN_PROMPT = (
     "You are screening a page from a road construction bid document. "

@@ -23,7 +23,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m py_compile main_opus.py && echo "Syntax OK"
+        run: python -m py_compile main.py && echo "Syntax OK"
 
   node-checks:
     runs-on: ubuntu-latest

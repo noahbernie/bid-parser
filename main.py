@@ -3580,12 +3580,9 @@ async def parse_pdf_async(
     contents = await file.read()
     doc_id = str(uuid.uuid4())[:8]
 
-    with pdfplumber.open(io.BytesIO(contents)) as pdf:
-        total = len(pdf.pages)
-
     documents[doc_id] = {
         "filename": file.filename,
-        "total_pages": total,
+        "total_pages": None,  # filled in by run_extraction when pipeline starts
         "bytes": contents,
         "page_cache": {},
         "extracted_schema": None,
@@ -3593,11 +3590,11 @@ async def parse_pdf_async(
     }
 
     # Write a placeholder so the job is findable on disk immediately
-    _write_job(doc_id, {"done": False, "filename": file.filename, "total_pages": total})
+    _write_job(doc_id, {"done": False, "filename": file.filename, "total_pages": None})
 
     background_tasks.add_task(_run_extraction_and_persist, doc_id, anthropic_key)
 
-    return {"job_id": doc_id, "filename": file.filename, "total_pages": total, "status": "processing"}
+    return {"job_id": doc_id, "filename": file.filename, "total_pages": None, "status": "processing"}
 
 
 @app.get("/parse/{job_id}")

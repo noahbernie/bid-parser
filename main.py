@@ -3555,7 +3555,13 @@ def _run_extraction_and_persist(doc_id: str, api_key: str):
                 "streets_raw":       schema.get("streets_raw"),
             })
     except Exception as e:
-        _write_job(doc_id, {"done": True, "error": str(e)})
+        import traceback
+        err_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-500:]}"
+        _write_job(doc_id, {"done": True, "error": err_msg})
+        # Update in-memory so same-container polls don't stay stuck at done:False
+        _doc = documents.get(doc_id)
+        if _doc is not None:
+            _doc["extracted_schema"] = {"_error": err_msg}
 
 
 @app.post("/parse")
@@ -3580,9 +3586,17 @@ async def parse_pdf_async(
     contents = await file.read()
     doc_id = str(uuid.uuid4())[:8]
 
+    # fitz is fast (<50ms) for page counting; pdfplumber was blocking for 60+s on large PDFs
+    try:
+        _fz = fitz.open(stream=contents, filetype="pdf")
+        total_pages_upload = len(_fz)
+        _fz.close()
+    except Exception:
+        total_pages_upload = None
+
     documents[doc_id] = {
         "filename": file.filename,
-        "total_pages": None,  # filled in by run_extraction when pipeline starts
+        "total_pages": total_pages_upload,
         "bytes": contents,
         "page_cache": {},
         "extracted_schema": None,
@@ -3590,11 +3604,11 @@ async def parse_pdf_async(
     }
 
     # Write a placeholder so the job is findable on disk immediately
-    _write_job(doc_id, {"done": False, "filename": file.filename, "total_pages": None})
+    _write_job(doc_id, {"done": False, "filename": file.filename, "total_pages": total_pages_upload})
 
     background_tasks.add_task(_run_extraction_and_persist, doc_id, anthropic_key)
 
-    return {"job_id": doc_id, "filename": file.filename, "total_pages": None, "status": "processing"}
+    return {"job_id": doc_id, "filename": file.filename, "total_pages": total_pages_upload, "status": "processing"}
 
 
 @app.get("/parse/{job_id}")
@@ -3619,6 +3633,8 @@ async def parse_status(
                 "status": "processing",
                 "progress": doc.get("progress", {}),
             }
+        if "_error" in schema:
+            raise HTTPException(status_code=500, detail=schema["_error"])
         # Done — clean up and return
         del documents[job_id]
         _delete_job(job_id)

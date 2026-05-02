@@ -41,8 +41,8 @@ os.makedirs(GEMINI_CACHE_DIR, exist_ok=True)
 
 # Global semaphores: cap concurrent API calls across all parallel document runs
 _SCREEN_SEMAPHORE   = threading.Semaphore(40)  # Gemini Flash page screening
-_DOCAI_SEMAPHORE    = threading.Semaphore(10)  # Document AI form parser
-_GEMINI_PRO_SEM     = threading.Semaphore(8)   # Gemini 2.5 Pro extraction
+_DOCAI_SEMAPHORE    = threading.Semaphore(30)  # Document AI form parser
+_GEMINI_PRO_SEM     = threading.Semaphore(30)  # Gemini 2.5 Pro extraction
 
 _header_cache_lock   = threading.Lock()
 

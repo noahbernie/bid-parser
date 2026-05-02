@@ -40,9 +40,9 @@ os.makedirs(SCREEN_CACHE_DIR, exist_ok=True)
 os.makedirs(GEMINI_CACHE_DIR, exist_ok=True)
 
 # Global semaphores: cap concurrent API calls across all parallel document runs
-_SCREEN_SEMAPHORE   = threading.Semaphore(5)   # Gemini Flash page screening
-_DOCAI_SEMAPHORE    = threading.Semaphore(6)   # Document AI form parser
-_GEMINI_PRO_SEM     = threading.Semaphore(4)   # Gemini 2.5 Pro extraction
+_SCREEN_SEMAPHORE   = threading.Semaphore(3)   # Gemini Flash page screening
+_DOCAI_SEMAPHORE    = threading.Semaphore(3)   # Document AI form parser
+_GEMINI_PRO_SEM     = threading.Semaphore(2)   # Gemini 2.5 Pro extraction
 
 _header_cache_lock   = threading.Lock()
 
@@ -1425,7 +1425,7 @@ Use null for any field not found. city and state are the city/state where the wo
 
     selected_pages = []
     _stage_page_screen = _stage(1, "page_screen")
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         futures = {pool.submit(_screen_page, i): i for i in range(total_pages)}
         results = {}
         screen_work_types = {}  # page_num -> work_type from Flash (or None)

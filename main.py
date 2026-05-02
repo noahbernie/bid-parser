@@ -1239,6 +1239,15 @@ _GEMINI_PAGE_SCREEN_PROMPT = (
 )
 
 
+def _rss_mb() -> int:
+    """Return current process RSS in MB."""
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+    except Exception:
+        return -1
+
+
 def run_extraction(doc_id: str, api_key: str):
     """New pipeline: Gemini Flash page screen → DocAI (filtered pages) → Gemini Pro extraction."""
     doc = documents[doc_id]
@@ -1312,6 +1321,7 @@ def run_extraction(doc_id: str, api_key: str):
         doc["extracted_schema"] = schema
 
     # --- Step 1: Extract project header from first 5 pages (include city & state) ---
+    log(f"🚀 Starting pipeline — PDF {len(pdf_bytes)//1024}KB, RSS {_rss_mb()}MB")
     log("📋 Step 1: Extracting project info from cover pages...")
     _HEADER_PROMPT_V2 = """You are parsing a road construction bid document. Extract project-level fields only.
 Return ONLY valid JSON with these fields:
@@ -1343,7 +1353,7 @@ Use null for any field not found. city and state are the city/state where the wo
     )
 
     total_pages = doc["total_pages"]
-    log(f"🔍 Step 2: Gemini Flash page screen — {total_pages} pages in parallel...")
+    log(f"🔍 Step 2: Gemini Flash page screen — {total_pages} pages in parallel... RSS {_rss_mb()}MB")
 
     pdf_screen_hash = hashlib.sha256(pdf_bytes).hexdigest()[:16]
 
@@ -1503,7 +1513,7 @@ Use null for any field not found. city and state are the city/state where the wo
             page_inherited_work_type[page_num] = screen_work_types.get(page_num - 1)
 
     # --- Step 3: DocAI Form Parser — send each selected page individually in parallel ---
-    log(f"🔷 Step 3: Document AI Form Parser — {len(selected_pages)} pages in parallel...")
+    log(f"🔷 Step 3: Document AI Form Parser — {len(selected_pages)} pages in parallel... RSS {_rss_mb()}MB")
     _stage_docai = _stage(2, "docai_extract")
 
     from google.cloud import documentai as _docai
@@ -1648,7 +1658,7 @@ Use null for any field not found. city and state are the city/state where the wo
         _exit_error("DocAI found no tables on selected pages"); return
 
     # --- Step 4: Extract streets (Haiku Vision col-confirm → Gemini 2.5 Pro extraction) ---
-    log("🤖 Step 4: Extracting streets — Gemini 2.5 Pro...")
+    log(f"🤖 Step 4: Extracting streets — Gemini 2.5 Pro... RSS {_rss_mb()}MB")
     _stage_gemini = _stage(3, "gemini_extract")
 
     STREET_SUFFIXES = {"RD", "AV", "AVE", "DR", "LN", "CT", "PL", "ST", "BL", "BLVD", "WY", "WAY",
@@ -1916,7 +1926,7 @@ Return ONLY valid JSON, no markdown:
     _stage_gemini.finish(count_out=len(all_streets))
 
     # --- Step 5: Deduplicate ---
-    log("🔀 Step 5: Deduplicating...")
+    log(f"🔀 Step 5: Deduplicating... RSS {_rss_mb()}MB")
     _streets_before_dedup = len(all_streets)
     _stage_dedup = _stage(4, "dedup", count_in=_streets_before_dedup)
 
@@ -2083,7 +2093,7 @@ Return ONLY valid JSON, no markdown:
     _stage_tags.finish(count_out=len(all_streets))
 
     # --- Step 6: Google Geocoding — intersection validation + spelling correction ---
-    log("🗺 Step 6: Google Geocoding intersection validation...")
+    log(f"🗺 Step 6: Google Geocoding intersection validation... RSS {_rss_mb()}MB")
 
     GEOCODE_CACHE_DIR = os.path.join(BASE_DIR, "geocode_cache")
     os.makedirs(GEOCODE_CACHE_DIR, exist_ok=True)

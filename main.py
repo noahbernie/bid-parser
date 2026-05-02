@@ -1358,10 +1358,15 @@ Use null for any field not found. city and state are the city/state where the wo
 
     pdf_screen_hash = hashlib.sha256(pdf_bytes).hexdigest()[:16]
     _page_renders: dict = {}  # page_idx (0-based) -> b64 PNG string
+    _render_start = time.time()
+    log(f"  🖼 Pre-rendering {total_pages} pages in parallel... RSS {_rss_mb()}MB")
 
     def _render_one(pi):
+        t0 = time.time()
         try:
-            return pi, render_page_as_image(pdf_bytes, pi)
+            img = render_page_as_image(pdf_bytes, pi)
+            log(f"    p.{pi+1} rendered in {time.time()-t0:.1f}s")
+            return pi, img
         except Exception as _e:
             log(f"  ⚠ Pre-render p.{pi+1} failed: {str(_e)[:60]}")
             return pi, None
@@ -1370,7 +1375,7 @@ Use null for any field not found. city and state are the city/state where the wo
         for _pi, _img in _rpool.map(_render_one, range(total_pages)):
             if _img:
                 _page_renders[_pi] = _img
-    log(f"  ✓ Pre-rendered {len(_page_renders)}/{total_pages} pages, RSS {_rss_mb()}MB")
+    log(f"  ✓ Pre-rendered {len(_page_renders)}/{total_pages} pages in {time.time()-_render_start:.1f}s, RSS {_rss_mb()}MB")
 
     def _screen_page(page_idx: int) -> tuple:
         """Returns (page_num_1indexed, is_street_schedule: bool, work_type: str|None)."""

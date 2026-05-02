@@ -1355,7 +1355,17 @@ Use null for any field not found. city and state are the city/state where the wo
     total_pages = doc["total_pages"]
     log(f"🔍 Step 2: Gemini Flash page screen — {total_pages} pages in parallel... RSS {_rss_mb()}MB")
 
+    # Pre-render all pages sequentially once — avoids concurrent fitz decompression
+    # which can spike to 300MB+ per page on large-format scanned plan sheets.
+    # Each page cached as b64 PNG; both screen and Gemini vision phases reuse these.
     pdf_screen_hash = hashlib.sha256(pdf_bytes).hexdigest()[:16]
+    _page_renders: dict = {}  # page_idx (0-based) -> b64 PNG string
+    for _pi in range(total_pages):
+        try:
+            _page_renders[_pi] = render_page_as_image(pdf_bytes, _pi)
+        except Exception as _e:
+            log(f"  ⚠ Pre-render p.{_pi+1} failed: {str(_e)[:60]}")
+    log(f"  ✓ Pre-rendered {len(_page_renders)}/{total_pages} pages, RSS {_rss_mb()}MB")
 
     def _screen_page(page_idx: int) -> tuple:
         """Returns (page_num_1indexed, is_street_schedule: bool, work_type: str|None)."""
@@ -1370,10 +1380,9 @@ Use null for any field not found. city and state are the city/state where the wo
             except Exception:
                 pass  # corrupt cache entry — re-screen
 
-        try:
-            b64 = render_page_as_image(pdf_bytes, page_idx)
-        except Exception as e:
-            log(f"  ⚠ Page {page_num}: render failed — {str(e)[:60]} — assuming no")
+        b64 = _page_renders.get(page_idx)
+        if not b64:
+            log(f"  ⚠ Page {page_num}: no render cached — assuming no")
             return page_num, False, None
         payload = json.dumps({
             "contents": [{"parts": [
@@ -1719,10 +1728,9 @@ Use null for any field not found. city and state are the city/state where the wo
         if not gemini_key:
             log(f"  ⚠ p.{page_num}: GEMINI_API_KEY not set")
             return []
-        try:
-            b64_img = render_page_as_image(pdf_bytes, page_num - 1, dpi=150)
-        except Exception as e:
-            log(f"  ⚠ p.{page_num}: could not render page image: {e}")
+        b64_img = _page_renders.get(page_num - 1)
+        if not b64_img:
+            log(f"  ⚠ p.{page_num}: no render cached for vision fallback")
             return []
         log(f"  🖼 p.{page_num}: STREET col missing from DocAI — using Gemini Vision + text...")
         docai_text = json.dumps({"header_rows": header_rows, "body_rows": body_rows}, ensure_ascii=False, indent=2)
@@ -3129,11 +3137,9 @@ Do not invent names — only use the exact text from the merged cell."""
             if header_key in _vision_header_cache:
                 return _vision_header_cache[header_key]
 
-        try:
-            b64_img = render_page_as_image(pdf_bytes, max(0, page_num - 1), dpi=120)
-        except Exception as e:
-            log(f"  ⚠ Could not render page {page_num} for street-table check: {e} — assuming yes")
-            return True
+        b64_img = _page_renders.get(max(0, page_num - 1))
+        if not b64_img:
+            return True  # no render cached — assume yes
 
         sample = {"header_rows": header_rows, "body_rows": body_rows[:6]}
         text = json.dumps(sample, ensure_ascii=False)
@@ -3183,10 +3189,8 @@ Return ONLY valid JSON:
                 log(f"  👁 Page {page_num}: using cached vision header map: {cached}")
                 return cached
 
-        try:
-            b64_img = render_page_as_image(pdf_bytes, max(0, page_num - 1), dpi=120)
-        except Exception as e:
-            log(f"  ⚠ Could not render page {page_num} for vision: {e}")
+        b64_img = _page_renders.get(max(0, page_num - 1))
+        if not b64_img:
             return {}
 
         sample = {"header_rows": header_rows, "sample_body_rows": body_rows[:6]}

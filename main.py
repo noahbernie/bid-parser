@@ -1383,9 +1383,9 @@ Use null for any field not found. city and state are the city/state where the wo
             "generationConfig": {"maxOutputTokens": 512, "temperature": 0},
         }).encode()
 
-        # Retry up to 2 times on transient errors (timeouts, broken pipe, etc.)
+        # Retry up to 9 times on transient errors (timeouts, broken pipe, 503s)
         last_err = None
-        for attempt in range(3):
+        for attempt in range(10):
             try:
                 with _SCREEN_SEMAPHORE:
                     req = urllib.request.Request(
@@ -1819,7 +1819,7 @@ Return ONLY valid JSON, no markdown:
                 pass  # corrupt cache — fall through to re-call
 
         result = None
-        for attempt in range(6):
+        for attempt in range(10):
             try:
                 payload = json.dumps({
                     "contents": [{"parts": [{"text": full_prompt}]}],

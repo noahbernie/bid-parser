@@ -40,9 +40,9 @@ os.makedirs(SCREEN_CACHE_DIR, exist_ok=True)
 os.makedirs(GEMINI_CACHE_DIR, exist_ok=True)
 
 # Global semaphores: cap concurrent API calls across all parallel document runs
-_SCREEN_SEMAPHORE   = threading.Semaphore(1)   # Gemini Flash page screening
-_DOCAI_SEMAPHORE    = threading.Semaphore(3)   # Document AI form parser
-_GEMINI_PRO_SEM     = threading.Semaphore(2)   # Gemini 2.5 Pro extraction
+_SCREEN_SEMAPHORE   = threading.Semaphore(5)   # Gemini Flash page screening
+_DOCAI_SEMAPHORE    = threading.Semaphore(6)   # Document AI form parser
+_GEMINI_PRO_SEM     = threading.Semaphore(4)   # Gemini 2.5 Pro extraction
 
 _header_cache_lock   = threading.Lock()
 
@@ -228,22 +228,26 @@ def extract_text_smart(page, page_index: int = None, pdf_bytes: bytes = None) ->
 
     return page.extract_text() or ""
 
-def render_page_as_image(pdf_bytes: bytes, page_index: int, dpi: int = 250) -> str:
-    """Render a PDF page to a base64 PNG."""
+def render_page_as_image(pdf_bytes: bytes, page_index: int, dpi: int = 250, max_width: int = 1280) -> str:
+    """Render a PDF page to a base64 PNG, capped at max_width pixels to avoid OOM on large-format sheets."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    pix = doc[page_index].get_pixmap(matrix=mat)
+    page = doc[page_index]
+    scale = min(dpi / 72, max_width / page.rect.width)
+    mat = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=mat)
     img_bytes = pix.tobytes("png")
     doc.close()
     return base64.standard_b64encode(img_bytes).decode()
 
-def render_page_as_strips(pdf_bytes: bytes, page_index: int, dpi: int = 250) -> list:
+def render_page_as_strips(pdf_bytes: bytes, page_index: int, dpi: int = 250, max_width: int = 1280) -> list:
     """Render a PDF page and split into 4 equal horizontal strips. Returns list of b64 strings."""
     import io
     from PIL import Image as PILImage
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    pix = doc[page_index].get_pixmap(matrix=mat)
+    page = doc[page_index]
+    scale = min(dpi / 72, max_width / page.rect.width)
+    mat = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=mat)
     doc.close()
     img = PILImage.open(io.BytesIO(pix.tobytes("png")))
     h, w = img.height, img.width
@@ -1240,6 +1244,7 @@ def run_extraction(doc_id: str, api_key: str):
     doc = documents[doc_id]
     pdf_bytes = doc["bytes"]
 
+
     def log(msg, streets_so_far=None):
         p = doc.get("progress") or {"logs": [], "streets_so_far": []}
         p["logs"].append(msg)
@@ -1342,9 +1347,6 @@ Use null for any field not found. city and state are the city/state where the wo
 
     pdf_screen_hash = hashlib.sha256(pdf_bytes).hexdigest()[:16]
 
-    # Open once, share across threads — avoids loading N copies of the PDF into memory
-    _screen_fitz_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
     def _screen_page(page_idx: int) -> tuple:
         """Returns (page_num_1indexed, is_street_schedule: bool, work_type: str|None)."""
         page_num = page_idx + 1
@@ -1359,13 +1361,7 @@ Use null for any field not found. city and state are the city/state where the wo
                 pass  # corrupt cache entry — re-screen
 
         try:
-            page_obj = _screen_fitz_doc[page_idx]
-            # Scale to max 1280px wide — preserves quality on letter pages,
-            # avoids 48MB+ pixmaps on large-format plan sheets
-            scale = min(1.0, 1280 / page_obj.rect.width)
-            mat = fitz.Matrix(scale, scale)
-            pix = page_obj.get_pixmap(matrix=mat)
-            b64 = base64.standard_b64encode(pix.tobytes("png")).decode()
+            b64 = render_page_as_image(pdf_bytes, page_idx)
         except Exception as e:
             log(f"  ⚠ Page {page_num}: render failed — {str(e)[:60]} — assuming no")
             return page_num, False, None
@@ -1434,7 +1430,7 @@ Use null for any field not found. city and state are the city/state where the wo
 
     selected_pages = []
     _stage_page_screen = _stage(1, "page_screen")
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {pool.submit(_screen_page, i): i for i in range(total_pages)}
         results = {}
         screen_work_types = {}  # page_num -> work_type from Flash (or None)
@@ -1449,7 +1445,6 @@ Use null for any field not found. city and state are the city/state where the wo
                 page_work_type = None
             results[page_num] = is_schedule
             screen_work_types[page_num] = page_work_type
-    _screen_fitz_doc.close()
 
     # Expand selections to include continuation pages:
     # If page N is selected, also include up to 4 following pages that weren't explicitly

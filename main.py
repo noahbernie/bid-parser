@@ -20,6 +20,11 @@ import threading
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
+from dataclasses import asdict
+from models import (
+    Job, BidParseResults, ParserStageLog, StreetRaw,
+    street_raw_from_dict, parser_stage_log_from_dict,
+)
 
 load_dotenv()
 
@@ -1293,17 +1298,7 @@ def run_extraction(doc_id: str, api_key: str):
         return _S()
 
     def _exit_error(message: str):
-        schema["job"] = {
-            "id": None,
-            "project_id": None,
-            "organization_id": None,
-            "uploaded_by_user_id": None,
-            "job_name": None,
-            "status": "error",
-            "parse_error": message,
-            "created_at": None,
-            "updated_at": None,
-        }
+        schema["job"] = asdict(Job(status="error", parse_error=message))
         schema["streets"] = []
         schema["low_confidence_streets"] = []
         schema["bid_parse_results"] = None
@@ -2571,65 +2566,40 @@ Return ONLY valid JSON, no markdown:
     def _street_to_raw(s: dict) -> dict:
         from_raw = _normalize_cross(s.get("from_street"))
         to_raw   = _normalize_cross(s.get("to_street"))
-        # Street with no cross streets at all → START / END
         if not from_raw and not to_raw:
             from_raw = "START"
             to_raw   = "END"
-        return {
-            "main_street":           s.get("main_street") or None,
-            "from_street":           from_raw,
-            "to_street":             to_raw,
-            "work_types":            s.get("work_types")  or [],
-            "location":              s.get("location")    or None,
-            "page":                  s.get("page")        or None,
-            "source":                s.get("source", "gemini-pro"),
-            "tags":                  s.get("tags")        or None,
-            "confidence":            s.get("confidence", "high"),
-            "low_confidence_reason": s.get("low_confidence_reason") or None,
-            "name_corrected":        s.get("name_corrected")        or None,
-            "cross_doc_validated":   s.get("cross_doc_validated")   or None,
-            "has_ramp_endpoint":     s.get("has_ramp_endpoint")     or None,
-        }
+        normalized = {**s, "from_street": from_raw, "to_street": to_raw}
+        return asdict(street_raw_from_dict(normalized))
 
     streets_raw = [_street_to_raw(s) for s in all_streets + [
         s for s in low_confidence_streets if id(s) not in {id(x) for x in all_streets}
     ]]
 
-    # bid_parse_results: one row per job — maps directly to bid_parse_results table
-    bid_parse_results = {
-        "bid_number":            schema.get("bid_number")      or None,
-        "project_name":          schema.get("project_name")    or None,
-        "city":                  city  or None,
-        "state":                 state or None,
-        "work_types":            _all_work_types or None,
-        "estimated_cost":        schema.get("estimated_cost")  or None,
-        "bid_due_date":          schema.get("bid_due_date")    or None,
-        "total_pages":           total_pages,
-        "selected_pages":        len(selected_pages),
-        "selected_page_numbers": selected_pages,
-        "total_streets":         len(all_streets),
-        "low_confidence_count":  len(low_confidence_streets),
-        "chunks_processed":      None,  # not currently tracked per-chunk
-    }
+    job_patch = asdict(Job(
+        job_name=schema.get("project_name") or None,
+        status="parsed",
+    ))
 
-    # parser_stage_logs: one row per stage — maps directly to parser_stage_logs table
-    # raw_log_s3_key is null here; platform fills it after uploading stage JSON to S3
+    bid_parse_results = asdict(BidParseResults(
+        bid_number=schema.get("bid_number")     or None,
+        project_name=schema.get("project_name") or None,
+        city=city   or None,
+        state=state or None,
+        work_types=_all_work_types              or None,
+        estimated_cost=schema.get("estimated_cost") or None,
+        bid_due_date=schema.get("bid_due_date") or None,
+        total_pages=total_pages,
+        selected_pages=len(selected_pages),
+        selected_page_numbers=selected_pages,
+        total_streets=len(all_streets),
+        chunks_processed=None,
+    ))
+
     parser_stage_logs = [
-        {**stg, "raw_log_s3_key": None}
+        asdict(parser_stage_log_from_dict(stg))
         for stg in _stages
     ]
-
-    job_patch = {
-        "id": None,
-        "project_id": None,
-        "organization_id": None,
-        "uploaded_by_user_id": None,
-        "job_name": schema.get("project_name") or None,
-        "status": "parsed",
-        "parse_error": None,
-        "created_at": None,
-        "updated_at": None,
-    }
 
     schema["job"]                = job_patch
     schema["bid_parse_results"]  = bid_parse_results

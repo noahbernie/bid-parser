@@ -2616,6 +2616,43 @@ Return ONLY valid JSON, no markdown:
         sr.id = str(uuid.uuid4())
         return asdict(sr)
 
+    # Fallback: if city/state still unknown, ask Flash to guess from the extracted street names
+    if (not city or not state) and all_streets and gemini_flash_url:
+        log("🌍 City/state unknown — asking Flash to guess from street names...")
+        _street_sample = ", ".join(
+            s.get("main_street", "") for s in all_streets[:40] if s.get("main_street")
+        )
+        _geo_prompt = (
+            "You are given a list of street names from a US road construction bid document. "
+            "Based on the street names, guess the most likely US city and state where this work is located. "
+            "Return ONLY valid JSON with keys \"city\" and \"state\" (2-letter abbreviation). "
+            "If you cannot make a confident guess, use null.\n\n"
+            f"Street names: {_street_sample}"
+        )
+        try:
+            _geo_body = json.dumps({
+                "contents": [{"parts": [{"text": _geo_prompt}]}],
+                "generationConfig": {"temperature": 0, "maxOutputTokens": 64},
+            }).encode()
+            _geo_req = urllib.request.Request(
+                gemini_flash_url,
+                data=_geo_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(_geo_req, timeout=15) as _r:
+                _geo_resp = json.loads(_r.read())
+            _geo_text = _geo_resp["candidates"][0]["content"]["parts"][0]["text"].strip()
+            _geo_text = re.sub(r"^```(?:json)?|```$", "", _geo_text, flags=re.MULTILINE).strip()
+            _geo_json = json.loads(_geo_text)
+            if not city:
+                city  = _geo_json.get("city")  or city
+            if not state:
+                state = _geo_json.get("state") or state
+            log(f"  ✓ Flash geo-guess: city={city}, state={state}")
+        except Exception as _ge:
+            log(f"  ⚠ Flash geo-guess failed: {str(_ge)[:80]}")
+
     streets_raw = [_street_to_raw(s, doc_id) for s in all_streets + [
         s for s in low_confidence_streets if id(s) not in {id(x) for x in all_streets}
     ]]

@@ -1837,14 +1837,22 @@ Return ONLY valid JSON, no markdown:
                 pass  # corrupt cache — fall through to re-call
 
         result = None
+        _pro_keys = [k for k in [
+            os.environ.get("GEMINI_API_KEY"),
+            os.environ.get("GEMINI_API_KEY_2"),
+        ] if k]
+        _pro_key_idx = [0]  # mutable so inner scope can update
+
         for attempt in range(10):
             try:
                 payload = json.dumps({
                     "contents": [{"parts": [{"text": full_prompt}]}],
                     "generationConfig": {"maxOutputTokens": 65536, "temperature": 0},
                 }).encode()
+                _active_key = _pro_keys[_pro_key_idx[0] % len(_pro_keys)]
+                _url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={_active_key}"
                 with _GEMINI_PRO_SEM:
-                    req = urllib.request.Request(gemini_pro_url, data=payload, headers={"Content-Type": "application/json"})
+                    req = urllib.request.Request(_url, data=payload, headers={"Content-Type": "application/json"})
                     with urllib.request.urlopen(req, timeout=300) as resp:
                         data = json.loads(resp.read())
                 raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -1852,14 +1860,15 @@ Return ONLY valid JSON, no markdown:
                 break
             except urllib.error.HTTPError as e:
                 if e.code in (429, 500, 503):
-                    log(f"  ⚠ Gemini Pro HTTP {e.code} p.{page_num} attempt {attempt+1} — retrying...")
-                    time.sleep(3 * (attempt + 1))
+                    _pro_key_idx[0] += 1  # switch to next key on throttle
+                    log(f"  ⚠ Gemini Pro HTTP {e.code} p.{page_num} attempt {attempt+1} — switching key & retrying...")
+                    time.sleep(2 * (attempt + 1))
                 else:
                     log(f"  ⚠ Gemini Pro HTTP {e.code} p.{page_num} — {e}")
                     break
             except Exception as e:
                 log(f"  ⚠ Gemini Pro error p.{page_num} attempt {attempt+1}: {str(e)[:80]}")
-                time.sleep(3 * (attempt + 1))
+                time.sleep(2 * (attempt + 1))
 
         if result is None:
             log(f"  ⚠ Gemini Pro failed after retries p.{page_num} — falling back to Opus...")

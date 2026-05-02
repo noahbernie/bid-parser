@@ -40,7 +40,7 @@ os.makedirs(SCREEN_CACHE_DIR, exist_ok=True)
 os.makedirs(GEMINI_CACHE_DIR, exist_ok=True)
 
 # Global semaphores: cap concurrent API calls across all parallel document runs
-_SCREEN_SEMAPHORE   = threading.Semaphore(2)   # Gemini Flash page screening
+_SCREEN_SEMAPHORE   = threading.Semaphore(5)   # Gemini Flash page screening
 _DOCAI_SEMAPHORE    = threading.Semaphore(3)   # Document AI form parser
 _GEMINI_PRO_SEM     = threading.Semaphore(2)   # Gemini 2.5 Pro extraction
 
@@ -1342,6 +1342,9 @@ Use null for any field not found. city and state are the city/state where the wo
 
     pdf_screen_hash = hashlib.sha256(pdf_bytes).hexdigest()[:16]
 
+    # Open once, share across threads — avoids loading N copies of the PDF into memory
+    _screen_fitz_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
     def _screen_page(page_idx: int) -> tuple:
         """Returns (page_num_1indexed, is_street_schedule: bool, work_type: str|None)."""
         page_num = page_idx + 1
@@ -1356,7 +1359,9 @@ Use null for any field not found. city and state are the city/state where the wo
                 pass  # corrupt cache entry — re-screen
 
         try:
-            b64 = render_page_as_image(pdf_bytes, page_idx, dpi=100)
+            mat = fitz.Matrix(150 / 72, 150 / 72)
+            pix = _screen_fitz_doc[page_idx].get_pixmap(matrix=mat)
+            b64 = base64.standard_b64encode(pix.tobytes("png")).decode()
         except Exception as e:
             log(f"  ⚠ Page {page_num}: render failed — {str(e)[:60]} — assuming no")
             return page_num, False, None
@@ -1425,7 +1430,7 @@ Use null for any field not found. city and state are the city/state where the wo
 
     selected_pages = []
     _stage_page_screen = _stage(1, "page_screen")
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {pool.submit(_screen_page, i): i for i in range(total_pages)}
         results = {}
         screen_work_types = {}  # page_num -> work_type from Flash (or None)
@@ -1440,6 +1445,7 @@ Use null for any field not found. city and state are the city/state where the wo
                 page_work_type = None
             results[page_num] = is_schedule
             screen_work_types[page_num] = page_work_type
+    _screen_fitz_doc.close()
 
     # Expand selections to include continuation pages:
     # If page N is selected, also include up to 4 following pages that weren't explicitly

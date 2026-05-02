@@ -1799,16 +1799,15 @@ Rules:
 Return ONLY valid JSON, no markdown:
 {{"streets": [{{"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "..." }}]}}"""
 
-    # Shared across all Pro calls in this pipeline run — keys blocked on 429/503 are removed
     _pro_keys = [k for k in [
         os.environ.get("GEMINI_API_KEY"),
         os.environ.get("GEMINI_API_KEY_2"),
     ] if k]
-    _blocked_pro_keys: set = set()
 
     def _extract_with_gemini_pro(header_rows, body_rows, page_num, full_text="", lines=None, inherited_work_type=None):  # noqa: ARG001
         if not _pro_keys:
             return []
+        _blocked_pro_keys: set = set()  # reset per page
         table_data = {"header_rows": header_rows, "body_rows": body_rows}
         table_json = json.dumps(table_data, ensure_ascii=False, indent=2)
 

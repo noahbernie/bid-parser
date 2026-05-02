@@ -1138,8 +1138,9 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Only PDF files supported")
     contents = await file.read()
     doc_id = str(uuid.uuid4())[:8]
-    with pdfplumber.open(io.BytesIO(contents)) as pdf:
-        total = len(pdf.pages)
+    _fz = fitz.open(stream=contents, filetype="pdf")
+    total = len(_fz)
+    _fz.close()
     documents[doc_id] = {
         "filename": file.filename,
         "total_pages": total,

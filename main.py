@@ -1918,6 +1918,9 @@ Return ONLY valid JSON, no markdown:
         gemini_tasks.append((page_num, merged_headers, merged_body, page_full_text, page_lines))
 
     # Run all Gemini Pro page extractions in parallel
+    if gemini_tasks:
+        log(f"  ⚡ Running {len(gemini_tasks)} page(s) through Gemini Pro in parallel...")
+
     def _run_gemini_task(task):
         page_num, headers, body, full_text, lines = task
         return _extract_with_gemini_pro(headers, body, page_num,

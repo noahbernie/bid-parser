@@ -1884,17 +1884,16 @@ Return ONLY valid JSON, no markdown:
     sent_to_gemini = 0
     sent_to_vision = 0
 
+    # Build list of pages to send to Gemini Pro
+    gemini_tasks = []
     for page_num in sorted(all_page_data.keys()):
         page_entry = all_page_data[page_num]
         page_full_text = page_entry.get("full_text", "")
         page_lines     = page_entry.get("lines", [])
         page_tables    = page_entry.get("tables", [])
 
-        # Filter to tables with body rows
         valid_tables = [(h, b) for h, b in page_tables if b]
 
-        # One Gemini call per page (all tables merged) + full_text
-        # Pass all tables together so Gemini sees the full page at once
         if not valid_tables and not page_full_text:
             continue
 
@@ -1907,20 +1906,27 @@ Return ONLY valid JSON, no markdown:
             log(f"  ⏩ p.{page_num}: text filter skip")
             continue
 
-        log(f"  📄 p.{page_num}: {len(valid_tables)} table(s) — sending to Gemini Pro")
-        sent_to_gemini += 1
-        # Merge all tables for this page into combined header+body lists
         merged_headers = []
         merged_body = []
         for h, b in valid_tables:
             if h:
                 merged_headers.extend(h)
             merged_body.extend(b)
-        extracted = _extract_with_gemini_pro(merged_headers, merged_body, page_num,
-                                              full_text=page_full_text, lines=page_lines,
-                                              inherited_work_type=page_inherited_work_type.get(page_num))
-        all_streets.extend(extracted)
 
+        log(f"  📄 p.{page_num}: {len(valid_tables)} table(s) — sending to Gemini Pro")
+        sent_to_gemini += 1
+        gemini_tasks.append((page_num, merged_headers, merged_body, page_full_text, page_lines))
+
+    # Run all Gemini Pro page extractions in parallel
+    def _run_gemini_task(task):
+        page_num, headers, body, full_text, lines = task
+        return _extract_with_gemini_pro(headers, body, page_num,
+                                        full_text=full_text, lines=lines,
+                                        inherited_work_type=page_inherited_work_type.get(page_num))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for result in pool.map(_run_gemini_task, gemini_tasks):
+            all_streets.extend(result)
 
     log(f"📊 Extraction summary — {skipped_text} text-filtered, {sent_to_vision} vision pages, {sent_to_gemini} tables sent to Gemini")
     _stage_gemini.finish(count_out=len(all_streets))

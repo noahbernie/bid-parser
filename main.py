@@ -2605,25 +2605,30 @@ Return ONLY valid JSON, no markdown:
             return "END"
         return v
 
-    def _street_to_raw(s: dict) -> dict:
+    def _street_to_raw(s: dict, job_id: str = None) -> dict:
         from_raw = _normalize_cross(s.get("from_street"))
         to_raw   = _normalize_cross(s.get("to_street"))
         if not from_raw and not to_raw:
             from_raw = "START"
             to_raw   = "END"
         normalized = {**s, "from_street": from_raw, "to_street": to_raw}
-        return asdict(street_raw_from_dict(normalized))
+        sr = street_raw_from_dict(normalized, job_id=job_id)
+        sr.id = str(uuid.uuid4())
+        return asdict(sr)
 
-    streets_raw = [_street_to_raw(s) for s in all_streets + [
+    streets_raw = [_street_to_raw(s, doc_id) for s in all_streets + [
         s for s in low_confidence_streets if id(s) not in {id(x) for x in all_streets}
     ]]
 
     job_patch = asdict(Job(
+        id=doc_id,
         job_name=schema.get("project_name") or None,
         status="parsed",
     ))
 
     bid_parse_results = asdict(BidParseResults(
+        id=str(uuid.uuid4()),
+        job_id=doc_id,
         bid_number=schema.get("bid_number")     or None,
         project_name=schema.get("project_name") or None,
         city=city   or None,
@@ -2638,10 +2643,12 @@ Return ONLY valid JSON, no markdown:
         chunks_processed=None,
     ))
 
-    parser_stage_logs = [
-        asdict(parser_stage_log_from_dict(stg))
-        for stg in _stages
-    ]
+    def _make_stage_log(stg):
+        sl = parser_stage_log_from_dict(stg, job_id=doc_id)
+        sl.id = str(uuid.uuid4())
+        return asdict(sl)
+
+    parser_stage_logs = [_make_stage_log(stg) for stg in _stages]
 
     schema["job"]                = job_patch
     schema["bid_parse_results"]  = bid_parse_results
@@ -3607,7 +3614,7 @@ async def parse_pdf_async(
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured on server")
 
     contents = await file.read()
-    doc_id = str(uuid.uuid4())[:8]
+    doc_id = str(uuid.uuid4())
 
     # fitz is fast (<50ms) for page counting; pdfplumber was blocking for 60+s on large PDFs
     try:

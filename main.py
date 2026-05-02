@@ -1356,16 +1356,20 @@ Use null for any field not found. city and state are the city/state where the wo
     total_pages = doc["total_pages"]
     log(f"🔍 Step 2: Gemini Flash page screen — {total_pages} pages in parallel... RSS {_rss_mb()}MB")
 
-    # Pre-render all pages sequentially once — avoids concurrent fitz decompression
-    # which can spike to 300MB+ per page on large-format scanned plan sheets.
-    # Each page cached as b64 PNG; both screen and Gemini vision phases reuse these.
     pdf_screen_hash = hashlib.sha256(pdf_bytes).hexdigest()[:16]
     _page_renders: dict = {}  # page_idx (0-based) -> b64 PNG string
-    for _pi in range(total_pages):
+
+    def _render_one(pi):
         try:
-            _page_renders[_pi] = render_page_as_image(pdf_bytes, _pi)
+            return pi, render_page_as_image(pdf_bytes, pi)
         except Exception as _e:
-            log(f"  ⚠ Pre-render p.{_pi+1} failed: {str(_e)[:60]}")
+            log(f"  ⚠ Pre-render p.{pi+1} failed: {str(_e)[:60]}")
+            return pi, None
+
+    with ThreadPoolExecutor(max_workers=total_pages) as _rpool:
+        for _pi, _img in _rpool.map(_render_one, range(total_pages)):
+            if _img:
+                _page_renders[_pi] = _img
     log(f"  ✓ Pre-rendered {len(_page_renders)}/{total_pages} pages, RSS {_rss_mb()}MB")
 
     def _screen_page(page_idx: int) -> tuple:

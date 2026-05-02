@@ -1799,12 +1799,16 @@ Rules:
 Return ONLY valid JSON, no markdown:
 {{"streets": [{{"main_street": "...", "from_street": "...", "to_street": "...", "work_type": "..." }}]}}"""
 
+    # Shared across all Pro calls in this pipeline run — keys blocked on 429/503 are removed
+    _pro_keys = [k for k in [
+        os.environ.get("GEMINI_API_KEY"),
+        os.environ.get("GEMINI_API_KEY_2"),
+    ] if k]
+    _blocked_pro_keys: set = set()
+
     def _extract_with_gemini_pro(header_rows, body_rows, page_num, full_text="", lines=None, inherited_work_type=None):  # noqa: ARG001
-        gemini_key = os.environ.get("GEMINI_API_KEY")
-        gemini_pro_url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={gemini_key}"
-            if gemini_key else None
-        )
+        if not _pro_keys:
+            return []
         table_data = {"header_rows": header_rows, "body_rows": body_rows}
         table_json = json.dumps(table_data, ensure_ascii=False, indent=2)
 
@@ -1837,19 +1841,16 @@ Return ONLY valid JSON, no markdown:
                 pass  # corrupt cache — fall through to re-call
 
         result = None
-        _pro_keys = [k for k in [
-            os.environ.get("GEMINI_API_KEY"),
-            os.environ.get("GEMINI_API_KEY_2"),
-        ] if k]
-        _pro_key_idx = [0]  # mutable so inner scope can update
-
         for attempt in range(10):
             try:
                 payload = json.dumps({
                     "contents": [{"parts": [{"text": full_prompt}]}],
                     "generationConfig": {"maxOutputTokens": 65536, "temperature": 0},
                 }).encode()
-                _active_key = _pro_keys[_pro_key_idx[0] % len(_pro_keys)]
+                # Pick first non-blocked key; fall back to primary if all blocked
+                _available = [k for i, k in enumerate(_pro_keys) if i not in _blocked_pro_keys]
+                _active_key = (_available or _pro_keys)[0]
+                _active_idx = _pro_keys.index(_active_key)
                 _url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={_active_key}"
                 with _GEMINI_PRO_SEM:
                     req = urllib.request.Request(_url, data=payload, headers={"Content-Type": "application/json"})
@@ -1860,8 +1861,8 @@ Return ONLY valid JSON, no markdown:
                 break
             except urllib.error.HTTPError as e:
                 if e.code in (429, 500, 503):
-                    _pro_key_idx[0] += 1  # switch to next key on throttle
-                    log(f"  ⚠ Gemini Pro HTTP {e.code} p.{page_num} attempt {attempt+1} — switching key & retrying...")
+                    _blocked_pro_keys.add(_active_idx)
+                    log(f"  ⚠ Gemini Pro HTTP {e.code} p.{page_num} attempt {attempt+1} — key {_active_idx+1} blocked, retrying...")
                     time.sleep(2 * (attempt + 1))
                 else:
                     log(f"  ⚠ Gemini Pro HTTP {e.code} p.{page_num} — {e}")

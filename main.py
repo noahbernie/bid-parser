@@ -1,4 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, BackgroundTasks
+from typing import Optional
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -3599,7 +3600,13 @@ def _write_job(job_id: str, payload: dict):
         json.dump(payload, f)
 
 
-def _db_write_job_start(job_id: str, filename: str):
+def _db_write_job_start(
+    job_id: str,
+    filename: str,
+    organization_id: str = None,
+    project_id: str = None,
+    uploaded_by_user_id: str = None,
+):
     """Insert a jobs row with status=parsing. No-ops if DATABASE_URL not set."""
     import asyncio
     db_url = os.environ.get("DATABASE_URL")
@@ -3610,10 +3617,10 @@ def _db_write_job_start(job_id: str, filename: str):
         conn = await asyncpg.connect(db_url)
         try:
             await conn.execute("""
-                INSERT INTO jobs (id, job_name, status)
-                VALUES ($1, $2, 'parsing')
+                INSERT INTO jobs (id, job_name, status, organization_id, project_id, uploaded_by_user_id)
+                VALUES ($1, $2, 'parsing', $3, $4, $5)
                 ON CONFLICT (id) DO NOTHING
-            """, job_id, filename)
+            """, job_id, filename, organization_id, project_id, uploaded_by_user_id)
         finally:
             await conn.close()
     try:
@@ -3770,6 +3777,9 @@ async def parse_pdf_async(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     x_api_key: str = Header(default=None),
+    organization_id: Optional[str] = Form(default=None),
+    project_id: Optional[str] = Form(default=None),
+    uploaded_by_user_id: Optional[str] = Form(default=None),
 ):
     """
     Async parse endpoint. Returns a job_id immediately.
@@ -3806,7 +3816,7 @@ async def parse_pdf_async(
 
     # Write a placeholder so the job is findable on disk immediately
     _write_job(doc_id, {"done": False, "filename": file.filename, "total_pages": total_pages_upload})
-    _db_write_job_start(doc_id, file.filename)
+    _db_write_job_start(doc_id, file.filename, organization_id, project_id, uploaded_by_user_id)
 
     background_tasks.add_task(_run_extraction_and_persist, doc_id, anthropic_key)
 

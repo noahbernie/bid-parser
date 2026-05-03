@@ -1296,7 +1296,7 @@ def run_extraction(doc_id: str, api_key: str):
                 self.error = None
             def finish(self, count_out=None, dropped=None, pages_processed=None,
                        pages_selected=None, selected_page_numbers=None, error=None,
-                       extra_log: dict = None):
+                       metadata: dict = None, extra_log: dict = None):
                 rec = {
                     "stage_order": self.order,
                     "stage": self.name,
@@ -1310,6 +1310,7 @@ def run_extraction(doc_id: str, api_key: str):
                 if pages_selected  is not None: rec["pages_selected"]  = pages_selected
                 if selected_page_numbers is not None: rec["selected_page_numbers"] = selected_page_numbers
                 if error: rec["error_message"] = str(error)[:300]
+                if metadata: rec["metadata"] = metadata
                 try:
                     from s3 import upload_stage_log
                     log_payload = dict(rec)
@@ -1387,6 +1388,9 @@ Use null for any field not found. city and state are the city/state where the wo
                 _page_renders[_pi] = _img
     log(f"  ✓ Pre-rendered {len(_page_renders)}/{total_pages} pages in {time.time()-_render_start:.1f}s, RSS {_rss_mb()}MB")
 
+    _flash_usage = {"input_tokens": 0, "output_tokens": 0, "api_calls": 0}
+    _flash_usage_lock = threading.Lock()
+
     def _screen_page(page_idx: int) -> tuple:
         """Returns (page_num_1indexed, is_street_schedule: bool, work_type: str|None)."""
         page_num = page_idx + 1
@@ -1453,6 +1457,12 @@ Use null for any field not found. city and state are the city/state where the wo
                             result = True
                         else:
                             result = False
+                # Capture token usage
+                usage = data.get("usageMetadata") or {}
+                with _flash_usage_lock:
+                    _flash_usage["input_tokens"]  += usage.get("promptTokenCount", 0)
+                    _flash_usage["output_tokens"] += usage.get("candidatesTokenCount", 0)
+                    _flash_usage["api_calls"]     += 1
                 # Cache to disk on success
                 try:
                     with open(cache_file, "w") as f:
@@ -1519,6 +1529,7 @@ Use null for any field not found. city and state are the city/state where the wo
         pages_processed=total_pages,
         pages_selected=len(selected_pages),
         selected_page_numbers=selected_pages,
+        metadata=_flash_usage,
         extra_log={
             "page_verdicts": {str(p): {"selected": v, "work_type": screen_work_types.get(p)} for p, v in sorted(results.items())},
         },
@@ -1686,6 +1697,7 @@ Use null for any field not found. city and state are the city/state where the wo
     _stage_docai.finish(
         count_out=total_rows,
         pages_processed=len(selected_pages),
+        metadata={"pages_processed": len(selected_pages), "tables_found": total_tables, "rows_found": total_rows},
         extra_log={
             "pages": {
                 str(pn): {
@@ -1885,6 +1897,11 @@ Return ONLY valid JSON, no markdown:
                         data = json.loads(resp.read())
                 raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
                 result = _parse_llm_json(raw)
+                usage = data.get("usageMetadata") or {}
+                with _pro_usage_lock:
+                    _pro_usage["input_tokens"]  += usage.get("promptTokenCount", 0)
+                    _pro_usage["output_tokens"] += usage.get("candidatesTokenCount", 0)
+                    _pro_usage["api_calls"]     += 1
                 break
             except urllib.error.HTTPError as e:
                 if e.code in (429, 500, 503):
@@ -1977,6 +1994,8 @@ Return ONLY valid JSON, no markdown:
         log(f"  ⚡ Running {len(gemini_tasks)} page(s) through Gemini Pro in parallel...")
 
     _gemini_page_results = {}
+    _pro_usage = {"input_tokens": 0, "output_tokens": 0, "api_calls": 0}
+    _pro_usage_lock = threading.Lock()
 
     def _run_gemini_task(task):
         page_num, headers, body, full_text, lines = task
@@ -1996,6 +2015,7 @@ Return ONLY valid JSON, no markdown:
     log(f"📊 Extraction summary — {skipped_text} text-filtered, {sent_to_vision} vision pages, {sent_to_gemini} tables sent to Gemini")
     _stage_gemini.finish(
         count_out=len(all_streets),
+        metadata=_pro_usage,
         extra_log={"pages": _gemini_page_results},
     )
 
@@ -2200,6 +2220,9 @@ Return ONLY valid JSON, no markdown:
         "NORTH CDS", "SOUTH CDS", "EAST CDS", "WEST CDS",
     }
 
+    _geo_api_calls = {"count": 0}
+    _geo_api_calls_lock = threading.Lock()
+
     def _geocode_intersection(main: str, cross: str, city: str, state: str, api_key: str) -> dict:
         """
         Geocode a street intersection via Google.
@@ -2222,6 +2245,8 @@ Return ONLY valid JSON, no markdown:
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read())
+            with _geo_api_calls_lock:
+                _geo_api_calls["count"] += 1
 
             if data.get("status") != "OK" or not data.get("results"):
                 result = {"found": False, "intersection": False,
@@ -2322,6 +2347,8 @@ Return ONLY valid JSON, no markdown:
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read())
+            with _geo_api_calls_lock:
+                _geo_api_calls["count"] += 1
 
             if data.get("status") != "OK" or not data.get("results"):
                 result = {"found": False, "main_canonical": None}
@@ -2612,6 +2639,7 @@ Return ONLY valid JSON, no markdown:
     all_streets, low_confidence_streets = _validate_streets(all_streets, city, state)
     _stage_geocode.finish(
         count_out=len(all_streets),
+        metadata={"api_calls": _geo_api_calls["count"], "cache_hits": len(tasks) - _geo_api_calls["count"]},
         extra_log={
             "streets_in": _streets_input_geocode,
             "streets_out": all_streets,
@@ -3749,8 +3777,8 @@ def _db_write_job_complete(job_id: str, schema: dict):
                              street_count_in, street_count_out, streets_dropped,
                              pages_processed, pages_selected,
                              selected_page_numbers, duration_ms, error_message,
-                             raw_log_s3_key)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                             raw_log_s3_key, metadata)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
                         ON CONFLICT (id) DO NOTHING
                     """,
                         stg.get("id"), job_id,
@@ -3762,6 +3790,7 @@ def _db_write_job_complete(job_id: str, schema: dict):
                         stg.get("selected_page_numbers") or [],
                         stg.get("duration_ms"), stg.get("error_message"),
                         stg.get("raw_log_s3_key"),
+                        json.dumps(stg["metadata"]) if stg.get("metadata") else None,
                     )
                 for s in streets:
                     await conn.execute("""

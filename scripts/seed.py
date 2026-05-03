@@ -1,9 +1,11 @@
 """
-Seed script — inserts baseline test data into the database.
+Seed script — inserts baseline test data for LOCAL DEVELOPMENT ONLY.
+Do NOT run against staging or prod — those environments get real data via the platform.
 Safe to run multiple times (skips rows that already exist).
 
 Usage:
     DATABASE_URL=postgresql://postgres@localhost:5432/blueroads_dev python scripts/seed.py
+    or: make seed
 """
 import asyncio
 import os

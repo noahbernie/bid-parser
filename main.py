@@ -3611,19 +3611,22 @@ async def _db_write_job_start(
     import asyncpg
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
+        print("[db] DATABASE_URL not set — skipping job start write")
         return
+    print(f"[db] connecting for job start {job_id[:8]}...")
     try:
-        conn = await asyncpg.connect(db_url)
+        conn = await asyncpg.connect(db_url, timeout=10)
         try:
             await conn.execute("""
                 INSERT INTO jobs (id, job_name, status, organization_id, project_id, uploaded_by_user_id)
                 VALUES ($1, $2, 'parsing', $3, $4, $5)
                 ON CONFLICT (id) DO NOTHING
             """, job_id, filename, organization_id, project_id, uploaded_by_user_id)
+            print(f"[db] job start written: {job_id[:8]}")
         finally:
             await conn.close()
     except Exception as e:
-        print(f"[db] job start write failed: {e}")
+        print(f"[db] job start write failed: {type(e).__name__}: {e}")
 
 
 def _db_write_job_complete(job_id: str, schema: dict):
@@ -3767,6 +3770,23 @@ def _run_extraction_and_persist(doc_id: str, api_key: str):
         _doc = documents.get(doc_id)
         if _doc is not None:
             _doc["extracted_schema"] = {"_error": err_msg}
+
+
+@app.get("/health/db")
+async def health_db(x_api_key: str = Header(default=None)):
+    """Test DB connectivity from Railway."""
+    _check_api_key(x_api_key)
+    import asyncpg
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        return {"status": "error", "detail": "DATABASE_URL not set"}
+    try:
+        conn = await asyncpg.connect(db_url, timeout=10)
+        row = await conn.fetchrow("SELECT COUNT(*) AS cnt FROM jobs")
+        await conn.close()
+        return {"status": "ok", "jobs_count": row["cnt"]}
+    except Exception as e:
+        return {"status": "error", "detail": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/parse")

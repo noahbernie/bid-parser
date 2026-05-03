@@ -68,28 +68,16 @@ async def seed():
             """, org_id, user_id)
             print(f"✓ Project created: {project_id}")
 
-        # --- Job ---
-        job = await conn.fetchrow(
-            "SELECT id FROM jobs WHERE project_id = $1 AND job_name = $2",
-            project_id, "test_bid.pdf"
-        )
-        if job:
-            job_id = job["id"]
-            print(f"✓ Job already exists: {job_id}")
-        else:
-            job_id = await conn.fetchval("""
-                INSERT INTO jobs (project_id, organization_id, uploaded_by_user_id, job_name, status)
-                VALUES ($1, $2, $3, 'test_bid.pdf', 'uploaded')
-                RETURNING id
-            """, project_id, org_id, user_id)
-            print(f"✓ Job created: {job_id}")
-
         print(f"""
 Seed complete. IDs for testing:
   org_id:     {org_id}
   user_id:    {user_id}
   project_id: {project_id}
-  job_id:     {job_id}
+
+Pass these into POST /parse as form fields:
+  organization_id={org_id}
+  project_id={project_id}
+  uploaded_by_user_id={user_id}
 """)
 
     finally:

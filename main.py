@@ -1519,6 +1519,9 @@ Use null for any field not found. city and state are the city/state where the wo
         pages_processed=total_pages,
         pages_selected=len(selected_pages),
         selected_page_numbers=selected_pages,
+        extra_log={
+            "page_verdicts": {str(p): {"selected": v, "work_type": screen_work_types.get(p)} for p, v in sorted(results.items())},
+        },
     )
 
     if not selected_pages:
@@ -1680,7 +1683,22 @@ Use null for any field not found. city and state are the city/state where the wo
     total_tables = sum(len(v) for v in all_page_tables.values())
     total_rows   = sum(len(t[1]) for v in all_page_tables.values() for t in v)
     log(f"✓ DocAI complete — {len(all_page_data)} pages with data ({len(all_page_tables)} with tables), {total_tables} tables, {total_rows} body rows")
-    _stage_docai.finish(count_out=total_rows, pages_processed=len(selected_pages))
+    _stage_docai.finish(
+        count_out=total_rows,
+        pages_processed=len(selected_pages),
+        extra_log={
+            "pages": {
+                str(pn): {
+                    "full_text": d.get("full_text", "")[:2000],
+                    "tables": [
+                        {"headers": hdr, "rows": body}
+                        for hdr, body in d.get("tables", [])
+                    ],
+                }
+                for pn, d in all_page_data.items()
+            },
+        },
+    )
 
     if not all_page_data:
         log("⚠ DocAI found no tables on selected pages.")
@@ -1958,22 +1976,33 @@ Return ONLY valid JSON, no markdown:
     if gemini_tasks:
         log(f"  ⚡ Running {len(gemini_tasks)} page(s) through Gemini Pro in parallel...")
 
+    _gemini_page_results = {}
+
     def _run_gemini_task(task):
         page_num, headers, body, full_text, lines = task
-        return _extract_with_gemini_pro(headers, body, page_num,
-                                        full_text=full_text, lines=lines,
-                                        inherited_work_type=page_inherited_work_type.get(page_num))
+        streets = _extract_with_gemini_pro(headers, body, page_num,
+                                           full_text=full_text, lines=lines,
+                                           inherited_work_type=page_inherited_work_type.get(page_num))
+        _gemini_page_results[page_num] = {
+            "input": {"headers": headers, "row_count": len(body), "full_text": (full_text or "")[:1000]},
+            "output": streets,
+        }
+        return streets
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         for result in pool.map(_run_gemini_task, gemini_tasks):
             all_streets.extend(result)
 
     log(f"📊 Extraction summary — {skipped_text} text-filtered, {sent_to_vision} vision pages, {sent_to_gemini} tables sent to Gemini")
-    _stage_gemini.finish(count_out=len(all_streets))
+    _stage_gemini.finish(
+        count_out=len(all_streets),
+        extra_log={"pages": _gemini_page_results},
+    )
 
     # --- Step 5: Deduplicate ---
     log(f"🔀 Step 5: Deduplicating... RSS {_rss_mb()}MB")
     _streets_before_dedup = len(all_streets)
+    _streets_input_dedup = [dict(s) for s in all_streets]
     _stage_dedup = _stage(4, "dedup", count_in=_streets_before_dedup)
 
     # Suffix normalization — all variants → short canonical form
@@ -2117,12 +2146,20 @@ Return ONLY valid JSON, no markdown:
             s["work_types"] = sorted(new_wts.values())
 
     log(f"  Dedup: {before} → {len(all_streets)} streets")
-    _stage_dedup.finish(count_out=len(all_streets), dropped=_streets_before_dedup - len(all_streets))
+    _stage_dedup.finish(
+        count_out=len(all_streets),
+        dropped=_streets_before_dedup - len(all_streets),
+        extra_log={
+            "streets_in": _streets_input_dedup,
+            "streets_out": all_streets,
+        },
+    )
 
     # --- Step 5b: Extract parenthetical tags from street fields ---
     # Parenthetical descriptors like "(NORTHBOUND ONLY)", "(WB ONLY)", "(BRIDGE OVERPASS)"
     # are not part of the street name — extract them as tags and clean the field value.
     _streets_before_tags = len(all_streets)
+    _streets_input_tags = [dict(s) for s in all_streets]
     _stage_tags = _stage(5, "tag_extraction", count_in=_streets_before_tags)
     _PAREN_RE = re.compile(r"\s*\(([^)]+)\)\s*")
     _DIR_TAG_RE = re.compile(r"\b(NB|SB|EB|WB|NORTHBOUND|SOUTHBOUND|EASTBOUND|WESTBOUND)\b", re.IGNORECASE)
@@ -2136,7 +2173,13 @@ Return ONLY valid JSON, no markdown:
                 s[field] = _PAREN_RE.sub(" ", val).strip()
         if tags:
             s["tags"] = tags
-    _stage_tags.finish(count_out=len(all_streets))
+    _stage_tags.finish(
+        count_out=len(all_streets),
+        extra_log={
+            "streets_in": _streets_input_tags,
+            "streets_out": all_streets,
+        },
+    )
 
     # --- Step 6: Google Geocoding — intersection validation + spelling correction ---
     log(f"🗺 Step 6: Google Geocoding intersection validation... RSS {_rss_mb()}MB")
@@ -2564,9 +2607,17 @@ Return ONLY valid JSON, no markdown:
         return confident, low_conf
 
     _streets_before_geocode = len(all_streets)
+    _streets_input_geocode = [dict(s) for s in all_streets]
     _stage_geocode = _stage(6, "geocoding", count_in=_streets_before_geocode)
     all_streets, low_confidence_streets = _validate_streets(all_streets, city, state)
-    _stage_geocode.finish(count_out=len(all_streets))
+    _stage_geocode.finish(
+        count_out=len(all_streets),
+        extra_log={
+            "streets_in": _streets_input_geocode,
+            "streets_out": all_streets,
+            "low_confidence": low_confidence_streets,
+        },
+    )
 
     # Inline confidence on every street
     _low_conf_id_set = {id(s) for s in low_confidence_streets}

@@ -1295,7 +1295,8 @@ def run_extraction(doc_id: str, api_key: str):
                 self.selected_page_numbers = None
                 self.error = None
             def finish(self, count_out=None, dropped=None, pages_processed=None,
-                       pages_selected=None, selected_page_numbers=None, error=None):
+                       pages_selected=None, selected_page_numbers=None, error=None,
+                       extra_log: dict = None):
                 rec = {
                     "stage_order": self.order,
                     "stage": self.name,
@@ -1309,6 +1310,14 @@ def run_extraction(doc_id: str, api_key: str):
                 if pages_selected  is not None: rec["pages_selected"]  = pages_selected
                 if selected_page_numbers is not None: rec["selected_page_numbers"] = selected_page_numbers
                 if error: rec["error_message"] = str(error)[:300]
+                try:
+                    from s3 import upload_stage_log
+                    log_payload = dict(rec)
+                    if extra_log:
+                        log_payload.update(extra_log)
+                    rec["raw_log_s3_key"] = upload_stage_log(doc_id, self.order, self.name, log_payload)
+                except Exception as _s3e:
+                    print(f"[s3] stage log upload failed: {_s3e}")
                 _stages.append(rec)
                 return rec
         return _S()
@@ -3603,12 +3612,26 @@ def _write_job(job_id: str, payload: dict):
 async def _db_write_job_start(
     job_id: str,
     filename: str,
+    pdf_bytes: bytes,
     organization_id: str = None,
     project_id: str = None,
     uploaded_by_user_id: str = None,
 ):
-    """Insert a jobs row with status=parsing. No-ops if DATABASE_URL not set."""
+    """Insert a jobs row with status=parsing, upload PDF to S3, write job_media row."""
     import asyncpg
+    from s3 import upload_pdf
+
+    # S3 upload (sync boto3 — run in thread so we don't block event loop)
+    s3_bucket, s3_key = None, None
+    try:
+        org_id = organization_id or "unknown"
+        loop = asyncio.get_event_loop()
+        s3_bucket, s3_key = await loop.run_in_executor(
+            None, lambda: upload_pdf(job_id, org_id, pdf_bytes, filename)
+        )
+    except Exception as e:
+        print(f"[s3] PDF upload failed: {type(e).__name__}: {e}")
+
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
         print("[db] DATABASE_URL not set — skipping job start write")
@@ -3622,6 +3645,11 @@ async def _db_write_job_start(
                 VALUES ($1, $2, 'parsing', $3, $4, $5)
                 ON CONFLICT (id) DO NOTHING
             """, job_id, filename, organization_id, project_id, uploaded_by_user_id)
+            if s3_bucket and s3_key:
+                await conn.execute("""
+                    INSERT INTO job_media (job_id, s3_bucket, s3_key, file_name, file_type, file_size_bytes)
+                    VALUES ($1, $2, $3, $4, 'application/pdf', $5)
+                """, job_id, s3_bucket, s3_key, filename, len(pdf_bytes))
             print(f"[db] job start written: {job_id[:8]}")
         finally:
             await conn.close()
@@ -3669,8 +3697,9 @@ def _db_write_job_complete(job_id: str, schema: dict):
                             (id, job_id, stage, stage_order, status,
                              street_count_in, street_count_out, streets_dropped,
                              pages_processed, pages_selected,
-                             selected_page_numbers, duration_ms, error_message)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                             selected_page_numbers, duration_ms, error_message,
+                             raw_log_s3_key)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                         ON CONFLICT (id) DO NOTHING
                     """,
                         stg.get("id"), job_id,
@@ -3681,6 +3710,7 @@ def _db_write_job_complete(job_id: str, schema: dict):
                         stg.get("pages_selected"),
                         stg.get("selected_page_numbers") or [],
                         stg.get("duration_ms"), stg.get("error_message"),
+                        stg.get("raw_log_s3_key"),
                     )
                 for s in streets:
                     await conn.execute("""
@@ -3833,7 +3863,7 @@ async def parse_pdf_async(
 
     # Write a placeholder so the job is findable on disk immediately
     _write_job(doc_id, {"done": False, "filename": file.filename, "total_pages": total_pages_upload})
-    await _db_write_job_start(doc_id, file.filename, organization_id, project_id, uploaded_by_user_id)
+    await _db_write_job_start(doc_id, file.filename, contents, organization_id, project_id, uploaded_by_user_id)
 
     background_tasks.add_task(_run_extraction_and_persist, doc_id, anthropic_key)
 

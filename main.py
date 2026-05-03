@@ -29,6 +29,12 @@ from models import (
 
 load_dotenv()
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+def _now_pt() -> str:
+    return datetime.now(ZoneInfo("America/Los_Angeles")).isoformat()
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Persistent cache paths
@@ -843,15 +849,16 @@ Skip header rows and tables with no from/to column. Extract every data row."""
 
 
 def _get_docai_credentials():
-    """Load Document AI service account creds from env var or local key file."""
+    """Load Document AI service account creds from key file or env var fallback."""
     from google.oauth2 import service_account
     scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+    # Prefer file — env var \n sequences get mangled by systemd EnvironmentFile
+    if os.path.exists(DOCAI_CRED_FILE):
+        return service_account.Credentials.from_service_account_file(DOCAI_CRED_FILE, scopes=scopes)
     creds_json_str = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if creds_json_str:
         info = json.loads(creds_json_str)
         return service_account.Credentials.from_service_account_info(info, scopes=scopes)
-    if os.path.exists(DOCAI_CRED_FILE):
-        return service_account.Credentials.from_service_account_file(DOCAI_CRED_FILE, scopes=scopes)
     return None
 
 
@@ -2704,7 +2711,7 @@ Return ONLY valid JSON, no markdown:
             return "END"
         return v
 
-    def _street_to_raw(s: dict, job_id: str = None) -> dict:
+    def _street_to_raw(s: dict, job_id: str = None, created_at: str = None) -> dict:
         from_raw = _normalize_cross(s.get("from_street"))
         to_raw   = _normalize_cross(s.get("to_street"))
         if not from_raw and not to_raw:
@@ -2713,6 +2720,7 @@ Return ONLY valid JSON, no markdown:
         normalized = {**s, "from_street": from_raw, "to_street": to_raw}
         sr = street_raw_from_dict(normalized, job_id=job_id)
         sr.id = str(uuid.uuid4())
+        sr.created_at = created_at
         return asdict(sr)
 
     # Fallback: if city/state still unknown, ask Flash to guess from the extracted street names
@@ -2752,7 +2760,9 @@ Return ONLY valid JSON, no markdown:
         except Exception as _ge:
             log(f"  ⚠ Flash geo-guess failed: {str(_ge)[:80]}")
 
-    streets_raw = [_street_to_raw(s, doc_id) for s in all_streets + [
+    now_pt = _now_pt()
+
+    streets_raw = [_street_to_raw(s, doc_id, created_at=now_pt) for s in all_streets + [
         s for s in low_confidence_streets if id(s) not in {id(x) for x in all_streets}
     ]]
 
@@ -2760,6 +2770,8 @@ Return ONLY valid JSON, no markdown:
         id=doc_id,
         job_name=schema.get("project_name") or None,
         status="parsed",
+        created_at=now_pt,
+        updated_at=now_pt,
     ))
 
     bid_parse_results = asdict(BidParseResults(
@@ -2777,11 +2789,13 @@ Return ONLY valid JSON, no markdown:
         selected_page_numbers=selected_pages,
         total_streets=len(all_streets),
         chunks_processed=None,
+        created_at=now_pt,
     ))
 
     def _make_stage_log(stg):
         sl = parser_stage_log_from_dict(stg, job_id=doc_id)
         sl.id = str(uuid.uuid4())
+        sl.created_at = now_pt
         return asdict(sl)
 
     parser_stage_logs = [_make_stage_log(stg) for stg in _stages]

@@ -3598,6 +3598,129 @@ def _write_job(job_id: str, payload: dict):
     with open(_job_path(job_id), "w") as f:
         json.dump(payload, f)
 
+
+def _db_write_job_start(job_id: str, filename: str):
+    """Insert a jobs row with status=parsing. No-ops if DATABASE_URL not set."""
+    import asyncio
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        return
+    async def _run():
+        import asyncpg
+        conn = await asyncpg.connect(db_url)
+        try:
+            await conn.execute("""
+                INSERT INTO jobs (id, job_name, status)
+                VALUES ($1, $2, 'parsing')
+                ON CONFLICT (id) DO NOTHING
+            """, job_id, filename)
+        finally:
+            await conn.close()
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        print(f"[db] job start write failed: {e}")
+
+
+def _db_write_job_complete(job_id: str, schema: dict):
+    """Write bid_parse_results, parser_stage_logs, streets_raw, update jobs. No-ops if DATABASE_URL not set."""
+    import asyncio
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        return
+    bpr = schema.get("bid_parse_results") or {}
+    stages = schema.get("parser_stage_logs") or []
+    streets = schema.get("streets_raw") or []
+
+    async def _run():
+        import asyncpg
+        conn = await asyncpg.connect(db_url)
+        try:
+            async with conn.transaction():
+                await conn.execute("""
+                    UPDATE jobs SET status='parsed' WHERE id=$1
+                """, job_id)
+                await conn.execute("""
+                    INSERT INTO bid_parse_results
+                        (id, job_id, bid_number, project_name, city, state,
+                         work_types, total_pages, selected_pages,
+                         selected_page_numbers, total_streets)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                    ON CONFLICT (id) DO NOTHING
+                """,
+                    bpr.get("id"), job_id,
+                    bpr.get("bid_number"), bpr.get("project_name"),
+                    bpr.get("city"), bpr.get("state"),
+                    bpr.get("work_types") or [],
+                    bpr.get("total_pages"), bpr.get("selected_pages"),
+                    bpr.get("selected_page_numbers") or [],
+                    bpr.get("total_streets"),
+                )
+                for stg in stages:
+                    await conn.execute("""
+                        INSERT INTO parser_stage_logs
+                            (id, job_id, stage, stage_order, status,
+                             street_count_in, street_count_out, streets_dropped,
+                             pages_processed, pages_selected,
+                             selected_page_numbers, duration_ms, error_message)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                        ON CONFLICT (id) DO NOTHING
+                    """,
+                        stg.get("id"), job_id,
+                        stg.get("stage"), stg.get("stage_order"),
+                        stg.get("status") or "success",
+                        stg.get("street_count_in"), stg.get("street_count_out"),
+                        stg.get("streets_dropped"), stg.get("pages_processed"),
+                        stg.get("pages_selected"),
+                        stg.get("selected_page_numbers") or [],
+                        stg.get("duration_ms"), stg.get("error_message"),
+                    )
+                for s in streets:
+                    await conn.execute("""
+                        INSERT INTO streets_raw
+                            (id, job_id, main_street, from_street, to_street,
+                             work_types, page, source, tags, confidence,
+                             is_active, validated)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                        ON CONFLICT (id) DO NOTHING
+                    """,
+                        s.get("id"), job_id,
+                        s.get("main_street") or "",
+                        s.get("from_street"), s.get("to_street"),
+                        s.get("work_types") or [],
+                        s.get("page"), s.get("source") or "gemini-pro",
+                        s.get("tags") or [],
+                        s.get("confidence") or "high",
+                        True, False,
+                    )
+        finally:
+            await conn.close()
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        print(f"[db] job complete write failed: {e}")
+
+
+def _db_write_job_error(job_id: str, error_msg: str):
+    """Update jobs.status=error. No-ops if DATABASE_URL not set."""
+    import asyncio
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        return
+    async def _run():
+        import asyncpg
+        conn = await asyncpg.connect(db_url)
+        try:
+            await conn.execute("""
+                UPDATE jobs SET status='error', parse_error=$2 WHERE id=$1
+            """, job_id, error_msg[:1000])
+        finally:
+            await conn.close()
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        print(f"[db] job error write failed: {e}")
+
 def _read_job(job_id: str):
     p = _job_path(job_id)
     if not os.path.exists(p):
@@ -3618,7 +3741,7 @@ def _check_api_key(x_api_key: str):
 
 
 def _run_extraction_and_persist(doc_id: str, api_key: str):
-    """Wrapper that runs extraction and writes the result to disk."""
+    """Wrapper that runs extraction and writes the result to disk and DB."""
     try:
         run_extraction(doc_id, api_key)
         schema = (documents.get(doc_id) or {}).get("extracted_schema")
@@ -3630,10 +3753,12 @@ def _run_extraction_and_persist(doc_id: str, api_key: str):
                 "parser_stage_logs": schema.get("parser_stage_logs"),
                 "streets_raw":       schema.get("streets_raw"),
             })
+            _db_write_job_complete(doc_id, schema)
     except Exception as e:
         import traceback
         err_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-500:]}"
         _write_job(doc_id, {"done": True, "error": err_msg})
+        _db_write_job_error(doc_id, err_msg)
         # Update in-memory so same-container polls don't stay stuck at done:False
         _doc = documents.get(doc_id)
         if _doc is not None:
@@ -3681,6 +3806,7 @@ async def parse_pdf_async(
 
     # Write a placeholder so the job is findable on disk immediately
     _write_job(doc_id, {"done": False, "filename": file.filename, "total_pages": total_pages_upload})
+    _db_write_job_start(doc_id, file.filename)
 
     background_tasks.add_task(_run_extraction_and_persist, doc_id, anthropic_key)
 

@@ -2407,6 +2407,7 @@ Return ONLY valid JSON, no markdown:
                 tasks.add((main, None))
 
         log(f"  🌐 Geocoding {len(tasks)} intersections/streets...")
+        _geo_api_calls["total_tasks"] = len(tasks)
 
         geo_results: dict = {}
         with ThreadPoolExecutor(max_workers=10) as pool:
@@ -2639,7 +2640,7 @@ Return ONLY valid JSON, no markdown:
     all_streets, low_confidence_streets = _validate_streets(all_streets, city, state)
     _stage_geocode.finish(
         count_out=len(all_streets),
-        metadata={"api_calls": _geo_api_calls["count"], "cache_hits": len(tasks) - _geo_api_calls["count"]},
+        metadata={"api_calls": _geo_api_calls["count"], "cache_hits": _geo_api_calls.get("total_tasks", 0) - _geo_api_calls["count"]},
         extra_log={
             "streets_in": _streets_input_geocode,
             "streets_out": all_streets,

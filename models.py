@@ -76,7 +76,6 @@ class ParserStageLog:
 class StreetRaw:
     id: Optional[str] = None
     job_id: Optional[str] = None
-    parser_stage_log_id: Optional[str] = None
     main_street: str = ""
     from_street: Optional[str] = None
     to_street: Optional[str] = None
@@ -152,4 +151,5 @@ def parser_stage_log_from_dict(d: dict, job_id: str = None) -> ParserStageLog:
         duration_ms=d.get("duration_ms"),
         error_message=d.get("error_message"),
         raw_log_s3_key=d.get("raw_log_s3_key"),
+        metadata=d.get("metadata"),
     )

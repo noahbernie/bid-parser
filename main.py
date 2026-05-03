@@ -3600,7 +3600,7 @@ def _write_job(job_id: str, payload: dict):
         json.dump(payload, f)
 
 
-def _db_write_job_start(
+async def _db_write_job_start(
     job_id: str,
     filename: str,
     organization_id: str = None,
@@ -3608,12 +3608,11 @@ def _db_write_job_start(
     uploaded_by_user_id: str = None,
 ):
     """Insert a jobs row with status=parsing. No-ops if DATABASE_URL not set."""
-    import asyncio
+    import asyncpg
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
         return
-    async def _run():
-        import asyncpg
+    try:
         conn = await asyncpg.connect(db_url)
         try:
             await conn.execute("""
@@ -3623,8 +3622,6 @@ def _db_write_job_start(
             """, job_id, filename, organization_id, project_id, uploaded_by_user_id)
         finally:
             await conn.close()
-    try:
-        asyncio.run(_run())
     except Exception as e:
         print(f"[db] job start write failed: {e}")
 
@@ -3816,7 +3813,7 @@ async def parse_pdf_async(
 
     # Write a placeholder so the job is findable on disk immediately
     _write_job(doc_id, {"done": False, "filename": file.filename, "total_pages": total_pages_upload})
-    _db_write_job_start(doc_id, file.filename, organization_id, project_id, uploaded_by_user_id)
+    await _db_write_job_start(doc_id, file.filename, organization_id, project_id, uploaded_by_user_id)
 
     background_tasks.add_task(_run_extraction_and_persist, doc_id, anthropic_key)
 
